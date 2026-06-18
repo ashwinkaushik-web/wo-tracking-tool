@@ -236,37 +236,33 @@ def sidebar(last_refresh):
     )
 
 
-def kpi_strip(df, wos):
+def kpi_strip(df, wos, warehouse_label):
     storage_wos = wos[wos["source_category"] == "Storage"]
     po_wos = wos[wos["source_category"] == "PO"]
     ir_wos = wos[wos["source_category"] == "IR"]
     storage_items = df[df["source_category"] == "Storage"]
     po_items = df[df["source_category"] == "PO"]
 
-    # Volume totals
     total_orig = int(df["original_request"].fillna(0).sum())
     total_current = int(df["current_request"].fillna(0).sum())
     total_processed = int(df["processed"].fillna(0).sum())
     pct_processed = (total_processed / total_orig * 100) if total_orig > 0 else 0
     unique_pos = int(po_items["po_number_raw"].dropna().nunique())
 
-    # Health counts
     storage_blocked = int(storage_items["is_blocked_pfs"].fillna(False).sum())
     po_blocked = int((po_items["po_block_flag"] == "🔴 Blocked / Issue").sum())
     po_partial = int((po_items["po_block_flag"] == "🟠 Partially Processed").sum())
     po_approaching = int((po_items["po_block_flag"] == "🟡 Approaching ship-by").sum())
     po_ontrack = int((po_items["po_block_flag"] == "🟢 On Track").sum())
 
-    # Data range caption (for verification against Pattern UI)
     try:
         date_min = df["created_at"].min()
         date_max = df["created_at"].max()
         date_range = f"{date_min.strftime('%Y-%m-%d')} → {date_max.strftime('%Y-%m-%d')}"
     except Exception:
         date_range = "—"
-    st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Both Northampton + Wroclaw")
+    st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Warehouse: **{warehouse_label}**")
 
-    # Row 1 — Volume (matches Pattern UI: Work Order Items / Purchase Orders / Original / Current / Processed)
     st.markdown("##### 📊 Volume")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Work Orders", f"{len(wos):,}", f"{len(storage_wos)} S · {len(po_wos)} PO · {len(ir_wos)} IR")
@@ -275,8 +271,7 @@ def kpi_strip(df, wos):
     c4.metric("Current Request", f"{total_current:,}")
     c5.metric("Processed", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
-    # Row 2 — Health (blocked / partial / approaching / on-track)
-    st.markdown("##### 🚦 Health")
+    st.markdown("##### 🚦 Health (item counts)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Storage Blocked", storage_blocked, "via PFS")
     c2.metric("PO Blocked 🔴", f"{po_blocked:,}", "21+ days, 0% processed")
@@ -292,7 +287,6 @@ def storage_tab(df, wos):
     s_wos = wos[wos["source_category"] == "Storage"].copy()
     s_items = df[df["source_category"] == "Storage"].copy()
 
-    # Selected-WO mode: show drilldown only
     sel = st.session_state.get("selected_storage_wo")
     if sel and sel in s_wos["work_order_number"].values:
         storage_wo_drilldown(sel, s_items, s_wos)
@@ -309,11 +303,10 @@ def storage_tab(df, wos):
 
 
 def storage_wo_view(s_wos, s_items):
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
     open_filter = c1.selectbox("Has Open", ["All", "With Open items", "All Closed"], index=1, key="sf_open")
     blk_filter = c2.selectbox("Has Blocked", ["All", "With Blocked", "No Blocked"], key="sf_blk")
-    wh_filter = c3.selectbox("Warehouse", ["Both", "Northampton", "Wroclaw"], key="sf_wh")
-    search = c4.text_input("Search", "", placeholder="WO, brand, reason...", key="sf_search")
+    search = c3.text_input("Search", "", placeholder="WO, brand, reason...", key="sf_search")
 
     filtered = s_wos.copy()
     if open_filter == "With Open items":
@@ -324,8 +317,6 @@ def storage_wo_view(s_wos, s_items):
         filtered = filtered[filtered["pfs_blocks"] > 0]
     elif blk_filter == "No Blocked":
         filtered = filtered[filtered["pfs_blocks"] == 0]
-    if wh_filter != "Both":
-        filtered = filtered[filtered["warehouse"] == wh_filter]
     if search:
         mask = _str_contains_any(filtered, ["work_order_number", "top_brand", "top_block_reason"], search)
         filtered = filtered[mask]
@@ -365,7 +356,6 @@ def storage_wo_view(s_wos, s_items):
 def storage_wo_drilldown(wo_id, s_items, s_wos):
     wo_row = s_wos[s_wos["work_order_number"] == wo_id].iloc[0]
 
-    # Top bar: back button + title
     top1, top2 = st.columns([1, 5])
     if top1.button("← Back to list", use_container_width=True, key="back_swo"):
         st.session_state.pop("selected_storage_wo", None)
@@ -426,19 +416,17 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
 
 
 def storage_item_view(s_items):
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     status_f = c1.selectbox("Status", ["All", "Open", "Closed"], index=1, key="sif_status")
     blk_f = c2.selectbox("Block", ["All", "Blocked only", "Pickable only"], key="sif_blk")
-    wh_f = c3.selectbox("Warehouse", ["Both", "Northampton", "Wroclaw"], key="sif_wh")
     reasons = sorted(s_items.loc[s_items["block_reason_pfs"].notna(), "block_reason_pfs"].unique().tolist())
-    reason_f = c4.selectbox("Reason", ["All"] + reasons, key="sif_reason")
-    search = c5.text_input("Search", "", placeholder="Listing...", key="sif_search")
+    reason_f = c3.selectbox("Reason", ["All"] + reasons, key="sif_reason")
+    search = c4.text_input("Search", "", placeholder="Listing, brand...", key="sif_search")
 
     filtered = s_items.copy()
     if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
     if blk_f == "Blocked only": filtered = filtered[filtered["is_blocked_pfs"].fillna(False)]
     elif blk_f == "Pickable only": filtered = filtered[~filtered["is_blocked_pfs"].fillna(False)]
-    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
     if reason_f != "All": filtered = filtered[filtered["block_reason_pfs"] == reason_f]
     if search:
         mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
@@ -489,17 +477,15 @@ def po_tab(df, wos):
 def po_wo_view(p_wos, p_items):
     flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
                     "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 2])
+    c1, c2, c3 = st.columns([1.2, 1, 2])
     flag_f = c1.selectbox("Worst Flag", flag_options, key="pf_flag")
     open_f = c2.selectbox("Has Open", ["All", "With Open", "All Closed"], index=1, key="pf_open")
-    wh_f = c3.selectbox("Warehouse", ["Both", "Northampton", "Wroclaw"], key="pf_wh")
-    search = c4.text_input("Search", "", placeholder="WO, PO#, brand...", key="pf_search")
+    search = c3.text_input("Search", "", placeholder="WO, PO#, brand...", key="pf_search")
 
     filtered = p_wos.copy()
     if flag_f != "All": filtered = filtered[filtered["worst_po_flag"] == flag_f]
     if open_f == "With Open": filtered = filtered[filtered["open_items"] > 0]
     elif open_f == "All Closed": filtered = filtered[filtered["open_items"] == 0]
-    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
     if search:
         mask = _str_contains_any(filtered, ["work_order_number", "po_number_raw", "top_brand"], search)
         filtered = filtered[mask]
@@ -537,7 +523,6 @@ def po_wo_view(p_wos, p_items):
 def po_wo_drilldown(wo_id, p_items, p_wos):
     wo_row = p_wos[p_wos["work_order_number"] == wo_id].iloc[0]
 
-    # Top bar: back button + title
     top1, top2 = st.columns([1, 5])
     if top1.button("← Back to list", use_container_width=True, key="back_pwo"):
         st.session_state.pop("selected_po_wo", None)
@@ -601,18 +586,16 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
 def po_item_view(p_items):
     flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
                     "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 2])
     flag_f = c1.selectbox("Flag", flag_options, key="pif_flag")
     status_f = c2.selectbox("Status", ["All", "Open", "Closed"], index=1, key="pif_status")
-    wh_f = c3.selectbox("Warehouse", ["Both", "Northampton", "Wroclaw"], key="pif_wh")
     pos = ["All"] + sorted(p_items["po_number_raw"].dropna().unique().tolist())
-    po_f = c4.selectbox("PO #", pos, key="pif_po")
-    search = c5.text_input("Search", "", placeholder="Listing, brand...", key="pif_search")
+    po_f = c3.selectbox("PO #", pos, key="pif_po")
+    search = c4.text_input("Search", "", placeholder="Listing, brand...", key="pif_search")
 
     filtered = p_items.copy()
     if flag_f != "All": filtered = filtered[filtered["po_block_flag"] == flag_f]
     if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
-    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
     if po_f != "All": filtered = filtered[filtered["po_number_raw"] == po_f]
     if search:
         mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
@@ -643,8 +626,20 @@ def po_item_view(p_items):
 # MAIN
 # ============================================================
 def main():
-    st.title("📊 WO Tracking Tool")
-    st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
+    # Header with global warehouse selector on the right
+    h1, h2 = st.columns([3, 1.3])
+    with h1:
+        st.title("📊 WO Tracking Tool")
+        st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
+    with h2:
+        st.markdown("##### 🏭 Warehouse")
+        warehouse = st.radio(
+            "Warehouse",
+            ["Both", "Northampton", "Wroclaw"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="global_wh",
+        )
 
     try:
         with st.spinner("Loading WO data from Snowflake..."):
@@ -654,8 +649,13 @@ def main():
         st.info("Check `.streamlit/secrets.toml` — see README for setup.")
         st.stop()
 
+    # Apply global warehouse filter (affects EVERYTHING below)
+    if warehouse != "Both":
+        df = df[df["warehouse"] == warehouse].copy()
+        wos = wos[wos["warehouse"] == warehouse].copy()
+
     sidebar(last_refresh)
-    kpi_strip(df, wos)
+    kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
     tab_storage, tab_po = st.tabs([
