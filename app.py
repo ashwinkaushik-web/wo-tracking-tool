@@ -26,14 +26,31 @@ st.set_page_config(
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
+
+def _safe_int(v, default=0):
+    """Convert to int, handling NaN/None gracefully."""
+    try:
+        if v is None or pd.isna(v):
+            return default
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_date_str(v):
+    """Convert date to string, NaT/None becomes em-dash."""
+    if v is None or pd.isna(v):
+        return "—"
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y-%m-%d")
+    return str(v)
+
+
 # ============================================================
 # SNOWFLAKE CONNECTION (key-pair auth)
 # ============================================================
 def _load_private_key():
-    """Load and serialize the RSA private key from Streamlit secrets.
-
-    Supports both encrypted keys (with passphrase) and unencrypted keys.
-    """
+    """Load and serialize the RSA private key from Streamlit secrets."""
     key_pem = st.secrets["snowflake"]["private_key"].encode("utf-8")
     passphrase = st.secrets["snowflake"].get("private_key_passphrase", None)
     passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
@@ -90,7 +107,21 @@ def fetch_data():
     for col in date_cols:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Convert Snowflake Decimal columns to numeric (floats)
+    numeric_cols = [
+        "original_request", "current_request", "processed",
+        "order_created", "shipped", "storage", "woi_processing_pct",
+        "age_days_from_created", "days_overdue",
+        "wo_total_wois", "wo_wois_open", "wo_wois_untouched",
+        "wo_total_orig_qty", "wo_total_processed_qty", "wo_processing_pct",
+        "po_days_past_ref_ship_by",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df, datetime.now()
+
 
 # ============================================================
 # DATA PREP
@@ -202,21 +233,6 @@ def kpi_strip(df, wos):
 
 
 # ============================================================
-# RENDERING HELPERS
-# ============================================================
-def proc_bar_col(val):
-    """Color-code processing % column with progress bar."""
-    return st.column_config.ProgressColumn(
-        "% Processed", help="Processing percentage", min_value=0, max_value=100, format="%.1f%%"
-    )
-
-
-def format_storage_wo_table(df_wo):
-    """Storage WO list configuration for st.dataframe."""
-    return st.column_config
-
-
-# ============================================================
 # STORAGE TAB
 # ============================================================
 def storage_tab(df, wos):
@@ -240,7 +256,6 @@ def storage_tab(df, wos):
 
 
 def storage_wo_view(s_wos, s_items):
-    # Filters
     c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     open_filter = c1.selectbox("Has Open", ["All", "With Open items", "All Closed"], index=1, key="sf_open")
     blk_filter = c2.selectbox("Has Blocked", ["All", "With Blocked", "No Blocked"], key="sf_blk")
@@ -270,8 +285,6 @@ def storage_wo_view(s_wos, s_items):
         ]
 
     st.caption(f"{len(filtered)} of {len(s_wos)} WOs")
-
-    # Sort by blocked count desc as default
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
 
     display = filtered[
@@ -313,13 +326,13 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     st.caption(f"Top brand: {wo_row['top_brand']} · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("Items", wo_row["items"])
-    c2.metric("Open", wo_row["open_items"])
-    c3.metric("Blocked (PFS)", wo_row["pfs_blocks"])
-    c4.metric("Orig Qty", f"{int(wo_row['orig']):,}")
-    c5.metric("Processed", f"{int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
-    c6.metric("Stowed", f"{int(wo_row['stowed']):,}")
-    c7.metric("Max Age", f"{int(wo_row['max_age'] or 0)}d")
+    c1.metric("Items", _safe_int(wo_row["items"]))
+    c2.metric("Open", _safe_int(wo_row["open_items"]))
+    c3.metric("Blocked (PFS)", _safe_int(wo_row["pfs_blocks"]))
+    c4.metric("Orig Qty", f"{_safe_int(wo_row['orig']):,}")
+    c5.metric("Processed", f"{_safe_int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
+    c6.metric("Stowed", f"{_safe_int(wo_row['stowed']):,}")
+    c7.metric("Max Age", f"{_safe_int(wo_row['max_age'])}d")
 
     items = s_items[s_items["work_order_number"] == wo_id].copy()
 
@@ -492,12 +505,12 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     st.caption(f"Top brand: {wo_row['top_brand']} · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Items", wo_row["items"])
-    c2.metric("Open", wo_row["open_items"])
-    c3.metric("Untouched", wo_row["untouched"])
-    c4.metric("Orig Qty", f"{int(wo_row['orig']):,}")
-    c5.metric("Processed", f"{int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
-    c6.metric("Ship By", str(wo_row["earliest_ship"]) if wo_row["earliest_ship"] else "—")
+    c1.metric("Items", _safe_int(wo_row["items"]))
+    c2.metric("Open", _safe_int(wo_row["open_items"]))
+    c3.metric("Untouched", _safe_int(wo_row["untouched"]))
+    c4.metric("Orig Qty", f"{_safe_int(wo_row['orig']):,}")
+    c5.metric("Processed", f"{_safe_int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
+    c6.metric("Ship By", _safe_date_str(wo_row["earliest_ship"]))
 
     items = p_items[p_items["work_order_number"] == wo_id].copy()
     flag_counts = items["po_block_flag"].value_counts().to_dict()
@@ -587,11 +600,9 @@ def po_item_view(p_items):
 # MAIN
 # ============================================================
 def main():
-    # Header
     st.title("📊 WO Tracking Tool")
     st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
 
-    # Fetch data
     try:
         with st.spinner("Loading WO data from Snowflake..."):
             df, last_refresh = fetch_data()
@@ -600,18 +611,13 @@ def main():
         st.info("Check `.streamlit/secrets.toml` — see README for setup.")
         st.stop()
 
-    # Build WO-level aggregates
     wos = build_wo_aggregates(df)
 
-    # Sidebar
     sidebar(last_refresh)
-
-    # KPIs
     kpi_strip(df, wos)
 
     st.markdown("---")
 
-    # Main tabs
     tab_storage, tab_po = st.tabs([
         f"📦 Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
         f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
