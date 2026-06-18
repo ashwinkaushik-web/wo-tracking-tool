@@ -29,7 +29,6 @@ CACHE_TTL_SECONDS = 1800  # 30 min
 
 
 def _safe_int(v, default=0):
-    """Convert to int, handling NaN/None gracefully."""
     try:
         if v is None or pd.isna(v):
             return default
@@ -39,7 +38,6 @@ def _safe_int(v, default=0):
 
 
 def _safe_date_str(v):
-    """Convert date to string, NaT/None becomes em-dash."""
     if v is None or pd.isna(v):
         return "—"
     if hasattr(v, "strftime"):
@@ -51,7 +49,6 @@ def _safe_date_str(v):
 # SNOWFLAKE CONNECTION (key-pair auth)
 # ============================================================
 def _load_private_key():
-    """Load and serialize the RSA private key from Streamlit secrets."""
     key_pem = st.secrets["snowflake"]["private_key"].encode("utf-8")
     passphrase = st.secrets["snowflake"].get("private_key_passphrase", None)
     passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
@@ -69,7 +66,6 @@ def _load_private_key():
 
 @st.cache_resource
 def get_snowflake_connection():
-    """Open Snowflake connection (cached for app session)."""
     return snowflake.connector.connect(
         user=st.secrets["snowflake"]["user"],
         private_key=_load_private_key(),
@@ -82,12 +78,7 @@ def get_snowflake_connection():
     )
 
 
-# ============================================================
-# DATA PREP — vectorised, fast
-# ============================================================
 def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate WOIs into one row per WO. Vectorised; runs once per cache cycle."""
-    # WO-level rollup
     g = df.groupby("work_order_number", as_index=False).agg(
         source_category=("source_category", "first"),
         source=("source", "first"),
@@ -114,13 +105,9 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
     )
     g["pct"] = pd.to_numeric(g["pct"], errors="coerce").fillna(0)
 
-    # Worst PO flag per WO — VECTORISED using flag rank + idxmin
     flag_priority = [
-        "🔴 Blocked / Issue",
-        "🟠 Partially Processed",
-        "🟡 Approaching ship-by",
-        "🟢 On Track",
-        "✅ Complete",
+        "🔴 Blocked / Issue", "🟠 Partially Processed",
+        "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete",
     ]
     flag_rank = {f: i for i, f in enumerate(flag_priority)}
     df_with_rank = df[df["po_block_flag"].notna()].copy()
@@ -133,26 +120,22 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
         worst_map = {}
     g["worst_po_flag"] = g["work_order_number"].map(worst_map)
 
-    # Top brand per WO — VECTORISED using value_counts groupby
     brand_counts = (
         df.dropna(subset=["source_brand"])
         .groupby(["work_order_number", "source_brand"])
-        .size()
-        .reset_index(name="_cnt")
+        .size().reset_index(name="_cnt")
         .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
         .drop_duplicates("work_order_number", keep="first")
     )
     brand_map = dict(zip(brand_counts["work_order_number"], brand_counts["source_brand"]))
     g["top_brand"] = g["work_order_number"].map(brand_map).fillna("")
 
-    # Top block reason per WO (only from blocked items) — VECTORISED
     blocked = df[df["is_blocked_pfs"].fillna(False)]
     if not blocked.empty:
         reason_counts = (
             blocked.dropna(subset=["block_reason_pfs"])
             .groupby(["work_order_number", "block_reason_pfs"])
-            .size()
-            .reset_index(name="_cnt")
+            .size().reset_index(name="_cnt")
             .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
             .drop_duplicates("work_order_number", keep="first")
         )
@@ -165,7 +148,6 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_data():
-    """Run query + build aggregates. Cached 30 min as a single bundle."""
     sql = QUERY_PATH.read_text()
     conn = get_snowflake_connection()
     cur = conn.cursor()
@@ -177,7 +159,6 @@ def fetch_data():
     finally:
         cur.close()
 
-    # Coerce date columns
     date_cols = [
         "po_ref_ship_by_date", "po_requested_ship_date",
         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
@@ -187,7 +168,6 @@ def fetch_data():
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Convert Decimal columns to numeric
     numeric_cols = [
         "original_request", "current_request", "processed",
         "order_created", "shipped", "storage", "woi_processing_pct",
@@ -200,16 +180,14 @@ def fetch_data():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Build aggregates ONCE and return alongside the raw data — both cached
     wos = _build_wo_aggregates(df)
     return df, wos, datetime.now()
 
 
 # ============================================================
-# FAST SEARCH HELPER (vectorised)
+# HELPERS
 # ============================================================
 def _str_contains_any(df, cols, query):
-    """Vectorised case-insensitive substring search across columns."""
     if not query:
         return pd.Series([True] * len(df), index=df.index)
     q = query.lower()
@@ -218,6 +196,10 @@ def _str_contains_any(df, cols, query):
         if c in df.columns:
             mask = mask | df[c].astype(str).str.lower().str.contains(q, na=False, regex=False)
     return mask
+
+
+def _df_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
 
 
 # ============================================================
@@ -233,6 +215,8 @@ def sidebar(last_refresh):
 
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
         fetch_data.clear()
+        st.session_state.pop("selected_storage_wo", None)
+        st.session_state.pop("selected_po_wo", None)
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -252,9 +236,6 @@ def sidebar(last_refresh):
     )
 
 
-# ============================================================
-# KPI STRIP
-# ============================================================
 def kpi_strip(df, wos):
     storage_wos = wos[wos["source_category"] == "Storage"]
     po_wos = wos[wos["source_category"] == "PO"]
@@ -280,15 +261,15 @@ def storage_tab(df, wos):
     s_wos = wos[wos["source_category"] == "Storage"].copy()
     s_items = df[df["source_category"] == "Storage"].copy()
 
-    view = st.radio(
-        "View",
-        ["📋 WO Level", "📄 Item Level"],
-        horizontal=True,
-        key="storage_view",
-        label_visibility="collapsed",
-    )
+    # Selected-WO mode: show drilldown only
+    sel = st.session_state.get("selected_storage_wo")
+    if sel and sel in s_wos["work_order_number"].values:
+        storage_wo_drilldown(sel, s_items, s_wos)
+        return
 
-    st.caption("Blocked detection: **PFS table** (Listing Failed, Replen Needed, etc.)")
+    view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
+                    key="storage_view", label_visibility="collapsed")
+    st.caption("Blocked detection: **PFS table** (Listing Failed, Replen Needed, etc.) · 💡 Tick a row to open a WO")
 
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
@@ -318,9 +299,12 @@ def storage_wo_view(s_wos, s_items):
         mask = _str_contains_any(filtered, ["work_order_number", "top_brand", "top_block_reason"], search)
         filtered = filtered[mask]
 
-    st.caption(f"{len(filtered)} of {len(s_wos)} WOs")
-    filtered = filtered.sort_values("pfs_blocks", ascending=False)
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(filtered)} of {len(s_wos)} WOs")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"storage_wos_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key="dl_swo")
 
+    filtered = filtered.sort_values("pfs_blocks", ascending=False)
     display = filtered[
         ["work_order_number", "warehouse", "top_brand", "items", "open_items",
          "pfs_blocks", "top_block_reason", "orig", "processed", "pct",
@@ -333,31 +317,31 @@ def storage_wo_view(s_wos, s_items):
     })
 
     event = st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        height=500,
-        on_select="rerun",
-        selection_mode="single-row",
+        display, use_container_width=True, hide_index=True, height=500,
+        on_select="rerun", selection_mode="single-row",
         column_config={
-            "% Processed": st.column_config.ProgressColumn(
-                "% Processed", min_value=0, max_value=100, format="%.1f%%"
-            ),
-            "Blocked (PFS)": st.column_config.NumberColumn("Blocked (PFS)", help="Items blocked per PFS"),
+            "% Processed": st.column_config.ProgressColumn("% Processed", min_value=0, max_value=100, format="%.1f%%"),
             "Ship By": st.column_config.DateColumn("Ship By"),
         },
     )
 
     if event.selection.rows:
         selected_wo = display.iloc[event.selection.rows[0]]["WO"]
-        storage_wo_drilldown(selected_wo, s_items, s_wos)
+        st.session_state.selected_storage_wo = selected_wo
+        st.rerun()
 
 
 def storage_wo_drilldown(wo_id, s_items, s_wos):
     wo_row = s_wos[s_wos["work_order_number"] == wo_id].iloc[0]
-    st.markdown("---")
-    st.markdown(f"### WO {wo_id} — Storage · {wo_row['warehouse']}")
-    st.caption(f"Top brand: {wo_row['top_brand']} · {wo_row['unique_listings']} unique listings")
+
+    # Top bar: back button + title
+    top1, top2 = st.columns([1, 5])
+    if top1.button("← Back to list", use_container_width=True, key="back_swo"):
+        st.session_state.pop("selected_storage_wo", None)
+        st.rerun()
+    top2.markdown(f"### WO {wo_id} — Storage · {wo_row['warehouse']}")
+
+    st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Items", _safe_int(wo_row["items"]))
@@ -370,32 +354,44 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
 
     items = s_items[s_items["work_order_number"] == wo_id].copy()
 
-    st.markdown("#### Items in this WO")
-    c1, c2 = st.columns([1, 2])
+    st.markdown("---")
+    st.markdown(f"#### 📄 Items in WO {wo_id}")
+    c1, c2, c3 = st.columns([1, 1, 2])
     status_f = c1.selectbox("Status", ["All", "Open", "Closed"], key=f"sdf_status_{wo_id}")
-    search = c2.text_input("Search items", "", placeholder="Listing, brand...", key=f"sdf_search_{wo_id}")
+    blk_f = c2.selectbox("Block", ["All", "Blocked only", "Pickable only"], key=f"sdf_blk_{wo_id}")
+    search = c3.text_input("Search", "", placeholder="Listing, brand, item name...", key=f"sdf_search_{wo_id}")
 
     if status_f != "All":
         items = items[items["status_simple"] == status_f]
+    if blk_f == "Blocked only":
+        items = items[items["is_blocked_pfs"].fillna(False)]
+    elif blk_f == "Pickable only":
+        items = items[~items["is_blocked_pfs"].fillna(False)]
     if search:
         mask = _str_contains_any(items, ["listing_id", "source_brand", "finished_good_name"], search)
         items = items[mask]
 
-    st.caption(f"{len(items)} items")
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(items)} items")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(items), file_name=f"wo_{wo_id}_items_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key=f"dl_swo_items_{wo_id}")
+
     display = items[
         ["listing_id", "finished_good_name", "source_brand", "status_simple",
-         "processing_status", "block_reason_pfs",
-         "original_request", "processed", "woi_processing_pct",
-         "shipped", "storage", "age_days_from_created", "ship_by"]
+         "processing_status", "block_reason_pfs", "original_request", "processed",
+         "woi_processing_pct", "shipped", "storage", "age_days_from_created", "ship_by"]
     ].rename(columns={
-        "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "status_simple": "Status",
-        "processing_status": "Processing Status", "block_reason_pfs": "Block Reason",
-        "original_request": "Orig", "processed": "Processed",
+        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "status_simple": "Status", "processing_status": "Processing Status",
+        "block_reason_pfs": "Block Reason", "original_request": "Orig", "processed": "Processed",
         "woi_processing_pct": "%", "shipped": "Shipped", "storage": "Stowed",
         "age_days_from_created": "Age (d)", "ship_by": "Ship By",
     })
-    st.dataframe(display, use_container_width=True, hide_index=True, height=400)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=500,
+                 column_config={
+                     "%": st.column_config.ProgressColumn("%", min_value=0, max_value=100, format="%.1f%%"),
+                     "Ship By": st.column_config.DateColumn("Ship By"),
+                 })
 
 
 def storage_item_view(s_items):
@@ -408,37 +404,33 @@ def storage_item_view(s_items):
     search = c5.text_input("Search", "", placeholder="Listing...", key="sif_search")
 
     filtered = s_items.copy()
-    if status_f != "All":
-        filtered = filtered[filtered["status_simple"] == status_f]
-    if blk_f == "Blocked only":
-        filtered = filtered[filtered["is_blocked_pfs"].fillna(False)]
-    elif blk_f == "Pickable only":
-        filtered = filtered[~filtered["is_blocked_pfs"].fillna(False)]
-    if wh_f != "Both":
-        filtered = filtered[filtered["warehouse"] == wh_f]
-    if reason_f != "All":
-        filtered = filtered[filtered["block_reason_pfs"] == reason_f]
+    if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
+    if blk_f == "Blocked only": filtered = filtered[filtered["is_blocked_pfs"].fillna(False)]
+    elif blk_f == "Pickable only": filtered = filtered[~filtered["is_blocked_pfs"].fillna(False)]
+    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
+    if reason_f != "All": filtered = filtered[filtered["block_reason_pfs"] == reason_f]
     if search:
         mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
         filtered = filtered[mask]
 
-    st.caption(f"{len(filtered):,} items")
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(filtered):,} items")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"storage_items_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key="dl_sit")
 
     display = filtered[
-        ["work_order_number", "listing_id", "finished_good_name", "source_brand",
-         "warehouse", "status_simple", "processing_status", "block_reason_pfs",
-         "original_request", "processed", "woi_processing_pct",
-         "age_days_from_created", "ship_by"]
+        ["work_order_number", "listing_id", "finished_good_name", "source_brand", "warehouse",
+         "status_simple", "processing_status", "block_reason_pfs", "original_request",
+         "processed", "woi_processing_pct", "age_days_from_created", "ship_by"]
     ].rename(columns={
-        "work_order_number": "WO", "listing_id": "Listing",
-        "finished_good_name": "Item Name", "source_brand": "Brand",
-        "warehouse": "WH", "status_simple": "Status",
+        "work_order_number": "WO", "listing_id": "Listing", "finished_good_name": "Item Name",
+        "source_brand": "Brand", "warehouse": "WH", "status_simple": "Status",
         "processing_status": "Processing Status", "block_reason_pfs": "Reason",
-        "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "age_days_from_created": "Age (d)",
-        "ship_by": "Ship By",
+        "original_request": "Orig", "processed": "Processed", "woi_processing_pct": "%",
+        "age_days_from_created": "Age (d)", "ship_by": "Ship By",
     })
-    st.dataframe(display, use_container_width=True, hide_index=True, height=600)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=600,
+                 column_config={"%": st.column_config.ProgressColumn("%", min_value=0, max_value=100, format="%.1f%%")})
 
 
 # ============================================================
@@ -448,15 +440,14 @@ def po_tab(df, wos):
     p_wos = wos[wos["source_category"] == "PO"].copy()
     p_items = df[df["source_category"] == "PO"].copy()
 
-    view = st.radio(
-        "View",
-        ["📋 WO Level", "📄 Item Level"],
-        horizontal=True,
-        key="po_view",
-        label_visibility="collapsed",
-    )
+    sel = st.session_state.get("selected_po_wo")
+    if sel and sel in p_wos["work_order_number"].values:
+        po_wo_drilldown(sel, p_items, p_wos)
+        return
 
-    st.caption("Block flag: **14/21 days past later of WO/PO ship-by**")
+    view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
+                    key="po_view", label_visibility="collapsed")
+    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Tick a row to open a WO")
 
     if view == "📋 WO Level":
         po_wo_view(p_wos, p_items)
@@ -474,58 +465,55 @@ def po_wo_view(p_wos, p_items):
     search = c4.text_input("Search", "", placeholder="WO, PO#, brand...", key="pf_search")
 
     filtered = p_wos.copy()
-    if flag_f != "All":
-        filtered = filtered[filtered["worst_po_flag"] == flag_f]
-    if open_f == "With Open":
-        filtered = filtered[filtered["open_items"] > 0]
-    elif open_f == "All Closed":
-        filtered = filtered[filtered["open_items"] == 0]
-    if wh_f != "Both":
-        filtered = filtered[filtered["warehouse"] == wh_f]
+    if flag_f != "All": filtered = filtered[filtered["worst_po_flag"] == flag_f]
+    if open_f == "With Open": filtered = filtered[filtered["open_items"] > 0]
+    elif open_f == "All Closed": filtered = filtered[filtered["open_items"] == 0]
+    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
     if search:
         mask = _str_contains_any(filtered, ["work_order_number", "po_number_raw", "top_brand"], search)
         filtered = filtered[mask]
 
-    st.caption(f"{len(filtered)} of {len(p_wos)} WOs")
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(filtered)} of {len(p_wos)} WOs")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"po_wos_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key="dl_pwo")
 
     display = filtered[
-        ["work_order_number", "po_number_raw", "warehouse", "top_brand",
-         "items", "open_items", "untouched", "orig", "processed", "pct",
-         "worst_po_flag", "max_age", "earliest_ship"]
+        ["work_order_number", "po_number_raw", "warehouse", "top_brand", "items", "open_items",
+         "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age", "earliest_ship"]
     ].rename(columns={
-        "work_order_number": "WO", "po_number_raw": "PO #",
-        "warehouse": "WH", "top_brand": "Brand",
+        "work_order_number": "WO", "po_number_raw": "PO #", "warehouse": "WH", "top_brand": "Brand",
         "items": "Items", "open_items": "Open", "untouched": "Untouched",
         "orig": "Orig", "processed": "Processed", "pct": "% Processed",
-        "worst_po_flag": "Worst Flag", "max_age": "Age (d)",
-        "earliest_ship": "Ship By",
+        "worst_po_flag": "Worst Flag", "max_age": "Age (d)", "earliest_ship": "Ship By",
     })
 
     event = st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        height=500,
-        on_select="rerun",
-        selection_mode="single-row",
+        display, use_container_width=True, hide_index=True, height=500,
+        on_select="rerun", selection_mode="single-row",
         column_config={
-            "% Processed": st.column_config.ProgressColumn(
-                "% Processed", min_value=0, max_value=100, format="%.1f%%"
-            ),
+            "% Processed": st.column_config.ProgressColumn("% Processed", min_value=0, max_value=100, format="%.1f%%"),
             "Ship By": st.column_config.DateColumn("Ship By"),
         },
     )
 
     if event.selection.rows:
         selected_wo = display.iloc[event.selection.rows[0]]["WO"]
-        po_wo_drilldown(selected_wo, p_items, p_wos)
+        st.session_state.selected_po_wo = selected_wo
+        st.rerun()
 
 
 def po_wo_drilldown(wo_id, p_items, p_wos):
     wo_row = p_wos[p_wos["work_order_number"] == wo_id].iloc[0]
-    st.markdown("---")
-    st.markdown(f"### WO {wo_id} — PO# {wo_row['po_number_raw']} · {wo_row['warehouse']} · {wo_row['worst_po_flag'] or ''}")
-    st.caption(f"Top brand: {wo_row['top_brand']} · {wo_row['unique_listings']} unique listings")
+
+    # Top bar: back button + title
+    top1, top2 = st.columns([1, 5])
+    if top1.button("← Back to list", use_container_width=True, key="back_pwo"):
+        st.session_state.pop("selected_po_wo", None)
+        st.rerun()
+    top2.markdown(f"### WO {wo_id} — PO# {wo_row['po_number_raw']} · {wo_row['warehouse']} · {wo_row['worst_po_flag'] or ''}")
+
+    st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Items", _safe_int(wo_row["items"]))
@@ -538,36 +526,45 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     items = p_items[p_items["work_order_number"] == wo_id].copy()
     flag_counts = items["po_block_flag"].value_counts().to_dict()
     if flag_counts:
-        breakdown = " · ".join([f"{k}: {v}" for k, v in flag_counts.items()])
+        breakdown = " · ".join([f"{k}: **{v}**" for k, v in flag_counts.items()])
         st.markdown(f"**Flag breakdown:** {breakdown}")
 
-    st.markdown("#### Items in this PO WO")
+    st.markdown("---")
+    st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
+
     flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
                     "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2 = st.columns([1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
     flag_f = c1.selectbox("Flag", flag_options, key=f"pdf_flag_{wo_id}")
-    search = c2.text_input("Search items", "", placeholder="Listing, brand...", key=f"pdf_search_{wo_id}")
+    status_f = c2.selectbox("Status", ["All", "Open", "Closed"], key=f"pdf_status_{wo_id}")
+    search = c3.text_input("Search", "", placeholder="Listing, brand, item name...", key=f"pdf_search_{wo_id}")
 
-    if flag_f != "All":
-        items = items[items["po_block_flag"] == flag_f]
+    if flag_f != "All": items = items[items["po_block_flag"] == flag_f]
+    if status_f != "All": items = items[items["status_simple"] == status_f]
     if search:
         mask = _str_contains_any(items, ["listing_id", "source_brand", "finished_good_name"], search)
         items = items[mask]
 
-    st.caption(f"{len(items)} items")
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(items)} items")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(items), file_name=f"wo_{wo_id}_items_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key=f"dl_pwo_items_{wo_id}")
+
     items = items.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = items[
-        ["listing_id", "finished_good_name", "source_brand", "status_simple",
-         "po_block_flag", "po_days_past_ref_ship_by",
-         "original_request", "processed", "woi_processing_pct", "po_ref_ship_by_date"]
+        ["listing_id", "finished_good_name", "source_brand", "status_simple", "po_block_flag",
+         "po_days_past_ref_ship_by", "original_request", "processed", "woi_processing_pct", "po_ref_ship_by_date"]
     ].rename(columns={
-        "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "status_simple": "Status",
-        "po_block_flag": "Flag", "po_days_past_ref_ship_by": "Days Past",
-        "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "po_ref_ship_by_date": "Ref Ship-by",
+        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "status_simple": "Status", "po_block_flag": "Flag", "po_days_past_ref_ship_by": "Days Past",
+        "original_request": "Orig", "processed": "Processed", "woi_processing_pct": "%",
+        "po_ref_ship_by_date": "Ref Ship-by",
     })
-    st.dataframe(display, use_container_width=True, hide_index=True, height=400)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=500,
+                 column_config={
+                     "%": st.column_config.ProgressColumn("%", min_value=0, max_value=100, format="%.1f%%"),
+                     "Ref Ship-by": st.column_config.DateColumn("Ref Ship-by"),
+                 })
 
 
 def po_item_view(p_items):
@@ -582,35 +579,33 @@ def po_item_view(p_items):
     search = c5.text_input("Search", "", placeholder="Listing, brand...", key="pif_search")
 
     filtered = p_items.copy()
-    if flag_f != "All":
-        filtered = filtered[filtered["po_block_flag"] == flag_f]
-    if status_f != "All":
-        filtered = filtered[filtered["status_simple"] == status_f]
-    if wh_f != "Both":
-        filtered = filtered[filtered["warehouse"] == wh_f]
-    if po_f != "All":
-        filtered = filtered[filtered["po_number_raw"] == po_f]
+    if flag_f != "All": filtered = filtered[filtered["po_block_flag"] == flag_f]
+    if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
+    if wh_f != "Both": filtered = filtered[filtered["warehouse"] == wh_f]
+    if po_f != "All": filtered = filtered[filtered["po_number_raw"] == po_f]
     if search:
         mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
         filtered = filtered[mask]
 
-    st.caption(f"{len(filtered):,} items")
+    h1, h2 = st.columns([3, 1])
+    h1.caption(f"{len(filtered):,} items")
+    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"po_items_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv", use_container_width=True, key="dl_pit")
+
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
-        ["work_order_number", "po_number_raw", "listing_id", "finished_good_name",
-         "source_brand", "warehouse", "status_simple", "po_block_flag",
-         "po_days_past_ref_ship_by", "original_request", "processed",
-         "woi_processing_pct", "ship_by"]
+        ["work_order_number", "po_number_raw", "listing_id", "finished_good_name", "source_brand",
+         "warehouse", "status_simple", "po_block_flag", "po_days_past_ref_ship_by", "original_request",
+         "processed", "woi_processing_pct", "ship_by"]
     ].rename(columns={
-        "work_order_number": "WO", "po_number_raw": "PO #",
-        "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "warehouse": "WH",
+        "work_order_number": "WO", "po_number_raw": "PO #", "listing_id": "Listing",
+        "finished_good_name": "Item Name", "source_brand": "Brand", "warehouse": "WH",
         "status_simple": "Status", "po_block_flag": "Flag",
-        "po_days_past_ref_ship_by": "Days Past",
-        "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "ship_by": "Ship By",
+        "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig",
+        "processed": "Processed", "woi_processing_pct": "%", "ship_by": "Ship By",
     })
-    st.dataframe(display, use_container_width=True, hide_index=True, height=600)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=600,
+                 column_config={"%": st.column_config.ProgressColumn("%", min_value=0, max_value=100, format="%.1f%%")})
 
 
 # ============================================================
@@ -630,7 +625,6 @@ def main():
 
     sidebar(last_refresh)
     kpi_strip(df, wos)
-
     st.markdown("---")
 
     tab_storage, tab_po = st.tabs([
