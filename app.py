@@ -24,6 +24,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Shrink the KPI cards so more fit on screen comfortably
+st.markdown("""
+<style>
+[data-testid="stMetric"] {
+    padding: 0.4rem 0.6rem;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.3rem !important;
+    line-height: 1.2 !important;
+}
+[data-testid="stMetricLabel"] p {
+    font-size: 0.72rem !important;
+}
+[data-testid="stMetricDelta"] {
+    font-size: 0.68rem !important;
+}
+[data-testid="stMetricDelta"] svg {
+    width: 0.7rem !important;
+    height: 0.7rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
