@@ -236,6 +236,9 @@ def sidebar(last_refresh):
     )
 
 
+# ============================================================
+# TOP-LEVEL KPI STRIP (combined totals across both sources)
+# ============================================================
 def kpi_strip(df, wos, warehouse_label):
     storage_wos = wos[wos["source_category"] == "Storage"]
     po_wos = wos[wos["source_category"] == "PO"]
@@ -249,12 +252,6 @@ def kpi_strip(df, wos, warehouse_label):
     pct_processed = (total_processed / total_orig * 100) if total_orig > 0 else 0
     unique_pos = int(po_items["po_number_raw"].dropna().nunique())
 
-    storage_blocked = int(storage_items["is_blocked_pfs"].fillna(False).sum())
-    po_blocked = int((po_items["po_block_flag"] == "🔴 Blocked / Issue").sum())
-    po_partial = int((po_items["po_block_flag"] == "🟠 Partially Processed").sum())
-    po_approaching = int((po_items["po_block_flag"] == "🟡 Approaching ship-by").sum())
-    po_ontrack = int((po_items["po_block_flag"] == "🟢 On Track").sum())
-
     try:
         date_min = df["created_at"].min()
         date_max = df["created_at"].max()
@@ -263,7 +260,7 @@ def kpi_strip(df, wos, warehouse_label):
         date_range = "—"
     st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Warehouse: **{warehouse_label}**")
 
-    st.markdown("##### 📊 Volume")
+    st.markdown("##### 📊 Overall Totals (Storage + PO + IR)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Work Orders", f"{len(wos):,}", f"{len(storage_wos)} S · {len(po_wos)} PO · {len(ir_wos)} IR")
     c2.metric("WO Items", f"{len(df):,}", f"{len(storage_items):,} S · {len(po_items):,} PO")
@@ -271,13 +268,77 @@ def kpi_strip(df, wos, warehouse_label):
     c4.metric("Current Request", f"{total_current:,}")
     c5.metric("Processed", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
-    st.markdown("##### 🚦 Health (item counts)")
+
+# ============================================================
+# STORAGE KPI STRIP (shown inside Storage tab)
+# ============================================================
+def storage_kpi_strip(s_items, s_wos):
+    total_orig = int(s_items["original_request"].fillna(0).sum())
+    total_current = int(s_items["current_request"].fillna(0).sum())
+    total_processed = int(s_items["processed"].fillna(0).sum())
+    pct_processed = (total_processed / total_orig * 100) if total_orig > 0 else 0
+    open_items = int((s_items["status_simple"] == "Open").sum())
+    closed_items = int((s_items["status_simple"] == "Closed").sum())
+    blocked_items = s_items[s_items["is_blocked_pfs"].fillna(False)]
+    total_blocked = len(blocked_items)
+    pickable = open_items - total_blocked
+
+    st.markdown("##### 📦 Storage Volume")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Storage Blocked", storage_blocked, "via PFS")
-    c2.metric("PO Blocked 🔴", f"{po_blocked:,}", "21+ days, 0% processed")
-    c3.metric("PO Partial 🟠", po_partial, "14+ days, not complete")
-    c4.metric("PO Approaching 🟡", po_approaching, "0–13 days past ship-by")
-    c5.metric("PO On Track 🟢", f"{po_ontrack:,}", "Before ship-by")
+    c1.metric("Storage WOs", f"{len(s_wos):,}")
+    c2.metric("Storage Items", f"{len(s_items):,}", f"{open_items:,} Open · {closed_items:,} Closed")
+    c3.metric("Original Qty", f"{total_orig:,}")
+    c4.metric("Current Qty", f"{total_current:,}")
+    c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
+
+    # Block-reason breakdown (top 4 + Other)
+    st.markdown(f"##### 🚫 Storage Block Reasons (PFS) — {total_blocked:,} blocked · {pickable:,} pickable")
+    reason_counts = blocked_items["block_reason_pfs"].dropna().value_counts()
+    top4 = list(reason_counts.head(4).items())
+    while len(top4) < 4:
+        top4.append(("—", 0))
+    other_count = int(reason_counts.iloc[4:].sum()) if len(reason_counts) > 4 else 0
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(top4[0][0], int(top4[0][1]))
+    c2.metric(top4[1][0], int(top4[1][1]))
+    c3.metric(top4[2][0], int(top4[2][1]))
+    c4.metric(top4[3][0], int(top4[3][1]))
+    c5.metric("Other reasons", other_count)
+
+
+# ============================================================
+# PO KPI STRIP (shown inside PO tab)
+# ============================================================
+def po_kpi_strip(p_items, p_wos):
+    total_orig = int(p_items["original_request"].fillna(0).sum())
+    total_current = int(p_items["current_request"].fillna(0).sum())
+    total_processed = int(p_items["processed"].fillna(0).sum())
+    pct_processed = (total_processed / total_orig * 100) if total_orig > 0 else 0
+    unique_pos = int(p_items["po_number_raw"].dropna().nunique())
+    open_items = int((p_items["status_simple"] == "Open").sum())
+    closed_items = int((p_items["status_simple"] == "Closed").sum())
+
+    blocked = int((p_items["po_block_flag"] == "🔴 Blocked / Issue").sum())
+    partial = int((p_items["po_block_flag"] == "🟠 Partially Processed").sum())
+    approaching = int((p_items["po_block_flag"] == "🟡 Approaching ship-by").sum())
+    ontrack = int((p_items["po_block_flag"] == "🟢 On Track").sum())
+    complete = int((p_items["po_block_flag"] == "✅ Complete").sum())
+
+    st.markdown("##### 🚚 PO Volume")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("PO WOs", f"{len(p_wos):,}", f"{unique_pos:,} unique POs")
+    c2.metric("PO Items", f"{len(p_items):,}", f"{open_items:,} Open · {closed_items:,} Closed")
+    c3.metric("Original Qty", f"{total_orig:,}")
+    c4.metric("Current Qty", f"{total_current:,}")
+    c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
+
+    st.markdown(f"##### 🚦 PO Block Flag Breakdown — {blocked + partial:,} items need attention")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Blocked 🔴", f"{blocked:,}", "21+ days, 0%")
+    c2.metric("Partial 🟠", f"{partial:,}", "14+ days, partial")
+    c3.metric("Approaching 🟡", f"{approaching:,}", "0–13 days past")
+    c4.metric("On Track 🟢", f"{ontrack:,}", "Before ship-by")
+    c5.metric("Complete ✅", f"{complete:,}", "Fully processed")
 
 
 # ============================================================
@@ -291,6 +352,10 @@ def storage_tab(df, wos):
     if sel and sel in s_wos["work_order_number"].values:
         storage_wo_drilldown(sel, s_items, s_wos)
         return
+
+    # Storage-specific KPI cards
+    storage_kpi_strip(s_items, s_wos)
+    st.markdown("---")
 
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="storage_view", label_visibility="collapsed")
@@ -464,6 +529,10 @@ def po_tab(df, wos):
         po_wo_drilldown(sel, p_items, p_wos)
         return
 
+    # PO-specific KPI cards
+    po_kpi_strip(p_items, p_wos)
+    st.markdown("---")
+
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="po_view", label_visibility="collapsed")
     st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Tick a row to open a WO")
@@ -626,7 +695,6 @@ def po_item_view(p_items):
 # MAIN
 # ============================================================
 def main():
-    # Header with global warehouse selector on the right
     h1, h2 = st.columns([3, 1.3])
     with h1:
         st.title("📊 WO Tracking Tool")
@@ -649,7 +717,6 @@ def main():
         st.info("Check `.streamlit/secrets.toml` — see README for setup.")
         st.stop()
 
-    # Apply global warehouse filter (affects EVERYTHING below)
     if warehouse != "Both":
         df = df[df["warehouse"] == warehouse].copy()
         wos = wos[wos["warehouse"] == warehouse].copy()
