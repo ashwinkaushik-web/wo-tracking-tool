@@ -54,7 +54,6 @@ def _load_private_key():
     key_pem = st.secrets["snowflake"]["private_key"].encode("utf-8")
     passphrase = st.secrets["snowflake"].get("private_key_passphrase", None)
     passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
-
     p_key = serialization.load_pem_private_key(
         key_pem,
         password=passphrase_bytes,
@@ -82,23 +81,97 @@ def get_snowflake_connection():
     )
 
 
+# ============================================================
+# DATA PREP — vectorised, fast
+# ============================================================
+def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate WOIs into one row per WO. Vectorised; runs once per cache cycle."""
+    # WO-level rollup
+    g = df.groupby("work_order_number", as_index=False).agg(
+        source_category=("source_category", "first"),
+        source=("source", "first"),
+        po_number_raw=("po_number_raw", "first"),
+        warehouse=("warehouse", "first"),
+        items=("work_order_item_id", "count"),
+        open_items=("status_simple", lambda s: (s == "Open").sum()),
+        closed_items=("status_simple", lambda s: (s == "Closed").sum()),
+        untouched=("processed", lambda s: (s == 0).sum()),
+        orig=("original_request", "sum"),
+        processed=("processed", "sum"),
+        ordered=("order_created", "sum"),
+        shipped=("shipped", "sum"),
+        stowed=("storage", "sum"),
+        max_age=("age_days_from_created", "max"),
+        earliest_ship=("ship_by", "min"),
+        unique_listings=("listing_id", "nunique"),
+        pfs_blocks=("is_blocked_pfs", lambda s: s.fillna(False).sum()),
+    )
+    g["pct"] = (g["processed"] * 100 / g["orig"].replace(0, pd.NA)).round(1).fillna(0)
+
+    # Worst PO flag per WO — VECTORISED using flag rank + idxmin
+    flag_priority = [
+        "🔴 Blocked / Issue",
+        "🟠 Partially Processed",
+        "🟡 Approaching ship-by",
+        "🟢 On Track",
+        "✅ Complete",
+    ]
+    flag_rank = {f: i for i, f in enumerate(flag_priority)}
+    df_with_rank = df[df["po_block_flag"].notna()].copy()
+    if not df_with_rank.empty:
+        df_with_rank["_rank"] = df_with_rank["po_block_flag"].map(flag_rank)
+        worst_idx = df_with_rank.groupby("work_order_number")["_rank"].idxmin()
+        worst_per_wo = df_with_rank.loc[worst_idx, ["work_order_number", "po_block_flag"]]
+        worst_map = dict(zip(worst_per_wo["work_order_number"], worst_per_wo["po_block_flag"]))
+    else:
+        worst_map = {}
+    g["worst_po_flag"] = g["work_order_number"].map(worst_map)
+
+    # Top brand per WO — VECTORISED using value_counts groupby
+    brand_counts = (
+        df.dropna(subset=["source_brand"])
+        .groupby(["work_order_number", "source_brand"])
+        .size()
+        .reset_index(name="_cnt")
+        .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
+        .drop_duplicates("work_order_number", keep="first")
+    )
+    brand_map = dict(zip(brand_counts["work_order_number"], brand_counts["source_brand"]))
+    g["top_brand"] = g["work_order_number"].map(brand_map).fillna("")
+
+    # Top block reason per WO (only from blocked items) — VECTORISED
+    blocked = df[df["is_blocked_pfs"].fillna(False)]
+    if not blocked.empty:
+        reason_counts = (
+            blocked.dropna(subset=["block_reason_pfs"])
+            .groupby(["work_order_number", "block_reason_pfs"])
+            .size()
+            .reset_index(name="_cnt")
+            .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
+            .drop_duplicates("work_order_number", keep="first")
+        )
+        reason_map = dict(zip(reason_counts["work_order_number"], reason_counts["block_reason_pfs"]))
+    else:
+        reason_map = {}
+    g["top_block_reason"] = g["work_order_number"].map(reason_map).fillna("")
+    return g
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_data():
-    """Run the production query and return a DataFrame. Cached 30 min."""
+    """Run query + build aggregates. Cached 30 min as a single bundle."""
     sql = QUERY_PATH.read_text()
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
         cur.execute(sql)
-        # Use fetchall() instead of fetch_pandas_all() so out-of-bounds
-        # dates (e.g. typo year 0026) don't break pandas' nanosecond limits.
         rows = cur.fetchall()
         cols = [c[0].lower() for c in cur.description]
         df = pd.DataFrame(rows, columns=cols)
     finally:
         cur.close()
 
-    # Coerce date columns; bad values become NaT (not a time)
+    # Coerce date columns
     date_cols = [
         "po_ref_ship_by_date", "po_requested_ship_date",
         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
@@ -108,7 +181,7 @@ def fetch_data():
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Convert Snowflake Decimal columns to numeric (floats)
+    # Convert Decimal columns to numeric
     numeric_cols = [
         "original_request", "current_request", "processed",
         "order_created", "shipped", "storage", "woi_processing_pct",
@@ -120,63 +193,25 @@ def fetch_data():
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df, datetime.now()
+
+    # Build aggregates ONCE and return alongside the raw data — both cached
+    wos = _build_wo_aggregates(df)
+    return df, wos, datetime.now()
 
 
 # ============================================================
-# DATA PREP
+# FAST SEARCH HELPER (vectorised)
 # ============================================================
-def build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate WOIs into one row per WO with summary metrics."""
-    g = df.groupby("work_order_number", as_index=False).agg(
-        source_category=("source_category", "first"),
-        source=("source", "first"),
-        po_number_raw=("po_number_raw", "first"),
-        warehouse=("warehouse", "first"),
-        items=("work_order_item_id", "count"),
-        open_items=("status_simple", lambda s: (s == "Open").sum()),
-        closed_items=("status_simple", lambda s: (s == "Closed").sum()),
-        untouched=("processed", lambda s: ((s == 0)).sum()),
-        orig=("original_request", "sum"),
-        processed=("processed", "sum"),
-        ordered=("order_created", "sum"),
-        shipped=("shipped", "sum"),
-        stowed=("storage", "sum"),
-        max_age=("age_days_from_created", "max"),
-        earliest_ship=("ship_by", "min"),
-        unique_listings=("listing_id", lambda s: s.nunique()),
-        pfs_blocks=("is_blocked_pfs", lambda s: s.fillna(False).sum()),
-    )
-    g["pct"] = (g["processed"] * 100 / g["orig"].replace(0, pd.NA)).round(1).fillna(0)
-
-    # Worst PO flag per WO (priority order)
-    flag_priority = [
-        "🔴 Blocked / Issue",
-        "🟠 Partially Processed",
-        "🟡 Approaching ship-by",
-        "🟢 On Track",
-        "✅ Complete",
-    ]
-
-    def worst_flag(wo_id):
-        flags = df.loc[df["work_order_number"] == wo_id, "po_block_flag"].dropna().unique()
-        for f in flag_priority:
-            if f in flags:
-                return f
-        return None
-
-    # Top brand and top block reason per WO
-    brand_map = df.groupby("work_order_number")["source_brand"].agg(
-        lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else ""
-    )
-    reason_map = df[df["is_blocked_pfs"].fillna(False)].groupby("work_order_number")["block_reason_pfs"].agg(
-        lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else ""
-    )
-
-    g["top_brand"] = g["work_order_number"].map(brand_map).fillna("")
-    g["top_block_reason"] = g["work_order_number"].map(reason_map).fillna("")
-    g["worst_po_flag"] = g["work_order_number"].apply(worst_flag)
-    return g
+def _str_contains_any(df, cols, query):
+    """Vectorised case-insensitive substring search across columns."""
+    if not query:
+        return pd.Series([True] * len(df), index=df.index)
+    q = query.lower()
+    mask = pd.Series([False] * len(df), index=df.index)
+    for c in cols:
+        if c in df.columns:
+            mask = mask | df[c].astype(str).str.lower().str.contains(q, na=False, regex=False)
+    return mask
 
 
 # ============================================================
@@ -274,15 +309,8 @@ def storage_wo_view(s_wos, s_items):
     if wh_filter != "Both":
         filtered = filtered[filtered["warehouse"] == wh_filter]
     if search:
-        s = search.lower()
-        filtered = filtered[
-            filtered.apply(
-                lambda r: s in str(r["work_order_number"]).lower()
-                or s in str(r["top_brand"]).lower()
-                or s in str(r["top_block_reason"]).lower(),
-                axis=1,
-            )
-        ]
+        mask = _str_contains_any(filtered, ["work_order_number", "top_brand", "top_block_reason"], search)
+        filtered = filtered[mask]
 
     st.caption(f"{len(filtered)} of {len(s_wos)} WOs")
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
@@ -344,11 +372,8 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     if status_f != "All":
         items = items[items["status_simple"] == status_f]
     if search:
-        s = search.lower()
-        items = items[items.apply(
-            lambda r: s in str(r["listing_id"]).lower() or s in str(r["source_brand"]).lower(),
-            axis=1,
-        )]
+        mask = _str_contains_any(items, ["listing_id", "source_brand", "finished_good_name"], search)
+        items = items[mask]
 
     st.caption(f"{len(items)} items")
     display = items[
@@ -388,11 +413,8 @@ def storage_item_view(s_items):
     if reason_f != "All":
         filtered = filtered[filtered["block_reason_pfs"] == reason_f]
     if search:
-        s = search.lower()
-        filtered = filtered[filtered.apply(
-            lambda r: s in str(r["listing_id"]).lower() or s in str(r["source_brand"]).lower(),
-            axis=1,
-        )]
+        mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
+        filtered = filtered[mask]
 
     st.caption(f"{len(filtered):,} items")
 
@@ -455,13 +477,8 @@ def po_wo_view(p_wos, p_items):
     if wh_f != "Both":
         filtered = filtered[filtered["warehouse"] == wh_f]
     if search:
-        s = search.lower()
-        filtered = filtered[filtered.apply(
-            lambda r: s in str(r["work_order_number"]).lower()
-            or s in str(r["po_number_raw"]).lower()
-            or s in str(r["top_brand"]).lower(),
-            axis=1,
-        )]
+        mask = _str_contains_any(filtered, ["work_order_number", "po_number_raw", "top_brand"], search)
+        filtered = filtered[mask]
 
     st.caption(f"{len(filtered)} of {len(p_wos)} WOs")
 
@@ -528,11 +545,8 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     if flag_f != "All":
         items = items[items["po_block_flag"] == flag_f]
     if search:
-        s = search.lower()
-        items = items[items.apply(
-            lambda r: s in str(r["listing_id"]).lower() or s in str(r["source_brand"]).lower(),
-            axis=1,
-        )]
+        mask = _str_contains_any(items, ["listing_id", "source_brand", "finished_good_name"], search)
+        items = items[mask]
 
     st.caption(f"{len(items)} items")
     items = items.sort_values("po_days_past_ref_ship_by", ascending=False)
@@ -571,11 +585,8 @@ def po_item_view(p_items):
     if po_f != "All":
         filtered = filtered[filtered["po_number_raw"] == po_f]
     if search:
-        s = search.lower()
-        filtered = filtered[filtered.apply(
-            lambda r: s in str(r["listing_id"]).lower() or s in str(r["source_brand"]).lower(),
-            axis=1,
-        )]
+        mask = _str_contains_any(filtered, ["listing_id", "source_brand", "finished_good_name", "work_order_number"], search)
+        filtered = filtered[mask]
 
     st.caption(f"{len(filtered):,} items")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
@@ -605,13 +616,11 @@ def main():
 
     try:
         with st.spinner("Loading WO data from Snowflake..."):
-            df, last_refresh = fetch_data()
+            df, wos, last_refresh = fetch_data()
     except Exception as e:
         st.error(f"Failed to fetch data from Snowflake: {e}")
         st.info("Check `.streamlit/secrets.toml` — see README for setup.")
         st.stop()
-
-    wos = build_wo_aggregates(df)
 
     sidebar(last_refresh)
     kpi_strip(df, wos)
