@@ -73,12 +73,24 @@ def fetch_data():
     cur = conn.cursor()
     try:
         cur.execute(sql)
-        df = cur.fetch_pandas_all()
-        df.columns = [c.lower() for c in df.columns]
+        # Use fetchall() instead of fetch_pandas_all() so out-of-bounds
+        # dates (e.g. typo year 0026) don't break pandas' nanosecond limits.
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
     finally:
         cur.close()
-    return df, datetime.now()
 
+    # Coerce date columns; bad values become NaT (not a time)
+    date_cols = [
+        "po_ref_ship_by_date", "po_requested_ship_date",
+        "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
+        "ship_by", "last_edit_at", "created_at",
+    ]
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df, datetime.now()
 
 # ============================================================
 # DATA PREP
