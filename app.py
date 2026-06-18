@@ -239,19 +239,50 @@ def sidebar(last_refresh):
 def kpi_strip(df, wos):
     storage_wos = wos[wos["source_category"] == "Storage"]
     po_wos = wos[wos["source_category"] == "PO"]
+    ir_wos = wos[wos["source_category"] == "IR"]
     storage_items = df[df["source_category"] == "Storage"]
     po_items = df[df["source_category"] == "PO"]
 
+    # Volume totals
+    total_orig = int(df["original_request"].fillna(0).sum())
+    total_current = int(df["current_request"].fillna(0).sum())
+    total_processed = int(df["processed"].fillna(0).sum())
+    pct_processed = (total_processed / total_orig * 100) if total_orig > 0 else 0
+    unique_pos = int(po_items["po_number_raw"].dropna().nunique())
+
+    # Health counts
     storage_blocked = int(storage_items["is_blocked_pfs"].fillna(False).sum())
     po_blocked = int((po_items["po_block_flag"] == "🔴 Blocked / Issue").sum())
     po_partial = int((po_items["po_block_flag"] == "🟠 Partially Processed").sum())
+    po_approaching = int((po_items["po_block_flag"] == "🟡 Approaching ship-by").sum())
+    po_ontrack = int((po_items["po_block_flag"] == "🟢 On Track").sum())
 
+    # Data range caption (for verification against Pattern UI)
+    try:
+        date_min = df["created_at"].min()
+        date_max = df["created_at"].max()
+        date_range = f"{date_min.strftime('%Y-%m-%d')} → {date_max.strftime('%Y-%m-%d')}"
+    except Exception:
+        date_range = "—"
+    st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Both Northampton + Wroclaw")
+
+    # Row 1 — Volume (matches Pattern UI: Work Order Items / Purchase Orders / Original / Current / Processed)
+    st.markdown("##### 📊 Volume")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total WOs YTD", f"{len(wos):,}", f"{len(storage_wos)} Storage · {len(po_wos)} PO")
-    c2.metric("Total Items YTD", f"{len(df):,}", f"{len(storage_items):,} S · {len(po_items):,} P")
-    c3.metric("Storage Blocked", storage_blocked, "via PFS")
-    c4.metric("PO Blocked 🔴", f"{po_blocked:,}", "21+ days, 0% processed")
-    c5.metric("PO Partial 🟠", po_partial, "14+ days, not complete")
+    c1.metric("Work Orders", f"{len(wos):,}", f"{len(storage_wos)} S · {len(po_wos)} PO · {len(ir_wos)} IR")
+    c2.metric("WO Items", f"{len(df):,}", f"{len(storage_items):,} S · {len(po_items):,} PO")
+    c3.metric("Original Request", f"{total_orig:,}")
+    c4.metric("Current Request", f"{total_current:,}")
+    c5.metric("Processed", f"{total_processed:,}", f"{pct_processed:.1f}%")
+
+    # Row 2 — Health (blocked / partial / approaching / on-track)
+    st.markdown("##### 🚦 Health")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Storage Blocked", storage_blocked, "via PFS")
+    c2.metric("PO Blocked 🔴", f"{po_blocked:,}", "21+ days, 0% processed")
+    c3.metric("PO Partial 🟠", po_partial, "14+ days, not complete")
+    c4.metric("PO Approaching 🟡", po_approaching, "0–13 days past ship-by")
+    c5.metric("PO On Track 🟢", f"{po_ontrack:,}", "Before ship-by")
 
 
 # ============================================================
