@@ -7,6 +7,7 @@ Live Snowflake connection, cached 30 min, manual refresh available.
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -106,7 +107,12 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
         unique_listings=("listing_id", "nunique"),
         pfs_blocks=("is_blocked_pfs", lambda s: s.fillna(False).sum()),
     )
-    g["pct"] = (g["processed"] * 100 / g["orig"].replace(0, pd.NA)).round(1).fillna(0)
+    g["pct"] = np.where(
+        g["orig"].fillna(0) > 0,
+        (g["processed"].fillna(0) * 100.0 / g["orig"].replace(0, np.nan)).round(1),
+        0,
+    )
+    g["pct"] = pd.to_numeric(g["pct"], errors="coerce").fillna(0)
 
     # Worst PO flag per WO — VECTORISED using flag rank + idxmin
     flag_priority = [
