@@ -4,13 +4,18 @@ WO Tracking Tool — Streamlit App
 Tracks Storage and PO Work Orders with blocked / stalled detection.
 Live Snowflake connection, cached 30 min, manual refresh available.
 
-Tables use AgGrid (Excel-style per-column filters in the header row). If
-streamlit-aggrid isn't available at runtime, every table automatically falls
-back to the native st.dataframe so the app never goes blank.
+Tables use AgGrid (Excel-style per-column filters, sort, resize, click-to-drill,
+% progress bars, colour-coded rows, pinned key column). Each table also has a
+Columns picker, CSV + Excel export, a "copy a few values" popover, and a
+one-click full-table copy. If streamlit-aggrid isn't available at runtime,
+tables fall back to native st.dataframe so the app never goes blank.
 """
 
+import io
 import re
+import html as _html
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import snowflake.connector
@@ -23,7 +28,6 @@ from pathlib import Path
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
     HAS_AGGRID = True
-    # % progress-bar renderer for AgGrid cells
     PCT_RENDERER = JsCode("""
     class PctBar {
       init(p){
@@ -57,9 +61,27 @@ try:
       refresh(){ return false; }
     }
     """)
+    # Colour rows by status — reads the displayed columns that carry the flag
+    ROW_STYLE_JS = JsCode("""
+    function(params){
+      var d = params.data || {};
+      var f = String(d['Flag'] || d['Worst Flag'] || '');
+      if (f.indexOf('🔴') > -1) return {'backgroundColor':'rgba(239,68,68,0.13)'};
+      if (f.indexOf('🟠') > -1) return {'backgroundColor':'rgba(245,158,11,0.13)'};
+      if (f.indexOf('🟡') > -1) return {'backgroundColor':'rgba(234,179,8,0.10)'};
+      if (f.indexOf('🟢') > -1) return {'backgroundColor':'rgba(34,197,94,0.07)'};
+      if (f.indexOf('✅') > -1) return {'backgroundColor':'rgba(34,197,94,0.04)'};
+      var bp = d['Blocked (PFS)'];
+      if (bp !== undefined && bp !== null && bp !== '' && Number(bp) > 0) return {'backgroundColor':'rgba(239,68,68,0.11)'};
+      var ps = String(d['Block Status'] || '');
+      if (ps.indexOf('Unpickable') > -1) return {'backgroundColor':'rgba(239,68,68,0.11)'};
+      return null;
+    }
+    """)
 except Exception:
     HAS_AGGRID = False
     PCT_RENDERER = None
+    ROW_STYLE_JS = None
 
 # ============================================================
 # CONFIG
@@ -71,26 +93,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Shrink the KPI cards so more fit on screen comfortably
 st.markdown("""
 <style>
-[data-testid="stMetric"] {
-    padding: 0.4rem 0.6rem;
-}
-[data-testid="stMetricValue"] {
-    font-size: 1.3rem !important;
-    line-height: 1.2 !important;
-}
-[data-testid="stMetricLabel"] p {
-    font-size: 0.72rem !important;
-}
-[data-testid="stMetricDelta"] {
-    font-size: 0.68rem !important;
-}
-[data-testid="stMetricDelta"] svg {
-    width: 0.7rem !important;
-    height: 0.7rem !important;
-}
+[data-testid="stMetric"] { padding: 0.4rem 0.6rem; }
+[data-testid="stMetricValue"] { font-size: 1.3rem !important; line-height: 1.2 !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.72rem !important; }
+[data-testid="stMetricDelta"] { font-size: 0.68rem !important; }
+[data-testid="stMetricDelta"] svg { width: 0.7rem !important; height: 0.7rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -116,7 +125,6 @@ def _safe_date_str(v):
 
 
 def _to_wo(v):
-    """Coerce an AgGrid/dataframe-returned WO value back to a clean int."""
     try:
         return int(v)
     except (ValueError, TypeError):
@@ -124,8 +132,6 @@ def _to_wo(v):
 
 
 def _reset_selection():
-    """Clear any open WO and bump the grid nonce so AgGrid/native selection
-    state resets cleanly (prevents a stale row re-opening the drilldown)."""
     st.session_state.pop("selected_storage_wo", None)
     st.session_state.pop("selected_po_wo", None)
     st.session_state["grid_nonce"] = st.session_state.get("grid_nonce", 0) + 1
@@ -138,11 +144,7 @@ def _load_private_key():
     key_pem = st.secrets["snowflake"]["private_key"].encode("utf-8")
     passphrase = st.secrets["snowflake"].get("private_key_passphrase", None)
     passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
-    p_key = serialization.load_pem_private_key(
-        key_pem,
-        password=passphrase_bytes,
-        backend=default_backend(),
-    )
+    p_key = serialization.load_pem_private_key(key_pem, password=passphrase_bytes, backend=default_backend())
     return p_key.private_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PrivateFormat.PKCS8,
@@ -271,23 +273,20 @@ def fetch_data():
 
 
 # ============================================================
-# SEARCH + GRID HELPERS
+# SEARCH + EXPORT HELPERS
 # ============================================================
 def _str_contains_any(df, cols, query):
-    """Multi-term search. Splits the query on commas / newlines / semicolons
-    and matches a row if ANY term appears in ANY of the given columns.
-    So you can paste several WOs or listing IDs at once and get all of them."""
+    """Multi-term search. Split on commas / new lines / semicolons and match a
+    row if ANY term appears in ANY of the columns (paste several at once)."""
     if not query or not str(query).strip():
         return pd.Series([True] * len(df), index=df.index)
     terms = [t.strip().lower() for t in re.split(r"[,\n;]+", str(query)) if t.strip()]
     if not terms:
         return pd.Series([True] * len(df), index=df.index)
-
     combined = pd.Series([""] * len(df), index=df.index)
     for c in cols:
         if c in df.columns:
             combined = combined + " " + df[c].astype(str).str.lower()
-
     mask = pd.Series([False] * len(df), index=df.index)
     for t in terms:
         mask = mask | combined.str.contains(re.escape(t), na=False, regex=True)
@@ -298,43 +297,131 @@ def _df_to_csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
-def copy_popover(display, id_cols, key):
-    """Quick clipboard copy of the key ID columns for the current filtered view.
-    Each block has Streamlit's built-in one-click copy icon. Reflects the
-    dropdown/search filters above. For an exact copy of rows after in-grid
-    header filters, drag-select rows in the table and press Ctrl+C."""
-    present = [c for c in id_cols if c in display.columns]
-    if not present:
-        return
-    col, _ = st.columns([1.3, 5])
-    with col:
-        with st.popover("📋 Copy items", use_container_width=True):
-            st.caption(
-                "Use the copy icon on each block (top-right). Reflects the filters above. "
-                "Tip: to copy exactly what's left after the header filters, drag-select rows "
-                "in the table and press Ctrl+C."
-            )
-            for c in present:
-                vals = [v for v in display[c].astype(str).tolist()
-                        if v and v.strip() and v.lower() != "nan"]
-                n = len(vals)
-                shown = vals[:5000]
-                suffix = " — first 5,000" if n > 5000 else ""
-                st.markdown(f"**{c}** ({n:,}{suffix})")
-                st.code("\n".join(shown) if shown else "—", language="text")
+@st.cache_data(show_spinner=False)
+def _xlsx_bytes_from_csv(csv_text: str) -> bytes:
+    """Build .xlsx from CSV text. Cached so repeated reruns don't rebuild."""
+    buf = io.BytesIO()
+    pd.read_csv(io.StringIO(csv_text), dtype=str).to_excel(buf, index=False, engine="openpyxl")
+    return buf.getvalue()
 
 
 def _grid_key(base):
     return f"{base}_{st.session_state.get('grid_nonce', 0)}"
 
 
+_COPY_TABLE_TEMPLATE = """
+<div style="font-family:sans-serif;">
+  <button id="__BID__" style="width:100%;background:#5B4DF0;color:#fff;border:none;border-radius:6px;padding:8px 10px;font-size:13px;font-weight:600;cursor:pointer;">📋 Copy table</button>
+  <textarea id="__BID___data" style="position:absolute;left:-9999px;top:-9999px;">__DATA__</textarea>
+  <script>
+  (function(){
+    var b = document.getElementById("__BID__");
+    var t = document.getElementById("__BID___data");
+    if(!b) return;
+    b.onclick = function(){
+      t.select(); t.setSelectionRange(0, 999999999);
+      try {
+        navigator.clipboard.writeText(t.value).then(function(){
+          b.textContent = "✅ Copied __NOTE__";
+          setTimeout(function(){ b.textContent = "📋 Copy table"; }, 2500);
+        });
+      } catch(e) {
+        document.execCommand("copy");
+        b.textContent = "✅ Copied";
+        setTimeout(function(){ b.textContent = "📋 Copy table"; }, 2500);
+      }
+    };
+  })();
+  </script>
+</div>
+"""
+
+
+def copy_table_button(display, key):
+    """One-click copy of the whole (visible) table as TSV with headers — pastes
+    straight into Excel / Google Sheets. Capped at 5,000 rows."""
+    cap = 5000
+    d = display.head(cap)
+    tsv = d.to_csv(index=False, sep="\t")
+    note = f"{len(d)}×{len(d.columns)}" + (" (first 5k)" if len(display) > cap else "")
+    bid = f"cbtn{abs(hash((key, len(display)))) % 10**9}"
+    html_out = (
+        _COPY_TABLE_TEMPLATE
+        .replace("__BID__", bid)
+        .replace("__DATA__", _html.escape(tsv))
+        .replace("__NOTE__", note)
+    )
+    components.html(html_out, height=46)
+
+
+def copy_popover(display, id_cols, key):
+    """Copy values from a column — all of them, or tick just a few. Drag-select
+    cells in the table + Ctrl+C also copies a few elements of a row/column."""
+    present = [c for c in id_cols if c in display.columns]
+    if not present:
+        return
+    with st.popover("📋 Copy items", use_container_width=True):
+        st.caption(
+            "Pick a column, optionally tick just the values you want, then use the copy "
+            "icon on the block. Or drag-select any cells in the table and press Ctrl+C."
+        )
+        c = st.selectbox("Column", present, key=f"{key}_col")
+        vals = [v for v in display[c].astype(str).tolist() if v and v.strip() and v.lower() != "nan"]
+        seen = set()
+        uniq = [x for x in vals if not (x in seen or seen.add(x))]
+        picked = st.multiselect(
+            "Pick a few (optional — empty = all)", uniq[:1000],
+            key=f"{key}_pick", placeholder="All values",
+        )
+        out = picked if picked else uniq
+        st.caption(f"{len(out):,} value(s)")
+        st.code("\n".join(out[:5000]) if out else "—", language="text")
+
+
+def column_picker(all_labels, key, default_labels=None, required=()):
+    """👁 Columns expander — choose which columns show. Required columns are
+    always kept (e.g. WO, needed for row selection)."""
+    default_labels = default_labels if default_labels is not None else all_labels
+    with st.expander("👁 Columns"):
+        chosen = st.multiselect(
+            "Show columns", options=all_labels, default=default_labels,
+            key=key, label_visibility="collapsed",
+        )
+    chosen_set = set(chosen) | set(required)
+    ordered = [c for c in all_labels if c in chosen_set]
+    return ordered if ordered else list(all_labels)
+
+
+def table_toolbar(display, *, key, file_stem, id_cols, count_label):
+    """Count + CSV + Excel + copy-items popover + copy-table button, one row."""
+    ts = datetime.now().strftime("%Y%m%d")
+    a, b, c, d, e = st.columns([2.6, 1, 1, 1.2, 1.4])
+    a.caption(count_label)
+    csv_text = display.to_csv(index=False)
+    b.download_button("📥 CSV", csv_text.encode("utf-8"),
+                      file_name=f"{file_stem}_{ts}.csv", mime="text/csv",
+                      use_container_width=True, key=f"{key}_csv")
+    if len(display) <= 20000:
+        c.download_button("📊 Excel", _xlsx_bytes_from_csv(csv_text),
+                          file_name=f"{file_stem}_{ts}.xlsx",
+                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                          use_container_width=True, key=f"{key}_xlsx")
+    else:
+        c.caption("Excel: filter <20k")
+    with d:
+        copy_popover(display, id_cols, key=f"{key}_cp")
+    with e:
+        copy_table_button(display, key=f"{key}_ct")
+
+
+# ============================================================
+# GRID RENDERER
+# ============================================================
 def render_table(display, *, key, selectable=False, pct_cols=(), num_cols=(),
-                 date_cols=(), height=480, page_size=100):
-    """Render a dataframe as an Excel-style filterable grid (AgGrid).
-    Falls back to st.dataframe if AgGrid is unavailable.
-    Returns the selected WO value (from the 'WO' column) or None."""
+                 date_cols=(), pin_cols=(), color_rows=True, height=480, page_size=100):
+    """Excel-style filterable grid (AgGrid) with native fallback.
+    Returns the selected WO (from the 'WO' column) or None."""
     disp = display.copy()
-    # Dates -> ISO strings so they serialise cleanly and stay text-filterable
     for c in date_cols:
         if c in disp.columns:
             disp[c] = pd.to_datetime(disp[c], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -342,44 +429,43 @@ def render_table(display, *, key, selectable=False, pct_cols=(), num_cols=(),
 
     if HAS_AGGRID:
         try:
-            return _render_aggrid(disp, key, selectable, pct_cols, num_cols, height, page_size)
-        except Exception as e:
-            st.caption(f"⚠️ Grid fell back to basic table ({e})")
-    return _render_native(disp, key, selectable, pct_cols, height)
+            return _render_aggrid(disp, key, selectable, pct_cols, num_cols,
+                                  pin_cols, color_rows, height, page_size)
+        except Exception as exc:  # noqa: BLE001
+            st.caption(f"⚠️ Grid fell back to basic table ({exc})")
+    return _render_native(disp, key, selectable, pct_cols, pin_cols, height)
 
 
-def _render_aggrid(disp, key, selectable, pct_cols, num_cols, height, page_size):
+def _render_aggrid(disp, key, selectable, pct_cols, num_cols, pin_cols, color_rows, height, page_size):
     gb = GridOptionsBuilder.from_dataframe(disp)
-    gb.configure_default_column(
-        filter=True, floatingFilter=True, sortable=True, resizable=True,
-    )
-    for c in num_cols:
-        if c in disp.columns:
-            gb.configure_column(c, type=["numericColumn"], filter="agNumberColumnFilter")
-    for c in pct_cols:
-        if c in disp.columns:
-            gb.configure_column(
-                c, type=["numericColumn"], filter="agNumberColumnFilter",
-                cellRenderer=PCT_RENDERER, minWidth=130,
-            )
+    gb.configure_default_column(filter=True, floatingFilter=True, sortable=True, resizable=True)
+
+    pct_set, num_set, pin_set = set(pct_cols), set(num_cols), set(pin_cols)
+    for col in disp.columns:
+        kwargs = {}
+        if col in num_set:
+            kwargs.update(type=["numericColumn"], filter="agNumberColumnFilter")
+        if col in pct_set:
+            kwargs.update(type=["numericColumn"], filter="agNumberColumnFilter",
+                          cellRenderer=PCT_RENDERER, minWidth=130)
+        if col in pin_set:
+            kwargs.update(pinned="left")
+        if kwargs:
+            gb.configure_column(col, **kwargs)
+
     if selectable:
         gb.configure_selection("single", use_checkbox=False)
-    gb.configure_grid_options(
-        pagination=True, paginationPageSize=page_size,
-        enableCellTextSelection=True, ensureDomOrder=True,
-    )
-    options = gb.build()
+
+    grid_opts = dict(pagination=True, paginationPageSize=page_size,
+                     enableCellTextSelection=True, ensureDomOrder=True)
+    if color_rows and ROW_STYLE_JS is not None:
+        grid_opts["getRowStyle"] = ROW_STYLE_JS
+    gb.configure_grid_options(**grid_opts)
 
     grid = AgGrid(
-        disp,
-        gridOptions=options,
-        height=height,
-        theme="streamlit",
-        update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=False,
-        enable_enterprise_modules=False,
-        key=key,
+        disp, gridOptions=gb.build(), height=height, theme="streamlit",
+        update_mode=GridUpdateMode.SELECTION_CHANGED, allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False, enable_enterprise_modules=False, key=key,
     )
 
     if not selectable:
@@ -396,16 +482,21 @@ def _render_aggrid(disp, key, selectable, pct_cols, num_cols, height, page_size)
     return None
 
 
-def _render_native(disp, key, selectable, pct_cols, height):
+def _render_native(disp, key, selectable, pct_cols, pin_cols, height):
     colcfg = {}
     for c in pct_cols:
         if c in disp.columns:
             colcfg[c] = st.column_config.ProgressColumn(c, min_value=0, max_value=100, format="%.1f%%")
+    for c in pin_cols:
+        if c in disp.columns and c not in colcfg:
+            try:
+                colcfg[c] = st.column_config.Column(c, pinned="left")
+            except TypeError:
+                pass  # older Streamlit without pinned support
     if selectable:
         event = st.dataframe(
             disp, use_container_width=True, hide_index=True, height=height,
-            on_select="rerun", selection_mode="single-row",
-            column_config=colcfg, key=key,
+            on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
         )
         if event.selection.rows and "WO" in disp.columns:
             return disp.iloc[event.selection.rows[0]]["WO"]
@@ -420,16 +511,13 @@ def _render_native(disp, key, selectable, pct_cols, height):
 def sidebar(last_refresh):
     st.sidebar.title("📊 WO Tracker")
     st.sidebar.caption("Live Snowflake snapshot")
-
     if last_refresh:
         delta_min = (datetime.now() - last_refresh).total_seconds() / 60
         st.sidebar.metric("Last refresh", last_refresh.strftime("%H:%M:%S"), f"{delta_min:.0f} min ago")
-
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
         fetch_data.clear()
         _reset_selection()
         st.rerun()
-
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**Coverage**\n\n"
@@ -439,9 +527,11 @@ def sidebar(last_refresh):
     )
     st.sidebar.markdown("---")
     st.sidebar.markdown(
-        "**Search tip**\n\n"
-        "Paste multiple values separated by commas or new lines to match any "
-        "of them (e.g. several WOs or listing IDs at once).\n"
+        "**Table tips**\n\n"
+        "- Filter row under each header (Excel-style)\n"
+        "- Drag-select cells + Ctrl+C to copy a few\n"
+        "- 👁 Columns to show/hide · 📋 to copy\n"
+        "- Paste several values in Search to match any\n"
     )
     st.sidebar.markdown("---")
     st.sidebar.markdown(
@@ -454,7 +544,7 @@ def sidebar(last_refresh):
 
 
 # ============================================================
-# TOP-LEVEL KPI STRIP (combined totals across both sources)
+# KPI STRIPS
 # ============================================================
 def kpi_strip(df, wos, warehouse_label):
     storage_wos = wos[wos["source_category"] == "Storage"]
@@ -470,9 +560,7 @@ def kpi_strip(df, wos, warehouse_label):
     unique_pos = int(po_items["po_number_raw"].dropna().nunique())
 
     try:
-        date_min = df["created_at"].min()
-        date_max = df["created_at"].max()
-        date_range = f"{date_min.strftime('%Y-%m-%d')} → {date_max.strftime('%Y-%m-%d')}"
+        date_range = f"{df['created_at'].min().strftime('%Y-%m-%d')} → {df['created_at'].max().strftime('%Y-%m-%d')}"
     except Exception:
         date_range = "—"
     st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Warehouse: **{warehouse_label}**")
@@ -486,9 +574,6 @@ def kpi_strip(df, wos, warehouse_label):
     c5.metric("Processed", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
 
-# ============================================================
-# STORAGE KPI STRIP (shown inside Storage tab)
-# ============================================================
 def storage_kpi_strip(s_items, s_wos):
     total_orig = int(s_items["original_request"].fillna(0).sum())
     total_current = int(s_items["current_request"].fillna(0).sum())
@@ -508,7 +593,6 @@ def storage_kpi_strip(s_items, s_wos):
     c4.metric("Current Qty", f"{total_current:,}")
     c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
-    # Block-reason breakdown (top 4 + Other)
     st.markdown(f"##### 🚫 Storage Block Reasons (PFS) — {total_blocked:,} blocked · {pickable:,} pickable")
     reason_counts = blocked_items["block_reason_pfs"].dropna().value_counts()
     top4 = list(reason_counts.head(4).items())
@@ -523,9 +607,6 @@ def storage_kpi_strip(s_items, s_wos):
     c5.metric("Other reasons", other_count)
 
 
-# ============================================================
-# PO KPI STRIP (shown inside PO tab)
-# ============================================================
 def po_kpi_strip(p_items, p_wos):
     total_orig = int(p_items["original_request"].fillna(0).sum())
     total_current = int(p_items["current_request"].fillna(0).sum())
@@ -572,11 +653,9 @@ def storage_tab(df, wos):
 
     storage_kpi_strip(s_items, s_wos)
     st.markdown("---")
-
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="storage_view", label_visibility="collapsed")
-    st.caption("Blocked detection: **PFS table** · 💡 Click a row to open a WO · use the filter row under each header to filter that column")
-
+    st.caption("Blocked detection: **PFS table** · 💡 Click a row to open a WO · filter row under each header")
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
     else:
@@ -601,30 +680,27 @@ def storage_wo_view(s_wos, s_items):
     if search:
         filtered = filtered[_str_contains_any(filtered, ["work_order_number", "top_brand", "top_block_reason"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(filtered)} of {len(s_wos)} WOs")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"storage_wos_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key="dl_swo")
-
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
     display = filtered[
         ["work_order_number", "warehouse", "top_brand", "items", "open_items",
-         "pfs_blocks", "top_block_reason", "orig", "processed", "pct",
-         "max_age", "earliest_ship"]
+         "pfs_blocks", "top_block_reason", "orig", "processed", "pct", "max_age", "earliest_ship"]
     ].rename(columns={
         "work_order_number": "WO", "warehouse": "WH", "top_brand": "Brand",
         "items": "Items", "open_items": "Open", "pfs_blocks": "Blocked (PFS)",
         "top_block_reason": "Top Reason", "orig": "Orig", "processed": "Processed",
         "pct": "% Processed", "max_age": "Age (d)", "earliest_ship": "Ship By",
     })
+    cols = column_picker(list(display.columns), key="cols_swo", required=["WO"])
+    display = display[cols]
 
+    table_toolbar(display, key="tb_swo", file_stem="storage_wos",
+                  id_cols=["WO"], count_label=f"{len(display)} of {len(s_wos)} WOs")
     sel_wo = render_table(
         display, key=_grid_key("grid_swo"), selectable=True,
         pct_cols=["% Processed"],
         num_cols=["WO", "Items", "Open", "Blocked (PFS)", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], height=500,
+        date_cols=["Ship By"], pin_cols=["WO"], height=500,
     )
-    copy_popover(display, ["WO"], key="cp_swo")
     if sel_wo is not None and _to_wo(sel_wo) in s_wos["work_order_number"].values \
             and _to_wo(sel_wo) != st.session_state.get("selected_storage_wo"):
         st.session_state.selected_storage_wo = _to_wo(sel_wo)
@@ -633,13 +709,11 @@ def storage_wo_view(s_wos, s_items):
 
 def storage_wo_drilldown(wo_id, s_items, s_wos):
     wo_row = s_wos[s_wos["work_order_number"] == wo_id].iloc[0]
-
     top1, top2 = st.columns([1, 5])
     if top1.button("← Back to list", use_container_width=True, key="back_swo"):
         _reset_selection()
         st.rerun()
     top2.markdown(f"### WO {wo_id} — Storage · {wo_row['warehouse']}")
-
     st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
@@ -652,7 +726,6 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     c7.metric("Max Age", f"{_safe_int(wo_row['max_age'])}d")
 
     items = s_items[s_items["work_order_number"] == wo_id].copy()
-
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id}")
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -669,29 +742,28 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     if search:
         items = items[_str_contains_any(items, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(items)} items")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(items), file_name=f"wo_{wo_id}_items_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key=f"dl_swo_items_{wo_id}")
-
     display = items[
         ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple",
          "processing_status", "block_reason_pfs", "original_request", "processed",
          "woi_processing_pct", "shipped", "storage", "age_days_from_created", "ship_by"]
     ].rename(columns={
         "work_order_item_id": "WOI ID", "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "status_simple": "Status", "processing_status": "Processing Status",
-        "block_reason_pfs": "Block Reason", "original_request": "Orig", "processed": "Processed",
+        "source_brand": "Brand", "status_simple": "Status", "processing_status": "Block Status",
+        "block_reason_pfs": "Reason", "original_request": "Orig", "processed": "Processed",
         "woi_processing_pct": "%", "shipped": "Shipped", "storage": "Stowed",
         "age_days_from_created": "Age (d)", "ship_by": "Ship By",
     })
+    cols = column_picker(list(display.columns), key=f"cols_swo_items_{wo_id}", required=["WOI ID"])
+    display = display[cols]
+
+    table_toolbar(display, key=f"tb_swo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
+                  id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_swo_items_{wo_id}"),
         pct_cols=["%"],
         num_cols=["WOI ID", "Orig", "Processed", "Shipped", "Stowed", "Age (d)"],
-        date_cols=["Ship By"], height=480,
+        date_cols=["Ship By"], pin_cols=["WOI ID"], height=480,
     )
-    copy_popover(display, ["WOI ID", "Listing"], key=f"cp_swo_items_{wo_id}")
 
 
 def storage_item_view(s_items):
@@ -710,11 +782,6 @@ def storage_item_view(s_items):
     if search:
         filtered = filtered[_str_contains_any(filtered, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(filtered):,} items")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"storage_items_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key="dl_sit")
-
     display = filtered[
         ["work_order_number", "work_order_item_id", "listing_id", "finished_good_name", "source_brand", "warehouse",
          "status_simple", "processing_status", "block_reason_pfs", "original_request",
@@ -722,17 +789,21 @@ def storage_item_view(s_items):
     ].rename(columns={
         "work_order_number": "WO", "work_order_item_id": "WOI ID", "listing_id": "Listing",
         "finished_good_name": "Item Name", "source_brand": "Brand", "warehouse": "WH",
-        "status_simple": "Status", "processing_status": "Processing Status", "block_reason_pfs": "Reason",
+        "status_simple": "Status", "processing_status": "Block Status", "block_reason_pfs": "Reason",
         "original_request": "Orig", "processed": "Processed", "woi_processing_pct": "%",
         "age_days_from_created": "Age (d)", "ship_by": "Ship By",
     })
+    cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
+    display = display[cols]
+
+    table_toolbar(display, key="tb_sit", file_stem="storage_items",
+                  id_cols=["WOI ID", "Listing", "WO"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_sit"),
         pct_cols=["%"],
         num_cols=["WO", "WOI ID", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], height=600,
+        date_cols=["Ship By"], pin_cols=["WOI ID"], height=600,
     )
-    copy_popover(display, ["WOI ID", "Listing", "WO"], key="cp_sit")
 
 
 # ============================================================
@@ -749,11 +820,9 @@ def po_tab(df, wos):
 
     po_kpi_strip(p_items, p_wos)
     st.markdown("---")
-
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="po_view", label_visibility="collapsed")
-    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Click a row to open a WO · use the filter row under each header to filter that column")
-
+    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Click a row to open a WO · filter row under each header")
     if view == "📋 WO Level":
         po_wo_view(p_wos, p_items)
     else:
@@ -775,11 +844,6 @@ def po_wo_view(p_wos, p_items):
     if search:
         filtered = filtered[_str_contains_any(filtered, ["work_order_number", "po_number_raw", "top_brand"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(filtered)} of {len(p_wos)} WOs")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"po_wos_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key="dl_pwo")
-
     display = filtered[
         ["work_order_number", "po_number_raw", "warehouse", "top_brand", "items", "open_items",
          "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age", "earliest_ship"]
@@ -789,14 +853,17 @@ def po_wo_view(p_wos, p_items):
         "orig": "Orig", "processed": "Processed", "pct": "% Processed",
         "worst_po_flag": "Worst Flag", "max_age": "Age (d)", "earliest_ship": "Ship By",
     })
+    cols = column_picker(list(display.columns), key="cols_pwo", required=["WO"])
+    display = display[cols]
 
+    table_toolbar(display, key="tb_pwo", file_stem="po_wos",
+                  id_cols=["WO", "PO #"], count_label=f"{len(display)} of {len(p_wos)} WOs")
     sel_wo = render_table(
         display, key=_grid_key("grid_pwo"), selectable=True,
         pct_cols=["% Processed"],
         num_cols=["WO", "Items", "Open", "Untouched", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], height=500,
+        date_cols=["Ship By"], pin_cols=["WO"], height=500,
     )
-    copy_popover(display, ["WO", "PO #"], key="cp_pwo")
     if sel_wo is not None and _to_wo(sel_wo) in p_wos["work_order_number"].values \
             and _to_wo(sel_wo) != st.session_state.get("selected_po_wo"):
         st.session_state.selected_po_wo = _to_wo(sel_wo)
@@ -805,13 +872,11 @@ def po_wo_view(p_wos, p_items):
 
 def po_wo_drilldown(wo_id, p_items, p_wos):
     wo_row = p_wos[p_wos["work_order_number"] == wo_id].iloc[0]
-
     top1, top2 = st.columns([1, 5])
     if top1.button("← Back to list", use_container_width=True, key="back_pwo"):
         _reset_selection()
         st.rerun()
     top2.markdown(f"### WO {wo_id} — PO# {wo_row['po_number_raw']} · {wo_row['warehouse']} · {wo_row['worst_po_flag'] or ''}")
-
     st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -830,7 +895,6 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
 
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
-
     flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
                     "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -843,11 +907,6 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     if search:
         items = items[_str_contains_any(items, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(items)} items")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(items), file_name=f"wo_{wo_id}_items_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key=f"dl_pwo_items_{wo_id}")
-
     items = items.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = items[
         ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple", "po_block_flag",
@@ -858,13 +917,17 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig", "processed": "Processed",
         "woi_processing_pct": "%", "po_ref_ship_by_date": "Ref Ship-by",
     })
+    cols = column_picker(list(display.columns), key=f"cols_pwo_items_{wo_id}", required=["WOI ID"])
+    display = display[cols]
+
+    table_toolbar(display, key=f"tb_pwo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
+                  id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_pwo_items_{wo_id}"),
         pct_cols=["%"],
         num_cols=["WOI ID", "Days Past", "Orig", "Processed"],
-        date_cols=["Ref Ship-by"], height=480,
+        date_cols=["Ref Ship-by"], pin_cols=["WOI ID"], height=480,
     )
-    copy_popover(display, ["WOI ID", "Listing"], key=f"cp_pwo_items_{wo_id}")
 
 
 def po_item_view(p_items):
@@ -884,11 +947,6 @@ def po_item_view(p_items):
     if search:
         filtered = filtered[_str_contains_any(filtered, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"], search)]
 
-    h1, h2 = st.columns([3, 1])
-    h1.caption(f"{len(filtered):,} items")
-    h2.download_button("📥 CSV", _df_to_csv_bytes(filtered), file_name=f"po_items_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", use_container_width=True, key="dl_pit")
-
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
         ["work_order_number", "work_order_item_id", "po_number_raw", "listing_id", "finished_good_name", "source_brand",
@@ -901,13 +959,17 @@ def po_item_view(p_items):
         "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig",
         "processed": "Processed", "woi_processing_pct": "%", "ship_by": "Ship By",
     })
+    cols = column_picker(list(display.columns), key="cols_pit", required=["WOI ID"])
+    display = display[cols]
+
+    table_toolbar(display, key="tb_pit", file_stem="po_items",
+                  id_cols=["WOI ID", "Listing", "WO", "PO #"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_pit"),
         pct_cols=["%"],
         num_cols=["WO", "WOI ID", "Days Past", "Orig", "Processed"],
-        date_cols=["Ship By"], height=600,
+        date_cols=["Ship By"], pin_cols=["WOI ID"], height=600,
     )
-    copy_popover(display, ["WOI ID", "Listing", "WO", "PO #"], key="cp_pit")
 
 
 # ============================================================
@@ -921,11 +983,8 @@ def main():
     with h2:
         st.markdown("##### 🏭 Warehouse")
         warehouse = st.radio(
-            "Warehouse",
-            ["Both", "Northampton", "Wroclaw"],
-            horizontal=True,
-            label_visibility="collapsed",
-            key="global_wh",
+            "Warehouse", ["Both", "Northampton", "Wroclaw"],
+            horizontal=True, label_visibility="collapsed", key="global_wh",
         )
 
     try:
