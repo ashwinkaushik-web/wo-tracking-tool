@@ -78,10 +78,24 @@ try:
       return null;
     }
     """)
+    # Date filter comparator — cells are 'YYYY-MM-DD' strings; parse and compare
+    DATE_COMPARATOR = JsCode("""
+    function(filterLocalDateAtMidnight, cellValue){
+      if (cellValue == null || cellValue === '') { return -1; }
+      var p = String(cellValue).split('-');
+      if (p.length !== 3) { return -1; }
+      var cell = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+      cell.setHours(0, 0, 0, 0);
+      if (cell < filterLocalDateAtMidnight) { return -1; }
+      if (cell > filterLocalDateAtMidnight) { return 1; }
+      return 0;
+    }
+    """)
 except Exception:
     HAS_AGGRID = False
     PCT_RENDERER = None
     ROW_STYLE_JS = None
+    DATE_COMPARATOR = None
 
 # ============================================================
 # CONFIG
@@ -105,6 +119,14 @@ st.markdown("""
 
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
+
+# Division lines between every column + row (injected into the AgGrid component)
+GRID_CSS = {
+    ".ag-cell": {"border-right": "1px solid rgba(130,130,150,0.18) !important"},
+    ".ag-header-cell": {"border-right": "1px solid rgba(130,130,150,0.30) !important"},
+    ".ag-header": {"border-bottom": "1px solid rgba(130,130,150,0.40) !important"},
+    ".ag-row": {"border-bottom": "1px solid rgba(130,130,150,0.14) !important"},
+}
 
 
 def _safe_int(v, default=0):
@@ -430,17 +452,17 @@ def render_table(display, *, key, selectable=False, pct_cols=(), num_cols=(),
     if HAS_AGGRID:
         try:
             return _render_aggrid(disp, key, selectable, pct_cols, num_cols,
-                                  pin_cols, color_rows, height, page_size)
+                                  date_cols, pin_cols, color_rows, height, page_size)
         except Exception as exc:  # noqa: BLE001
             st.caption(f"⚠️ Grid fell back to basic table ({exc})")
     return _render_native(disp, key, selectable, pct_cols, pin_cols, height)
 
 
-def _render_aggrid(disp, key, selectable, pct_cols, num_cols, pin_cols, color_rows, height, page_size):
+def _render_aggrid(disp, key, selectable, pct_cols, num_cols, date_cols, pin_cols, color_rows, height, page_size):
     gb = GridOptionsBuilder.from_dataframe(disp)
     gb.configure_default_column(filter=True, floatingFilter=True, sortable=True, resizable=True)
 
-    pct_set, num_set, pin_set = set(pct_cols), set(num_cols), set(pin_cols)
+    pct_set, num_set, pin_set, date_set = set(pct_cols), set(num_cols), set(pin_cols), set(date_cols)
     for col in disp.columns:
         kwargs = {}
         if col in num_set:
@@ -448,6 +470,11 @@ def _render_aggrid(disp, key, selectable, pct_cols, num_cols, pin_cols, color_ro
         if col in pct_set:
             kwargs.update(type=["numericColumn"], filter="agNumberColumnFilter",
                           cellRenderer=PCT_RENDERER, minWidth=130)
+        if col in date_set:
+            kwargs.update(filter="agDateColumnFilter",
+                          filterParams={"comparator": DATE_COMPARATOR,
+                                        "browserDatePicker": True,
+                                        "inRangeInclusive": True})
         if col in pin_set:
             kwargs.update(pinned="left")
         if kwargs:
@@ -465,7 +492,8 @@ def _render_aggrid(disp, key, selectable, pct_cols, num_cols, pin_cols, color_ro
     grid = AgGrid(
         disp, gridOptions=gb.build(), height=height, theme="streamlit",
         update_mode=GridUpdateMode.SELECTION_CHANGED, allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=False, enable_enterprise_modules=False, key=key,
+        fit_columns_on_grid_load=False, enable_enterprise_modules=False,
+        custom_css=GRID_CSS, key=key,
     )
 
     if not selectable:
