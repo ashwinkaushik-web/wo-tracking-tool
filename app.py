@@ -4,11 +4,11 @@ WO Tracking Tool — Streamlit App
 Tracks Storage and PO Work Orders with blocked / stalled detection.
 Live Snowflake connection, cached 30 min, manual refresh available.
 
-Tables use AgGrid (Excel-style per-column filters, sort, resize, click-to-drill,
-% progress bars, colour-coded rows, pinned key column). Each table also has a
-Columns picker, CSV + Excel export, a "copy a few values" popover, and a
-one-click full-table copy. If streamlit-aggrid isn't available at runtime,
-tables fall back to native st.dataframe so the app never goes blank.
+Tables are native st.dataframe — drag-select any cells / rows / columns and
+press Ctrl+C to copy (clean, nothing in the way). Filtering is driven by the
+panel above each table: Brand, Blocked/Flag, Reason, Ship By (from→to), Status,
+and a multi-term Search. Plus a Columns picker, CSV + Excel export, a
+"copy a few values" popover, and a one-click full-table copy.
 """
 
 import io
@@ -23,79 +23,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime
 from pathlib import Path
-
-# ---- AgGrid (optional; native fallback if missing) ----------------------
-try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
-    HAS_AGGRID = True
-    PCT_RENDERER = JsCode("""
-    class PctBar {
-      init(p){
-        const raw = (p.value === null || p.value === undefined || isNaN(p.value)) ? 0 : Number(p.value);
-        const pct = Math.max(0, Math.min(100, raw));
-        this.eGui = document.createElement('div');
-        this.eGui.style.display = 'flex';
-        this.eGui.style.alignItems = 'center';
-        this.eGui.style.gap = '6px';
-        this.eGui.style.height = '100%';
-        const bar = document.createElement('div');
-        bar.style.flex = '1';
-        bar.style.background = '#e6e6ef';
-        bar.style.borderRadius = '4px';
-        bar.style.height = '10px';
-        bar.style.overflow = 'hidden';
-        const fill = document.createElement('div');
-        fill.style.width = pct + '%';
-        fill.style.background = '#5B4DF0';
-        fill.style.height = '100%';
-        bar.appendChild(fill);
-        const label = document.createElement('span');
-        label.style.fontSize = '11px';
-        label.style.minWidth = '42px';
-        label.style.textAlign = 'right';
-        label.textContent = pct.toFixed(1) + '%';
-        this.eGui.appendChild(bar);
-        this.eGui.appendChild(label);
-      }
-      getGui(){ return this.eGui; }
-      refresh(){ return false; }
-    }
-    """)
-    # Colour rows by status — reads the displayed columns that carry the flag
-    ROW_STYLE_JS = JsCode("""
-    function(params){
-      var d = params.data || {};
-      var f = String(d['Flag'] || d['Worst Flag'] || '');
-      if (f.indexOf('🔴') > -1) return {'backgroundColor':'rgba(239,68,68,0.13)'};
-      if (f.indexOf('🟠') > -1) return {'backgroundColor':'rgba(245,158,11,0.13)'};
-      if (f.indexOf('🟡') > -1) return {'backgroundColor':'rgba(234,179,8,0.10)'};
-      if (f.indexOf('🟢') > -1) return {'backgroundColor':'rgba(34,197,94,0.07)'};
-      if (f.indexOf('✅') > -1) return {'backgroundColor':'rgba(34,197,94,0.04)'};
-      var bp = d['Blocked (PFS)'];
-      if (bp !== undefined && bp !== null && bp !== '' && Number(bp) > 0) return {'backgroundColor':'rgba(239,68,68,0.11)'};
-      var ps = String(d['Block Status'] || '');
-      if (ps.indexOf('Unpickable') > -1) return {'backgroundColor':'rgba(239,68,68,0.11)'};
-      return null;
-    }
-    """)
-    # Date filter comparator — cells are 'YYYY-MM-DD' strings; parse and compare
-    DATE_COMPARATOR = JsCode("""
-    function(filterLocalDateAtMidnight, cellValue){
-      if (cellValue == null || cellValue === '') { return -1; }
-      var p = String(cellValue).split('-');
-      if (p.length !== 3) { return -1; }
-      var cell = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
-      cell.setHours(0, 0, 0, 0);
-      if (cell < filterLocalDateAtMidnight) { return -1; }
-      if (cell > filterLocalDateAtMidnight) { return 1; }
-      return 0;
-    }
-    """)
-except Exception:
-    HAS_AGGRID = False
-    PCT_RENDERER = None
-    ROW_STYLE_JS = None
-    DATE_COMPARATOR = None
 
 # ============================================================
 # CONFIG
@@ -120,13 +47,10 @@ st.markdown("""
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
-# Division lines between every column + row (injected into the AgGrid component)
-GRID_CSS = {
-    ".ag-cell": {"border-right": "1px solid rgba(130,130,150,0.18) !important"},
-    ".ag-header-cell": {"border-right": "1px solid rgba(130,130,150,0.30) !important"},
-    ".ag-header": {"border-bottom": "1px solid rgba(130,130,150,0.40) !important"},
-    ".ag-row": {"border-bottom": "1px solid rgba(130,130,150,0.14) !important"},
-}
+FLAG_ORDER = [
+    "🔴 Blocked / Issue", "🟠 Partially Processed",
+    "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete",
+]
 
 
 def _safe_int(v, default=0):
@@ -215,11 +139,7 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
     )
     g["pct"] = pd.to_numeric(g["pct"], errors="coerce").fillna(0)
 
-    flag_priority = [
-        "🔴 Blocked / Issue", "🟠 Partially Processed",
-        "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete",
-    ]
-    flag_rank = {f: i for i, f in enumerate(flag_priority)}
+    flag_rank = {f: i for i, f in enumerate(FLAG_ORDER)}
     df_with_rank = df[df["po_block_flag"].notna()].copy()
     if not df_with_rank.empty:
         df_with_rank["_rank"] = df_with_rank["po_block_flag"].map(flag_rank)
@@ -299,7 +219,7 @@ def fetch_data():
 # ============================================================
 def _str_contains_any(df, cols, query):
     """Multi-term search. Split on commas / new lines / semicolons and match a
-    row if ANY term appears in ANY of the columns (paste several at once)."""
+    row if ANY term appears in ANY column (paste several values at once)."""
     if not query or not str(query).strip():
         return pd.Series([True] * len(df), index=df.index)
     terms = [t.strip().lower() for t in re.split(r"[,\n;]+", str(query)) if t.strip()]
@@ -321,7 +241,6 @@ def _df_to_csv_bytes(df):
 
 @st.cache_data(show_spinner=False)
 def _xlsx_bytes_from_csv(csv_text: str) -> bytes:
-    """Build .xlsx from CSV text. Cached so repeated reruns don't rebuild."""
     buf = io.BytesIO()
     pd.read_csv(io.StringIO(csv_text), dtype=str).to_excel(buf, index=False, engine="openpyxl")
     return buf.getvalue()
@@ -329,6 +248,32 @@ def _xlsx_bytes_from_csv(csv_text: str) -> bytes:
 
 def _grid_key(base):
     return f"{base}_{st.session_state.get('grid_nonce', 0)}"
+
+
+def _row_style(row):
+    """Background colour by status for the coloured (non-clickable) tables."""
+    flag = str(row.get("Flag", row.get("Worst Flag", "")))
+    color = ""
+    if "🔴" in flag:
+        color = "rgba(239,68,68,0.13)"
+    elif "🟠" in flag:
+        color = "rgba(245,158,11,0.13)"
+    elif "🟡" in flag:
+        color = "rgba(234,179,8,0.10)"
+    elif "🟢" in flag:
+        color = "rgba(34,197,94,0.07)"
+    elif "✅" in flag:
+        color = "rgba(34,197,94,0.04)"
+    else:
+        bp = row.get("Blocked (PFS)")
+        try:
+            if bp is not None and not pd.isna(bp) and float(bp) > 0:
+                color = "rgba(239,68,68,0.11)"
+        except (ValueError, TypeError):
+            pass
+        if not color and "Unpickable" in str(row.get("Block Status", "")):
+            color = "rgba(239,68,68,0.11)"
+    return [f"background-color: {color}"] * len(row) if color else [""] * len(row)
 
 
 _COPY_TABLE_TEMPLATE = """
@@ -360,12 +305,11 @@ _COPY_TABLE_TEMPLATE = """
 
 
 def copy_table_button(display, key):
-    """One-click copy of the whole (visible) table as TSV with headers — pastes
-    straight into Excel / Google Sheets. Capped at 5,000 rows."""
+    """One-click copy of the whole (visible) table as TSV with headers. Capped 5,000 rows."""
     cap = 5000
     d = display.head(cap)
     tsv = d.to_csv(index=False, sep="\t")
-    note = f"{len(d)}×{len(d.columns)}" + (" (first 5k)" if len(display) > cap else "")
+    note = f"{len(d)}x{len(d.columns)}" + (" (first 5k)" if len(display) > cap else "")
     bid = f"cbtn{abs(hash((key, len(display)))) % 10**9}"
     html_out = (
         _COPY_TABLE_TEMPLATE
@@ -377,15 +321,15 @@ def copy_table_button(display, key):
 
 
 def copy_popover(display, id_cols, key):
-    """Copy values from a column — all of them, or tick just a few. Drag-select
-    cells in the table + Ctrl+C also copies a few elements of a row/column."""
+    """Copy values from a column — all of them, or tick just a few. Or
+    drag-select cells in the table and Ctrl+C to copy a row/column straight."""
     present = [c for c in id_cols if c in display.columns]
     if not present:
         return
     with st.popover("📋 Copy items", use_container_width=True):
         st.caption(
             "Pick a column, optionally tick just the values you want, then use the copy "
-            "icon on the block. Or drag-select any cells in the table and press Ctrl+C."
+            "icon on the block. Or drag-select cells in the table and press Ctrl+C."
         )
         c = st.selectbox("Column", present, key=f"{key}_col")
         vals = [v for v in display[c].astype(str).tolist() if v and v.strip() and v.lower() != "nan"]
@@ -401,8 +345,7 @@ def copy_popover(display, id_cols, key):
 
 
 def column_picker(all_labels, key, default_labels=None, required=()):
-    """👁 Columns expander — choose which columns show. Required columns are
-    always kept (e.g. WO, needed for row selection)."""
+    """👁 Columns — choose which columns show. Required columns always kept."""
     default_labels = default_labels if default_labels is not None else all_labels
     with st.expander("👁 Columns"):
         chosen = st.multiselect(
@@ -415,7 +358,7 @@ def column_picker(all_labels, key, default_labels=None, required=()):
 
 
 def table_toolbar(display, *, key, file_stem, id_cols, count_label):
-    """Count + CSV + Excel + copy-items popover + copy-table button, one row."""
+    """Count + CSV + Excel + copy-items popover + copy-table button."""
     ts = datetime.now().strftime("%Y%m%d")
     a, b, c, d, e = st.columns([2.6, 1, 1, 1.2, 1.4])
     a.caption(count_label)
@@ -437,99 +380,123 @@ def table_toolbar(display, *, key, file_stem, id_cols, count_label):
 
 
 # ============================================================
-# GRID RENDERER
+# SHARED FILTER PANEL
 # ============================================================
-def render_table(display, *, key, selectable=False, pct_cols=(), num_cols=(),
-                 date_cols=(), pin_cols=(), color_rows=True, height=480, page_size=100):
-    """Excel-style filterable grid (AgGrid) with native fallback.
-    Returns the selected WO (from the 'WO' column) or None."""
-    disp = display.copy()
-    for c in date_cols:
-        if c in disp.columns:
-            disp[c] = pd.to_datetime(disp[c], errors="coerce").dt.strftime("%Y-%m-%d")
-            disp[c] = disp[c].where(disp[c].notna(), "")
+def filter_panel(df, key, *, brand_col=None, ship_col=None, reason_col=None,
+                 blocked_kind=None, flag_col=None, status_kind=None, search_cols=None):
+    """Standard filters in an expander. Returns the filtered DataFrame.
+    blocked_kind: 'wo' (pfs_blocks count) or 'item' (is_blocked_pfs bool) or None.
+    flag_col: a column to filter via the 5-way Flag dropdown (PO) or None.
+    status_kind: 'wo' (open_items) or 'item' (status_simple) or None."""
+    out = df.copy()
+    with st.expander("🔎 Filters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
 
-    if HAS_AGGRID:
-        try:
-            return _render_aggrid(disp, key, selectable, pct_cols, num_cols,
-                                  date_cols, pin_cols, color_rows, height, page_size)
-        except Exception as exc:  # noqa: BLE001
-            st.caption(f"⚠️ Grid fell back to basic table ({exc})")
-    return _render_native(disp, key, selectable, pct_cols, pin_cols, height)
+        # Brand
+        if brand_col and brand_col in out.columns:
+            brands = sorted([b for b in out[brand_col].dropna().astype(str).unique() if b and b != "nan"])
+            pick = c1.multiselect("Brand", brands, key=f"{key}_brand", placeholder="All brands")
+            if pick:
+                out = out[out[brand_col].astype(str).isin(pick)]
+
+        # Blocked toggle (Storage) or Flag dropdown (PO)
+        if flag_col and flag_col in out.columns:
+            avail = [f for f in FLAG_ORDER if (out[flag_col] == f).any()]
+            fp = c2.selectbox("Flag", ["All"] + avail, key=f"{key}_flag")
+            if fp != "All":
+                out = out[out[flag_col] == fp]
+        elif blocked_kind == "wo":
+            bp = c2.selectbox("Blocked", ["All", "Blocked", "Not blocked"], key=f"{key}_blk")
+            if bp == "Blocked":
+                out = out[out["pfs_blocks"] > 0]
+            elif bp == "Not blocked":
+                out = out[out["pfs_blocks"] == 0]
+        elif blocked_kind == "item":
+            bp = c2.selectbox("Blocked", ["All", "Blocked", "Not blocked"], key=f"{key}_blk")
+            if bp == "Blocked":
+                out = out[out["is_blocked_pfs"].fillna(False)]
+            elif bp == "Not blocked":
+                out = out[~out["is_blocked_pfs"].fillna(False)]
+
+        # Reason (where present)
+        if reason_col and reason_col in out.columns and out[reason_col].notna().any():
+            reasons = sorted([r for r in out[reason_col].dropna().astype(str).unique() if r and r != "nan"])
+            if reasons:
+                rp = c3.multiselect("Reason", reasons, key=f"{key}_reason", placeholder="All reasons")
+                if rp:
+                    out = out[out[reason_col].astype(str).isin(rp)]
+
+        # Status
+        if status_kind == "item":
+            sp = c4.selectbox("Status", ["Open", "All", "Closed"], key=f"{key}_status")
+            if sp == "Open":
+                out = out[out["status_simple"] == "Open"]
+            elif sp == "Closed":
+                out = out[out["status_simple"] == "Closed"]
+        elif status_kind == "wo":
+            sp = c4.selectbox("Show", ["With Open", "All", "Closed"], key=f"{key}_status")
+            if sp == "With Open":
+                out = out[out["open_items"] > 0]
+            elif sp == "Closed":
+                out = out[out["open_items"] == 0]
+
+        # Ship By range + Search
+        d1, d2, d3 = st.columns([1, 1, 2])
+        if ship_col and ship_col in out.columns:
+            sfrom = d1.date_input("Ship by — from", value=None, key=f"{key}_sfrom", format="YYYY-MM-DD")
+            sto = d2.date_input("Ship by — to", value=None, key=f"{key}_sto", format="YYYY-MM-DD")
+            ship_dt = pd.to_datetime(out[ship_col], errors="coerce")
+            if sfrom:
+                out = out[ship_dt >= pd.Timestamp(sfrom)]
+                ship_dt = pd.to_datetime(out[ship_col], errors="coerce")
+            if sto:
+                out = out[ship_dt <= (pd.Timestamp(sto) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+        if search_cols:
+            q = d3.text_input("Search", "", key=f"{key}_search",
+                              placeholder="paste several — comma / new line = match any")
+            if q:
+                out = out[_str_contains_any(out, search_cols, q)]
+    return out
 
 
-def _render_aggrid(disp, key, selectable, pct_cols, num_cols, date_cols, pin_cols, color_rows, height, page_size):
-    gb = GridOptionsBuilder.from_dataframe(disp)
-    gb.configure_default_column(filter=True, floatingFilter=True, sortable=True, resizable=True)
-
-    pct_set, num_set, pin_set, date_set = set(pct_cols), set(num_cols), set(pin_cols), set(date_cols)
-    for col in disp.columns:
-        kwargs = {}
-        if col in num_set:
-            kwargs.update(type=["numericColumn"], filter="agNumberColumnFilter")
-        if col in pct_set:
-            kwargs.update(type=["numericColumn"], filter="agNumberColumnFilter",
-                          cellRenderer=PCT_RENDERER, minWidth=130)
-        if col in date_set:
-            kwargs.update(filter="agDateColumnFilter",
-                          filterParams={"comparator": DATE_COMPARATOR,
-                                        "browserDatePicker": True,
-                                        "inRangeInclusive": True})
-        if col in pin_set:
-            kwargs.update(pinned="left")
-        if kwargs:
-            gb.configure_column(col, **kwargs)
-
-    if selectable:
-        gb.configure_selection("single", use_checkbox=False)
-
-    grid_opts = dict(pagination=True, paginationPageSize=page_size,
-                     enableCellTextSelection=True, ensureDomOrder=True)
-    if color_rows and ROW_STYLE_JS is not None:
-        grid_opts["getRowStyle"] = ROW_STYLE_JS
-    gb.configure_grid_options(**grid_opts)
-
-    grid = AgGrid(
-        disp, gridOptions=gb.build(), height=height, theme="streamlit",
-        update_mode=GridUpdateMode.SELECTION_CHANGED, allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=False, enable_enterprise_modules=False,
-        custom_css=GRID_CSS, key=key,
-    )
-
-    if not selectable:
-        return None
-    sel = grid["selected_rows"]
-    if sel is None:
-        return None
-    if isinstance(sel, pd.DataFrame):
-        if len(sel) and "WO" in sel.columns:
-            return sel.iloc[0]["WO"]
-        return None
-    if isinstance(sel, list) and sel:
-        return sel[0].get("WO")
-    return None
-
-
-def _render_native(disp, key, selectable, pct_cols, pin_cols, height):
+# ============================================================
+# NATIVE TABLE RENDERER
+# ============================================================
+def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
+                 pin_cols=(), color_rows=False, height=480):
+    """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
+    Selectable tables show a tick column; returns the ticked WO (or None)."""
     colcfg = {}
     for c in pct_cols:
-        if c in disp.columns:
+        if c in display.columns:
             colcfg[c] = st.column_config.ProgressColumn(c, min_value=0, max_value=100, format="%.1f%%")
+    for c in date_cols:
+        if c in display.columns and c not in colcfg:
+            colcfg[c] = st.column_config.DateColumn(c, format="YYYY-MM-DD")
     for c in pin_cols:
-        if c in disp.columns and c not in colcfg:
+        if c in display.columns and c not in colcfg:
             try:
                 colcfg[c] = st.column_config.Column(c, pinned="left")
             except TypeError:
-                pass  # older Streamlit without pinned support
+                pass
+
     if selectable:
         event = st.dataframe(
-            disp, use_container_width=True, hide_index=True, height=height,
+            display, use_container_width=True, hide_index=True, height=height,
             on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
         )
-        if event.selection.rows and "WO" in disp.columns:
-            return disp.iloc[event.selection.rows[0]]["WO"]
+        rows = event.selection.rows
+        if rows and "WO" in display.columns:
+            return display.iloc[rows[0]]["WO"]
         return None
-    st.dataframe(disp, use_container_width=True, hide_index=True, height=height, column_config=colcfg)
+
+    data = display
+    if color_rows:
+        try:
+            data = display.style.apply(_row_style, axis=1)
+        except Exception:
+            data = display
+    st.dataframe(data, use_container_width=True, hide_index=True, height=height, column_config=colcfg)
     return None
 
 
@@ -556,10 +523,11 @@ def sidebar(last_refresh):
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**Table tips**\n\n"
-        "- Filter row under each header (Excel-style)\n"
-        "- Drag-select cells + Ctrl+C to copy a few\n"
-        "- 👁 Columns to show/hide · 📋 to copy\n"
+        "- Drag-select cells / a row / a column, then Ctrl+C to copy\n"
+        "- Click a column header to sort\n"
+        "- 👁 Columns to show/hide · 📋 to copy lists\n"
         "- Paste several values in Search to match any\n"
+        "- Tick a WO row, then press **Open WO** to drill in\n"
     )
     st.sidebar.markdown("---")
     st.sidebar.markdown(
@@ -683,7 +651,7 @@ def storage_tab(df, wos):
     st.markdown("---")
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="storage_view", label_visibility="collapsed")
-    st.caption("Blocked detection: **PFS table** · 💡 Click a row to open a WO · filter row under each header")
+    st.caption("Blocked detection: **PFS table** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy")
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
     else:
@@ -691,23 +659,11 @@ def storage_tab(df, wos):
 
 
 def storage_wo_view(s_wos, s_items):
-    c1, c2, c3 = st.columns([1, 1, 2])
-    open_filter = c1.selectbox("Has Open", ["All", "With Open items", "All Closed"], index=1, key="sf_open")
-    blk_filter = c2.selectbox("Has Blocked", ["All", "With Blocked", "No Blocked"], key="sf_blk")
-    search = c3.text_input("Search", "", placeholder="WO, brand, reason… (comma / new line = match any)", key="sf_search")
-
-    filtered = s_wos.copy()
-    if open_filter == "With Open items":
-        filtered = filtered[filtered["open_items"] > 0]
-    elif open_filter == "All Closed":
-        filtered = filtered[filtered["open_items"] == 0]
-    if blk_filter == "With Blocked":
-        filtered = filtered[filtered["pfs_blocks"] > 0]
-    elif blk_filter == "No Blocked":
-        filtered = filtered[filtered["pfs_blocks"] == 0]
-    if search:
-        filtered = filtered[_str_contains_any(filtered, ["work_order_number", "top_brand", "top_block_reason"], search)]
-
+    filtered = filter_panel(
+        s_wos, "fp_swo", brand_col="top_brand", ship_col="earliest_ship",
+        reason_col="top_block_reason", blocked_kind="wo", status_kind="wo",
+        search_cols=["work_order_number", "top_brand", "top_block_reason"],
+    )
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
     display = filtered[
         ["work_order_number", "warehouse", "top_brand", "items", "open_items",
@@ -725,14 +681,12 @@ def storage_wo_view(s_wos, s_items):
                   id_cols=["WO"], count_label=f"{len(display)} of {len(s_wos)} WOs")
     sel_wo = render_table(
         display, key=_grid_key("grid_swo"), selectable=True,
-        pct_cols=["% Processed"],
-        num_cols=["WO", "Items", "Open", "Blocked (PFS)", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], pin_cols=["WO"], height=500,
+        pct_cols=["% Processed"], date_cols=["Ship By"], pin_cols=["WO"], height=500,
     )
-    if sel_wo is not None and _to_wo(sel_wo) in s_wos["work_order_number"].values \
-            and _to_wo(sel_wo) != st.session_state.get("selected_storage_wo"):
-        st.session_state.selected_storage_wo = _to_wo(sel_wo)
-        st.rerun()
+    if sel_wo is not None:
+        if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_swo", use_container_width=True):
+            st.session_state.selected_storage_wo = _to_wo(sel_wo)
+            st.rerun()
 
 
 def storage_wo_drilldown(wo_id, s_items, s_wos):
@@ -756,21 +710,12 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     items = s_items[s_items["work_order_number"] == wo_id].copy()
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id}")
-    c1, c2, c3 = st.columns([1, 1, 2])
-    status_f = c1.selectbox("Status", ["All", "Open", "Closed"], key=f"sdf_status_{wo_id}")
-    blk_f = c2.selectbox("Block", ["All", "Blocked only", "Pickable only"], key=f"sdf_blk_{wo_id}")
-    search = c3.text_input("Search", "", placeholder="Listings, brand, item… (comma / new line = match any)", key=f"sdf_search_{wo_id}")
-
-    if status_f != "All":
-        items = items[items["status_simple"] == status_f]
-    if blk_f == "Blocked only":
-        items = items[items["is_blocked_pfs"].fillna(False)]
-    elif blk_f == "Pickable only":
-        items = items[~items["is_blocked_pfs"].fillna(False)]
-    if search:
-        items = items[_str_contains_any(items, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name"], search)]
-
-    display = items[
+    filtered = filter_panel(
+        items, f"fp_swo_items_{wo_id}", brand_col="source_brand", ship_col="ship_by",
+        reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
+        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
+    )
+    display = filtered[
         ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple",
          "processing_status", "block_reason_pfs", "original_request", "processed",
          "woi_processing_pct", "shipped", "storage", "age_days_from_created", "ship_by"]
@@ -788,28 +733,16 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
                   id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_swo_items_{wo_id}"),
-        pct_cols=["%"],
-        num_cols=["WOI ID", "Orig", "Processed", "Shipped", "Stowed", "Age (d)"],
-        date_cols=["Ship By"], pin_cols=["WOI ID"], height=480,
+        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
 
 def storage_item_view(s_items):
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-    status_f = c1.selectbox("Status", ["All", "Open", "Closed"], index=1, key="sif_status")
-    blk_f = c2.selectbox("Block", ["All", "Blocked only", "Pickable only"], key="sif_blk")
-    reasons = sorted(s_items.loc[s_items["block_reason_pfs"].notna(), "block_reason_pfs"].unique().tolist())
-    reason_f = c3.selectbox("Reason", ["All"] + reasons, key="sif_reason")
-    search = c4.text_input("Search", "", placeholder="Listings, brand, WO… (comma / new line = match any)", key="sif_search")
-
-    filtered = s_items.copy()
-    if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
-    if blk_f == "Blocked only": filtered = filtered[filtered["is_blocked_pfs"].fillna(False)]
-    elif blk_f == "Pickable only": filtered = filtered[~filtered["is_blocked_pfs"].fillna(False)]
-    if reason_f != "All": filtered = filtered[filtered["block_reason_pfs"] == reason_f]
-    if search:
-        filtered = filtered[_str_contains_any(filtered, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"], search)]
-
+    filtered = filter_panel(
+        s_items, "fp_sit", brand_col="source_brand", ship_col="ship_by",
+        reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
+        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
+    )
     display = filtered[
         ["work_order_number", "work_order_item_id", "listing_id", "finished_good_name", "source_brand", "warehouse",
          "status_simple", "processing_status", "block_reason_pfs", "original_request",
@@ -828,9 +761,7 @@ def storage_item_view(s_items):
                   id_cols=["WOI ID", "Listing", "WO"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_sit"),
-        pct_cols=["%"],
-        num_cols=["WO", "WOI ID", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], pin_cols=["WOI ID"], height=600,
+        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
 
@@ -850,7 +781,7 @@ def po_tab(df, wos):
     st.markdown("---")
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="po_view", label_visibility="collapsed")
-    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Click a row to open a WO · filter row under each header")
+    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy")
     if view == "📋 WO Level":
         po_wo_view(p_wos, p_items)
     else:
@@ -858,20 +789,11 @@ def po_tab(df, wos):
 
 
 def po_wo_view(p_wos, p_items):
-    flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
-                    "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2, c3 = st.columns([1.2, 1, 2])
-    flag_f = c1.selectbox("Worst Flag", flag_options, key="pf_flag")
-    open_f = c2.selectbox("Has Open", ["All", "With Open", "All Closed"], index=1, key="pf_open")
-    search = c3.text_input("Search", "", placeholder="WO, PO#, brand… (comma / new line = match any)", key="pf_search")
-
-    filtered = p_wos.copy()
-    if flag_f != "All": filtered = filtered[filtered["worst_po_flag"] == flag_f]
-    if open_f == "With Open": filtered = filtered[filtered["open_items"] > 0]
-    elif open_f == "All Closed": filtered = filtered[filtered["open_items"] == 0]
-    if search:
-        filtered = filtered[_str_contains_any(filtered, ["work_order_number", "po_number_raw", "top_brand"], search)]
-
+    filtered = filter_panel(
+        p_wos, "fp_pwo", brand_col="top_brand", ship_col="earliest_ship",
+        flag_col="worst_po_flag", status_kind="wo",
+        search_cols=["work_order_number", "po_number_raw", "top_brand"],
+    )
     display = filtered[
         ["work_order_number", "po_number_raw", "warehouse", "top_brand", "items", "open_items",
          "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age", "earliest_ship"]
@@ -888,14 +810,12 @@ def po_wo_view(p_wos, p_items):
                   id_cols=["WO", "PO #"], count_label=f"{len(display)} of {len(p_wos)} WOs")
     sel_wo = render_table(
         display, key=_grid_key("grid_pwo"), selectable=True,
-        pct_cols=["% Processed"],
-        num_cols=["WO", "Items", "Open", "Untouched", "Orig", "Processed", "Age (d)"],
-        date_cols=["Ship By"], pin_cols=["WO"], height=500,
+        pct_cols=["% Processed"], date_cols=["Ship By"], pin_cols=["WO"], height=500,
     )
-    if sel_wo is not None and _to_wo(sel_wo) in p_wos["work_order_number"].values \
-            and _to_wo(sel_wo) != st.session_state.get("selected_po_wo"):
-        st.session_state.selected_po_wo = _to_wo(sel_wo)
-        st.rerun()
+    if sel_wo is not None:
+        if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_pwo", use_container_width=True):
+            st.session_state.selected_po_wo = _to_wo(sel_wo)
+            st.rerun()
 
 
 def po_wo_drilldown(wo_id, p_items, p_wos):
@@ -923,27 +843,20 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
 
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
-    flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
-                    "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2, c3 = st.columns([1, 1, 2])
-    flag_f = c1.selectbox("Flag", flag_options, key=f"pdf_flag_{wo_id}")
-    status_f = c2.selectbox("Status", ["All", "Open", "Closed"], key=f"pdf_status_{wo_id}")
-    search = c3.text_input("Search", "", placeholder="Listings, brand, item… (comma / new line = match any)", key=f"pdf_search_{wo_id}")
-
-    if flag_f != "All": items = items[items["po_block_flag"] == flag_f]
-    if status_f != "All": items = items[items["status_simple"] == status_f]
-    if search:
-        items = items[_str_contains_any(items, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name"], search)]
-
-    items = items.sort_values("po_days_past_ref_ship_by", ascending=False)
-    display = items[
+    filtered = filter_panel(
+        items, f"fp_pwo_items_{wo_id}", brand_col="source_brand", ship_col="ship_by",
+        flag_col="po_block_flag", status_kind="item",
+        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
+    )
+    filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
+    display = filtered[
         ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple", "po_block_flag",
          "po_days_past_ref_ship_by", "original_request", "processed", "woi_processing_pct", "po_ref_ship_by_date"]
     ].rename(columns={
         "work_order_item_id": "WOI ID", "listing_id": "Listing", "finished_good_name": "Item Name",
         "source_brand": "Brand", "status_simple": "Status", "po_block_flag": "Flag",
         "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "po_ref_ship_by_date": "Ref Ship-by",
+        "woi_processing_pct": "%", "po_ref_ship_by_date": "Ship By",
     })
     cols = column_picker(list(display.columns), key=f"cols_pwo_items_{wo_id}", required=["WOI ID"])
     display = display[cols]
@@ -952,29 +865,16 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
                   id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_pwo_items_{wo_id}"),
-        pct_cols=["%"],
-        num_cols=["WOI ID", "Days Past", "Orig", "Processed"],
-        date_cols=["Ref Ship-by"], pin_cols=["WOI ID"], height=480,
+        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
 
 def po_item_view(p_items):
-    flag_options = ["All", "🔴 Blocked / Issue", "🟠 Partially Processed",
-                    "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete"]
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 2])
-    flag_f = c1.selectbox("Flag", flag_options, key="pif_flag")
-    status_f = c2.selectbox("Status", ["All", "Open", "Closed"], index=1, key="pif_status")
-    pos = ["All"] + sorted(p_items["po_number_raw"].dropna().unique().tolist())
-    po_f = c3.selectbox("PO #", pos, key="pif_po")
-    search = c4.text_input("Search", "", placeholder="Listings, brand, WO… (comma / new line = match any)", key="pif_search")
-
-    filtered = p_items.copy()
-    if flag_f != "All": filtered = filtered[filtered["po_block_flag"] == flag_f]
-    if status_f != "All": filtered = filtered[filtered["status_simple"] == status_f]
-    if po_f != "All": filtered = filtered[filtered["po_number_raw"] == po_f]
-    if search:
-        filtered = filtered[_str_contains_any(filtered, ["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"], search)]
-
+    filtered = filter_panel(
+        p_items, "fp_pit", brand_col="source_brand", ship_col="ship_by",
+        flag_col="po_block_flag", status_kind="item",
+        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
+    )
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
         ["work_order_number", "work_order_item_id", "po_number_raw", "listing_id", "finished_good_name", "source_brand",
@@ -994,9 +894,7 @@ def po_item_view(p_items):
                   id_cols=["WOI ID", "Listing", "WO", "PO #"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_pit"),
-        pct_cols=["%"],
-        num_cols=["WO", "WOI ID", "Days Past", "Orig", "Processed"],
-        date_cols=["Ship By"], pin_cols=["WOI ID"], height=600,
+        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
 
