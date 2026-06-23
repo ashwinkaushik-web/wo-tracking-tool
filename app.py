@@ -298,6 +298,32 @@ def _df_to_csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
+def copy_popover(display, id_cols, key):
+    """Quick clipboard copy of the key ID columns for the current filtered view.
+    Each block has Streamlit's built-in one-click copy icon. Reflects the
+    dropdown/search filters above. For an exact copy of rows after in-grid
+    header filters, drag-select rows in the table and press Ctrl+C."""
+    present = [c for c in id_cols if c in display.columns]
+    if not present:
+        return
+    col, _ = st.columns([1.3, 5])
+    with col:
+        with st.popover("📋 Copy items", use_container_width=True):
+            st.caption(
+                "Use the copy icon on each block (top-right). Reflects the filters above. "
+                "Tip: to copy exactly what's left after the header filters, drag-select rows "
+                "in the table and press Ctrl+C."
+            )
+            for c in present:
+                vals = [v for v in display[c].astype(str).tolist()
+                        if v and v.strip() and v.lower() != "nan"]
+                n = len(vals)
+                shown = vals[:5000]
+                suffix = " — first 5,000" if n > 5000 else ""
+                st.markdown(f"**{c}** ({n:,}{suffix})")
+                st.code("\n".join(shown) if shown else "—", language="text")
+
+
 def _grid_key(base):
     return f"{base}_{st.session_state.get('grid_nonce', 0)}"
 
@@ -338,7 +364,10 @@ def _render_aggrid(disp, key, selectable, pct_cols, num_cols, height, page_size)
             )
     if selectable:
         gb.configure_selection("single", use_checkbox=False)
-    gb.configure_grid_options(pagination=True, paginationPageSize=page_size)
+    gb.configure_grid_options(
+        pagination=True, paginationPageSize=page_size,
+        enableCellTextSelection=True, ensureDomOrder=True,
+    )
     options = gb.build()
 
     grid = AgGrid(
@@ -595,6 +624,7 @@ def storage_wo_view(s_wos, s_items):
         num_cols=["WO", "Items", "Open", "Blocked (PFS)", "Orig", "Processed", "Age (d)"],
         date_cols=["Ship By"], height=500,
     )
+    copy_popover(display, ["WO"], key="cp_swo")
     if sel_wo is not None and _to_wo(sel_wo) in s_wos["work_order_number"].values \
             and _to_wo(sel_wo) != st.session_state.get("selected_storage_wo"):
         st.session_state.selected_storage_wo = _to_wo(sel_wo)
@@ -661,6 +691,7 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
         num_cols=["WOI ID", "Orig", "Processed", "Shipped", "Stowed", "Age (d)"],
         date_cols=["Ship By"], height=480,
     )
+    copy_popover(display, ["WOI ID", "Listing"], key=f"cp_swo_items_{wo_id}")
 
 
 def storage_item_view(s_items):
@@ -701,6 +732,7 @@ def storage_item_view(s_items):
         num_cols=["WO", "WOI ID", "Orig", "Processed", "Age (d)"],
         date_cols=["Ship By"], height=600,
     )
+    copy_popover(display, ["WOI ID", "Listing", "WO"], key="cp_sit")
 
 
 # ============================================================
@@ -764,6 +796,7 @@ def po_wo_view(p_wos, p_items):
         num_cols=["WO", "Items", "Open", "Untouched", "Orig", "Processed", "Age (d)"],
         date_cols=["Ship By"], height=500,
     )
+    copy_popover(display, ["WO", "PO #"], key="cp_pwo")
     if sel_wo is not None and _to_wo(sel_wo) in p_wos["work_order_number"].values \
             and _to_wo(sel_wo) != st.session_state.get("selected_po_wo"):
         st.session_state.selected_po_wo = _to_wo(sel_wo)
@@ -831,6 +864,7 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         num_cols=["WOI ID", "Days Past", "Orig", "Processed"],
         date_cols=["Ref Ship-by"], height=480,
     )
+    copy_popover(display, ["WOI ID", "Listing"], key=f"cp_pwo_items_{wo_id}")
 
 
 def po_item_view(p_items):
@@ -873,6 +907,7 @@ def po_item_view(p_items):
         num_cols=["WO", "WOI ID", "Days Past", "Orig", "Processed"],
         date_cols=["Ship By"], height=600,
     )
+    copy_popover(display, ["WOI ID", "Listing", "WO", "PO #"], key="cp_pit")
 
 
 # ============================================================
