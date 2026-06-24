@@ -459,11 +459,26 @@ def filter_panel(df, key, *, brand_col=None, ship_col=None, reason_col=None,
     return out
 
 
+def hide_unlisted(df, key):
+    """Hide item rows with no Listing — their brand mapping is unreliable.
+    A checkbox restores them if needed."""
+    if "listing_id" not in df.columns:
+        return df
+    lid = df["listing_id"].astype(str).str.strip().str.lower()
+    has = df["listing_id"].notna() & lid.ne("") & lid.ne("none") & lid.ne("nan")
+    n_hidden = int((~has).sum())
+    if n_hidden == 0:
+        return df
+    show = st.checkbox(f"Show {n_hidden:,} item(s) with no Listing (brand may be unreliable)",
+                       value=False, key=key)
+    return df if show else df[has]
+
+
 # ============================================================
 # NATIVE TABLE RENDERER
 # ============================================================
 def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
-                 pin_cols=(), color_rows=False, height=480):
+                 datetime_cols=(), pin_cols=(), color_rows=False, height=480):
     """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
     Selectable tables show a tick column; returns the ticked WO (or None)."""
     colcfg = {}
@@ -473,6 +488,9 @@ def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
     for c in date_cols:
         if c in display.columns and c not in colcfg:
             colcfg[c] = st.column_config.DateColumn(c, format="YYYY-MM-DD")
+    for c in datetime_cols:
+        if c in display.columns and c not in colcfg:
+            colcfg[c] = st.column_config.DatetimeColumn(c, format="YYYY-MM-DD HH:mm")
     for c in pin_cols:
         if c in display.columns and c not in colcfg:
             try:
@@ -715,25 +733,31 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
         reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
     )
+    filtered = hide_unlisted(filtered, f"hl_swo_items_{wo_id}")
     display = filtered[
-        ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple",
-         "processing_status", "block_reason_pfs", "original_request", "processed",
-         "woi_processing_pct", "shipped", "storage", "age_days_from_created", "ship_by"]
+        ["work_order_item_id", "source", "master_id", "listing_id", "finished_good_name", "source_brand",
+         "status_simple", "processing_status", "block_reason_pfs", "original_request", "current_request",
+         "processed", "order_created", "shipped", "storage", "woi_processing_pct",
+         "age_days_from_created", "days_overdue", "ship_by", "created_at", "last_edit_at"]
     ].rename(columns={
-        "work_order_item_id": "WOI ID", "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "status_simple": "Status", "processing_status": "Block Status",
-        "block_reason_pfs": "Reason", "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "shipped": "Shipped", "storage": "Stowed",
-        "age_days_from_created": "Age (d)", "ship_by": "Ship By",
+        "work_order_item_id": "WOI ID", "source": "Source", "master_id": "Master ID",
+        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "status_simple": "Status", "processing_status": "Block Status", "block_reason_pfs": "Reason",
+        "original_request": "Orig", "current_request": "Current", "processed": "Processed",
+        "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
+        "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
+        "ship_by": "Ship By", "created_at": "Created At", "last_edit_at": "Last Edit At",
     })
     cols = column_picker(list(display.columns), key=f"cols_swo_items_{wo_id}", required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key=f"tb_swo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
-                  id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
+                  id_cols=["WOI ID", "Listing", "Master ID"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_swo_items_{wo_id}"),
-        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=480,
+        pct_cols=["%"], date_cols=["Ship By"],
+        datetime_cols=["Created At", "Last Edit At"],
+        pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
 
@@ -743,25 +767,33 @@ def storage_item_view(s_items):
         reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
     )
+    filtered = hide_unlisted(filtered, "hl_sit")
     display = filtered[
-        ["work_order_number", "work_order_item_id", "listing_id", "finished_good_name", "source_brand", "warehouse",
-         "status_simple", "processing_status", "block_reason_pfs", "original_request",
-         "processed", "woi_processing_pct", "age_days_from_created", "ship_by"]
+        ["work_order_number", "work_order_item_id", "source", "master_id", "listing_id",
+         "finished_good_name", "source_brand", "warehouse", "status_simple", "processing_status",
+         "block_reason_pfs", "original_request", "current_request", "processed", "order_created",
+         "shipped", "storage", "woi_processing_pct", "age_days_from_created", "days_overdue",
+         "ship_by", "created_at", "last_edit_at"]
     ].rename(columns={
-        "work_order_number": "WO", "work_order_item_id": "WOI ID", "listing_id": "Listing",
-        "finished_good_name": "Item Name", "source_brand": "Brand", "warehouse": "WH",
-        "status_simple": "Status", "processing_status": "Block Status", "block_reason_pfs": "Reason",
-        "original_request": "Orig", "processed": "Processed", "woi_processing_pct": "%",
-        "age_days_from_created": "Age (d)", "ship_by": "Ship By",
+        "work_order_number": "WO", "work_order_item_id": "WOI ID", "source": "Source",
+        "master_id": "Master ID", "listing_id": "Listing", "finished_good_name": "Item Name",
+        "source_brand": "Brand", "warehouse": "WH", "status_simple": "Status",
+        "processing_status": "Block Status", "block_reason_pfs": "Reason",
+        "original_request": "Orig", "current_request": "Current", "processed": "Processed",
+        "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
+        "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
+        "ship_by": "Ship By", "created_at": "Created At", "last_edit_at": "Last Edit At",
     })
     cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key="tb_sit", file_stem="storage_items",
-                  id_cols=["WOI ID", "Listing", "WO"], count_label=f"{len(display):,} items")
+                  id_cols=["WOI ID", "Listing", "WO", "Master ID"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_sit"),
-        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=600,
+        pct_cols=["%"], date_cols=["Ship By"],
+        datetime_cols=["Created At", "Last Edit At"],
+        pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
 
@@ -848,24 +880,36 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         flag_col="po_block_flag", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
     )
+    filtered = hide_unlisted(filtered, f"hl_pwo_items_{wo_id}")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
-        ["work_order_item_id", "listing_id", "finished_good_name", "source_brand", "status_simple", "po_block_flag",
-         "po_days_past_ref_ship_by", "original_request", "processed", "woi_processing_pct", "po_ref_ship_by_date"]
+        ["work_order_item_id", "source", "master_id", "listing_id", "finished_good_name", "source_brand",
+         "status_simple", "po_block_flag", "po_days_past_ref_ship_by", "original_request", "current_request",
+         "processed", "order_created", "shipped", "storage", "woi_processing_pct", "days_overdue",
+         "ship_by", "po_ref_ship_by_date", "po_requested_ship_date", "po_requested_delivery_date",
+         "po_placed_at", "po_arrived_at", "created_at", "last_edit_at"]
     ].rename(columns={
-        "work_order_item_id": "WOI ID", "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "status_simple": "Status", "po_block_flag": "Flag",
-        "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig", "processed": "Processed",
-        "woi_processing_pct": "%", "po_ref_ship_by_date": "Ship By",
+        "work_order_item_id": "WOI ID", "source": "Source", "master_id": "Master ID",
+        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "status_simple": "Status", "po_block_flag": "Flag", "po_days_past_ref_ship_by": "Days Past",
+        "original_request": "Orig", "current_request": "Current", "processed": "Processed",
+        "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
+        "woi_processing_pct": "%", "days_overdue": "Days Overdue", "ship_by": "Ship By",
+        "po_ref_ship_by_date": "Ref Ship-by", "po_requested_ship_date": "Req Ship Date",
+        "po_requested_delivery_date": "Req Delivery Date", "po_placed_at": "Placed At",
+        "po_arrived_at": "Arrived At", "created_at": "Created At", "last_edit_at": "Last Edit At",
     })
     cols = column_picker(list(display.columns), key=f"cols_pwo_items_{wo_id}", required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key=f"tb_pwo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
-                  id_cols=["WOI ID", "Listing"], count_label=f"{len(display)} items")
+                  id_cols=["WOI ID", "Listing", "Master ID"], count_label=f"{len(display)} items")
     render_table(
         display, key=_grid_key(f"grid_pwo_items_{wo_id}"),
-        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=480,
+        pct_cols=["%"],
+        date_cols=["Ship By", "Ref Ship-by", "Req Ship Date", "Req Delivery Date"],
+        datetime_cols=["Placed At", "Arrived At", "Created At", "Last Edit At"],
+        pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
 
@@ -875,26 +919,38 @@ def po_item_view(p_items):
         flag_col="po_block_flag", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
     )
+    filtered = hide_unlisted(filtered, "hl_pit")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
-        ["work_order_number", "work_order_item_id", "po_number_raw", "listing_id", "finished_good_name", "source_brand",
-         "warehouse", "status_simple", "po_block_flag", "po_days_past_ref_ship_by", "original_request",
-         "processed", "woi_processing_pct", "ship_by"]
+        ["work_order_number", "work_order_item_id", "po_number_raw", "source", "master_id", "listing_id",
+         "finished_good_name", "source_brand", "warehouse", "status_simple", "po_block_flag",
+         "original_request", "current_request", "processed", "order_created", "shipped", "storage",
+         "woi_processing_pct", "po_days_past_ref_ship_by", "days_overdue", "ship_by", "po_ref_ship_by_date",
+         "po_requested_ship_date", "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
+         "created_at", "last_edit_at"]
     ].rename(columns={
-        "work_order_number": "WO", "work_order_item_id": "WOI ID", "po_number_raw": "PO #", "listing_id": "Listing",
+        "work_order_number": "WO", "work_order_item_id": "WOI ID", "po_number_raw": "PO #",
+        "source": "Source", "master_id": "Master ID", "listing_id": "Listing",
         "finished_good_name": "Item Name", "source_brand": "Brand", "warehouse": "WH",
-        "status_simple": "Status", "po_block_flag": "Flag",
-        "po_days_past_ref_ship_by": "Days Past", "original_request": "Orig",
-        "processed": "Processed", "woi_processing_pct": "%", "ship_by": "Ship By",
+        "status_simple": "Status", "po_block_flag": "Flag", "original_request": "Orig",
+        "current_request": "Current", "processed": "Processed", "order_created": "Ship Created",
+        "shipped": "Shipped", "storage": "Stowed", "woi_processing_pct": "%",
+        "po_days_past_ref_ship_by": "Days Past", "days_overdue": "Days Overdue", "ship_by": "Ship By",
+        "po_ref_ship_by_date": "Ref Ship-by", "po_requested_ship_date": "Req Ship Date",
+        "po_requested_delivery_date": "Req Delivery Date", "po_placed_at": "Placed At",
+        "po_arrived_at": "Arrived At", "created_at": "Created At", "last_edit_at": "Last Edit At",
     })
     cols = column_picker(list(display.columns), key="cols_pit", required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key="tb_pit", file_stem="po_items",
-                  id_cols=["WOI ID", "Listing", "WO", "PO #"], count_label=f"{len(display):,} items")
+                  id_cols=["WOI ID", "Listing", "WO", "PO #", "Master ID"], count_label=f"{len(display):,} items")
     render_table(
         display, key=_grid_key("grid_pit"),
-        pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True, height=600,
+        pct_cols=["%"],
+        date_cols=["Ship By", "Ref Ship-by", "Req Ship Date", "Req Delivery Date"],
+        datetime_cols=["Placed At", "Arrived At", "Created At", "Last Edit At"],
+        pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
 
