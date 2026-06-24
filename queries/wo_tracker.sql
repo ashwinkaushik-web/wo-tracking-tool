@@ -7,6 +7,15 @@
 --   - PFS blocked detection (Storage WOs)
 --   - PO block flag based on later of WO/PO ship-by + processing %
 --   - WO-level processing % aggregates
+--
+-- BRAND/LISTING FIX (brand mis-mapping):
+--   Item identity (brand, item name, listing, master) is now anchored to the
+--   PFS finished-good item (FINISHED_GOOD_ITEM_ID) — the same source the
+--   correct item name comes from — with the catalog join only as a fallback.
+--   The old `it.id = COALESCE(l.item_id, woi.workable_id)` fell back to the
+--   *listing id* when the LISTINGS join missed, joining to the wrong item and
+--   showing the wrong brand (e.g. Sorel→Polar). PFS covers Storage WOs; PO/IR
+--   WOs fall back to the catalog join as before.
 -- =====================================================================
 
 WITH woi_results AS (
@@ -31,6 +40,11 @@ pfs_agg AS (
         MAX(WOI_AGE_DAYS) AS age_days_from_created,
         MAX(WOI_SHIP_BY_DAYS_OVERDUE) AS days_overdue,
         MAX(FINISHED_GOOD_NAME) AS finished_good_name,
+        -- NEW: correct item identity from PFS (same source as the name)
+        MAX(FINISHED_GOOD_ITEM_ID) AS fg_item_id,
+        MAX(FINISHED_GOOD_MASTER_ID) AS fg_master_id,
+        MAX(LISTING_ID) AS pfs_listing_id,
+        MAX(COMPONENT_BRAND) AS pfs_component_brand,
         LISTAGG(DISTINCT COMPONENT_UNPICKABLE_REASON, ' | ')
             WITHIN GROUP (ORDER BY COMPONENT_UNPICKABLE_REASON) AS component_block_reasons
     FROM PATTERN_DB.OPERATIONS.PICK_FROM_STOW_WORK_ORDER_ITEMS
@@ -53,8 +67,10 @@ SELECT
     woi.work_order_id                             AS work_order_number,
     woi.id                                        AS work_order_item_id,
     it.name                                       AS work_order_item,
-    pfs.finished_good_name                        AS finished_good_name,
-    it.master_id                                  AS master_id,
+    -- Item name: PFS name first, else the (now-correct) catalog item name
+    COALESCE(pfs.finished_good_name, it.name)     AS finished_good_name,
+    -- Master: catalog (now correct) first, else PFS master
+    COALESCE(it.master_id, pfs.fg_master_id)      AS master_id,
     COALESCE(ir.ir_number, 'PO# ' || p.po_number, 'Storage') AS source,
     CASE
         WHEN wo.receivable_type = 'Purchase'         THEN 'PO'
@@ -63,7 +79,8 @@ SELECT
     END                                           AS source_category,
     p.po_number                                   AS po_number_raw,
     wo.receivable_type                            AS receivable_type,
-    pa.name                                       AS source_brand,
+    -- Brand: partner of the (now-correct) item, else PFS component brand
+    COALESCE(pa.name, pfs.pfs_component_brand)     AS source_brand,
     CASE WHEN woi.quantity - COALESCE(woi.processed_quantity, 0) > 0
          THEN 'Open' ELSE 'Closed' END            AS status_simple,
     pfs.processing_status                         AS processing_status,
@@ -135,7 +152,8 @@ SELECT
     pfs.age_days_from_created                     AS age_days_from_created,
     woi.ship_by_date                              AS ship_by,
     pfs.days_overdue                              AS days_overdue,
-    l.listing_id                                  AS listing_id,
+    -- Listing: catalog listing first, else PFS listing (fills the blanks)
+    COALESCE(l.listing_id, pfs.pfs_listing_id)    AS listing_id,
     cm.name                                       AS marketplace,
     cm.country_code                               AS marketplace_country,
     wh.warehouse_name                             AS warehouse,
@@ -146,8 +164,11 @@ SELECT
 FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
 JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS            wo ON wo.id = woi.work_order_id
 JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEM_TYPES  wt ON wt.id = woi.work_order_item_type_id
+-- pfs joined BEFORE items so the item/brand join can use the correct FG item id
+LEFT JOIN pfs_agg           pfs  ON pfs.woi_id = woi.id
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__LISTINGS          l  ON l.id = woi.workable_id AND woi.workable_type = 'Listing'
-JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__ITEMS                  it ON it.id = COALESCE(l.item_id, woi.workable_id)
+-- Item identity prefers the PFS finished-good item id (correct), then catalog
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__ITEMS                  it ON it.id = COALESCE(pfs.fg_item_id, l.item_id, woi.workable_id)
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__PARTNERS          pa ON pa.id = it.partner_id
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__CATALOG_MARKETPLACES cm ON cm.id = l.catalog_marketplace_id
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WAREHOUSES        wh ON wh.id = wo.warehouse_id
@@ -158,7 +179,6 @@ LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__PURCHASES         p
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__USERS             eu ON eu.id = woi.updated_by_id
 LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__USERS             cu ON cu.id = woi.created_by_id
 LEFT JOIN woi_results       res  ON res.work_order_item_id = woi.id
-LEFT JOIN pfs_agg           pfs  ON pfs.woi_id = woi.id
 LEFT JOIN wo_agg            wagg ON wagg.work_order_id = woi.work_order_id
 WHERE woi.deleted_at IS NULL
   AND wo.deleted_at IS NULL
