@@ -197,6 +197,7 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
         stowed=("storage", "sum"),
         max_age=("age_days_from_created", "max"),
         earliest_ship=("ship_by", "min"),
+        earliest_ref_ship=("po_ref_ship_by_date", "min"),
         unique_listings=("listing_id", "nunique"),
         pfs_blocks=("is_blocked_pfs", lambda s: s.fillna(False).sum()),
     )
@@ -426,31 +427,42 @@ def column_picker(all_labels, key, default_labels=None, required=()):
 
 
 def table_toolbar(display, *, key, file_stem, id_cols, count_label):
-    """Count + CSV + Excel + copy-items popover + copy-table button."""
+    """Count + CSV + Excel + copy-items popover + copy-table button.
+
+    Excel and Copy-table are built only when the user ticks them on — generating
+    them on every rerun is what made big tables (e.g. PO items) crawl."""
     ts = datetime.now().strftime("%Y%m%d")
-    a, b, c, d, e = st.columns([2.6, 1, 1, 1.2, 1.4])
+    a, b, c, d, e = st.columns([2.6, 1, 1.1, 1.2, 1.4])
     a.caption(count_label)
-    csv_text = display.to_csv(index=False)
-    b.download_button("📥 CSV", csv_text.encode("utf-8"),
+
+    # CSV is cheap, keep it one-click.
+    b.download_button("📥 CSV", _df_to_csv_bytes(display),
                       file_name=f"{file_stem}_{ts}.csv", mime="text/csv",
                       use_container_width=True, key=f"{key}_csv")
-    if len(display) <= 20000:
-        c.download_button("📊 Excel", _xlsx_bytes_from_csv(csv_text),
-                          file_name=f"{file_stem}_{ts}.xlsx",
-                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                          use_container_width=True, key=f"{key}_xlsx")
-    else:
-        c.caption("Excel: filter <20k")
+
+    # Excel (openpyxl) is slow — only build it when asked.
+    with c:
+        if len(display) > 20000:
+            st.caption("Excel: filter <20k")
+        elif st.checkbox("📊 Excel", key=f"{key}_xlsx_go", help="Build an .xlsx to download"):
+            st.download_button("⬇ Download", _xlsx_bytes_from_csv(display.to_csv(index=False)),
+                               file_name=f"{file_stem}_{ts}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, key=f"{key}_xlsx")
     with d:
         copy_popover(display, id_cols, key=f"{key}_cp")
+
+    # Copy-table injects the whole table into the page — only render on demand.
     with e:
-        copy_table_button(display, key=f"{key}_ct")
+        if st.checkbox("📋 Copy table", key=f"{key}_ct_go", help="Show a copy-to-clipboard button"):
+            copy_table_button(display, key=f"{key}_ct")
 
 
 # ============================================================
 # SHARED FILTER PANEL
 # ============================================================
-def filter_panel(df, key, *, brand_col=None, ship_col=None, reason_col=None,
+def filter_panel(df, key, *, brand_col=None, ship_col=None, ship_fallback_col=None,
+                 ship_label="Ship by", reason_col=None,
                  blocked_kind=None, flag_col=None, status_kind=None, search_cols=None):
     """Standard filters in an expander. Returns the filtered DataFrame.
     blocked_kind: 'wo' (pfs_blocks count) or 'item' (is_blocked_pfs bool) or None.
@@ -508,15 +520,18 @@ def filter_panel(df, key, *, brand_col=None, ship_col=None, reason_col=None,
             elif sp == "Closed":
                 out = out[out["open_items"] == 0]
 
-        # Ship By range + Search
+        # Ship-by range + Search
         d1, d2, d3 = st.columns([1, 1, 2])
         if ship_col and ship_col in out.columns:
-            sfrom = d1.date_input("Ship by — from", value=None, key=f"{key}_sfrom", format="YYYY-MM-DD")
-            sto = d2.date_input("Ship by — to", value=None, key=f"{key}_sto", format="YYYY-MM-DD")
+            sfrom = d1.date_input(f"{ship_label} — from", value=None, key=f"{key}_sfrom", format="YYYY-MM-DD")
+            sto = d2.date_input(f"{ship_label} — to", value=None, key=f"{key}_sto", format="YYYY-MM-DD")
             ship_dt = pd.to_datetime(out[ship_col], errors="coerce")
+            # Many POs have no ship_by — fall back to the reference ship-by date.
+            if ship_fallback_col and ship_fallback_col in out.columns:
+                ship_dt = ship_dt.fillna(pd.to_datetime(out[ship_fallback_col], errors="coerce"))
             if sfrom:
                 out = out[ship_dt >= pd.Timestamp(sfrom)]
-                ship_dt = pd.to_datetime(out[ship_col], errors="coerce")
+                ship_dt = ship_dt.loc[out.index]
             if sto:
                 out = out[ship_dt <= (pd.Timestamp(sto) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
         if search_cols:
@@ -924,18 +939,18 @@ def po_tab(df, wos):
 
 def po_wo_view(p_wos, p_items):
     filtered = filter_panel(
-        p_wos, "fp_pwo", brand_col="top_brand", ship_col="earliest_ship",
-        flag_col="worst_po_flag", status_kind="wo",
+        p_wos, "fp_pwo", brand_col="top_brand", ship_col="earliest_ref_ship",
+        ship_label="Ref ship-by", flag_col="worst_po_flag", status_kind="wo",
         search_cols=["work_order_number", "po_number_raw", "top_brand"],
     )
     display = filtered[
-        ["work_order_number", "po_number_raw", "earliest_ship", "warehouse", "top_brand", "items", "open_items",
+        ["work_order_number", "po_number_raw", "earliest_ref_ship", "warehouse", "top_brand", "items", "open_items",
          "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age"]
     ].rename(columns={
         "work_order_number": "WO", "po_number_raw": "PO #", "warehouse": "WH", "top_brand": "Brand",
         "items": "Items", "open_items": "Open", "untouched": "Untouched",
         "orig": "Orig", "processed": "Processed", "pct": "% Processed",
-        "worst_po_flag": "Worst Flag", "max_age": "Age (d)", "earliest_ship": "Ship By",
+        "worst_po_flag": "Worst Flag", "max_age": "Age (d)", "earliest_ref_ship": "Ref Ship-by",
     })
     cols = column_picker(list(display.columns), key="cols_pwo", required=["WO"])
     display = display[cols]
@@ -944,7 +959,7 @@ def po_wo_view(p_wos, p_items):
                   id_cols=["WO", "PO #"], count_label=f"{len(display)} of {len(p_wos)} WOs")
     sel_wo = render_table(
         display, key=_grid_key("grid_pwo"), selectable=True,
-        pct_cols=["% Processed"], date_cols=["Ship By"], pin_cols=["WO"], height=500,
+        pct_cols=["% Processed"], date_cols=["Ref Ship-by"], pin_cols=["WO"], height=500,
     )
     if sel_wo is not None:
         if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_pwo", use_container_width=True):
@@ -967,7 +982,7 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     c3.metric("Untouched", _safe_int(wo_row["untouched"]))
     c4.metric("Orig Qty", f"{_safe_int(wo_row['orig']):,}")
     c5.metric("Processed", f"{_safe_int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
-    c6.metric("Ship By", _safe_date_str(wo_row["earliest_ship"]))
+    c6.metric("Ref Ship-by", _safe_date_str(wo_row["earliest_ref_ship"]))
 
     items = p_items[p_items["work_order_number"] == wo_id].copy()
     flag_counts = items["po_block_flag"].value_counts().to_dict()
@@ -978,23 +993,23 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
     filtered = filter_panel(
-        items, f"fp_pwo_items_{wo_id}", brand_col="source_brand", ship_col="ship_by",
-        flag_col="po_block_flag", status_kind="item",
+        items, f"fp_pwo_items_{wo_id}", brand_col="source_brand", ship_col="po_ref_ship_by_date",
+        ship_label="Ref ship-by", flag_col="po_block_flag", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
     )
     filtered = hide_unlisted(filtered, f"hl_pwo_items_{wo_id}")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
-        ["work_order_item_id", "ship_by", "po_ref_ship_by_date", "po_requested_ship_date",
-         "po_requested_delivery_date", "po_placed_at", "po_arrived_at", "created_at",
+        ["work_order_item_id", "po_ref_ship_by_date",
+         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
          "master_id", "listing_id", "finished_good_name", "source_brand",
          "status_simple", "po_block_flag",
          "original_request", "current_request", "processed", "order_created", "shipped", "storage",
          "woi_processing_pct", "po_days_past_ref_ship_by"]
     ].rename(columns={
-        "work_order_item_id": "WOI ID", "ship_by": "Ship By", "po_ref_ship_by_date": "Ref Ship-by",
-        "po_requested_ship_date": "Req Ship Date", "po_requested_delivery_date": "Req Delivery Date",
-        "po_placed_at": "Placed At", "po_arrived_at": "Arrived At", "created_at": "Created At",
+        "work_order_item_id": "WOI ID", "po_ref_ship_by_date": "Ref Ship-by",
+        "po_requested_delivery_date": "Req Delivery Date",
+        "po_placed_at": "Placed At", "po_arrived_at": "Arrived At",
         "master_id": "Master ID",
         "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
         "status_simple": "Status",
@@ -1011,33 +1026,33 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     render_table(
         display, key=_grid_key(f"grid_pwo_items_{wo_id}"),
         pct_cols=["%"],
-        date_cols=["Ship By", "Ref Ship-by", "Req Ship Date", "Req Delivery Date"],
-        datetime_cols=["Placed At", "Arrived At", "Created At"],
+        date_cols=["Ref Ship-by", "Req Delivery Date"],
+        datetime_cols=["Placed At", "Arrived At"],
         pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
 
 def po_item_view(p_items):
     filtered = filter_panel(
-        p_items, "fp_pit", brand_col="source_brand", ship_col="ship_by",
-        flag_col="po_block_flag", status_kind="item",
+        p_items, "fp_pit", brand_col="source_brand", ship_col="po_ref_ship_by_date",
+        ship_label="Ref ship-by", flag_col="po_block_flag", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
     )
     filtered = hide_unlisted(filtered, "hl_pit")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     display = filtered[
         ["work_order_item_id", "work_order_number", "po_number_raw",
-         "ship_by", "po_ref_ship_by_date", "po_requested_ship_date", "po_requested_delivery_date",
-         "po_placed_at", "po_arrived_at", "created_at",
+         "po_ref_ship_by_date", "po_requested_delivery_date",
+         "po_placed_at", "po_arrived_at",
          "master_id", "listing_id", "finished_good_name", "source_brand",
          "warehouse", "status_simple", "po_block_flag",
          "original_request", "current_request", "processed", "order_created", "shipped", "storage",
          "woi_processing_pct", "po_days_past_ref_ship_by"]
     ].rename(columns={
         "work_order_item_id": "WOI ID", "work_order_number": "WO", "po_number_raw": "PO #",
-        "ship_by": "Ship By", "po_ref_ship_by_date": "Ref Ship-by", "po_requested_ship_date": "Req Ship Date",
+        "po_ref_ship_by_date": "Ref Ship-by",
         "po_requested_delivery_date": "Req Delivery Date", "po_placed_at": "Placed At",
-        "po_arrived_at": "Arrived At", "created_at": "Created At",
+        "po_arrived_at": "Arrived At",
         "master_id": "Master ID", "listing_id": "Listing",
         "finished_good_name": "Item Name", "source_brand": "Brand",
         "warehouse": "WH", "status_simple": "Status",
@@ -1054,8 +1069,8 @@ def po_item_view(p_items):
     render_table(
         display, key=_grid_key("grid_pit"),
         pct_cols=["%"],
-        date_cols=["Ship By", "Ref Ship-by", "Req Ship Date", "Req Delivery Date"],
-        datetime_cols=["Placed At", "Arrived At", "Created At"],
+        date_cols=["Ref Ship-by", "Req Delivery Date"],
+        datetime_cols=["Placed At", "Arrived At"],
         pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
