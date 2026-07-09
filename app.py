@@ -45,11 +45,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
+PO_QUERY_PATH = Path(__file__).parent / "queries" / "po_tracker.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
 FLAG_ORDER = [
     "🔴 Blocked / Issue", "🟠 Partially Processed",
     "🟡 Approaching ship-by", "🟢 On Track", "✅ Complete",
+]
+
+# Unified lifecycle status vocabulary (PO Details + future areas). Worst → best.
+PO_STATUS_ORDER = [
+    "🔴 Issue", "🟠 Partial", "🟡 Placed", "🟢 In progress", "✅ Complete",
 ]
 
 # ============================================================
@@ -148,6 +154,7 @@ def _to_wo(v):
 def _reset_selection():
     st.session_state.pop("selected_storage_wo", None)
     st.session_state.pop("selected_po_wo", None)
+    st.session_state.pop("selected_po_detail", None)
     st.session_state["grid_nonce"] = st.session_state.get("grid_nonce", 0) + 1
 
 
@@ -321,7 +328,7 @@ def _grid_key(base):
 
 def _row_style(row):
     """Background colour by status for the coloured (non-clickable) tables."""
-    flag = str(row.get("Flag", row.get("Worst Flag", "")))
+    flag = str(row.get("Flag", row.get("Worst Flag", row.get("Status", ""))))
     color = ""
     if "🔴" in flag:
         color = "rgba(239,68,68,0.13)"
@@ -563,8 +570,8 @@ def hide_unlisted(df, key):
 COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler is slow)
 
 
-def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
-                 datetime_cols=(), pin_cols=(), color_rows=False, height=480):
+def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=(), numpct_cols=(),
+                 date_cols=(), datetime_cols=(), pin_cols=(), color_rows=False, height=480):
     """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
     Selectable tables show a tick column; returns the ticked WO (or None).
 
@@ -577,6 +584,8 @@ def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
         if c in pct_cols:
             colcfg[c] = st.column_config.ProgressColumn(
                 c, help=help_txt, min_value=0, max_value=100, format="%.1f%%")
+        elif c in numpct_cols:
+            colcfg[c] = st.column_config.NumberColumn(c, help=help_txt, format="%.1f%%")
         elif c in date_cols:
             colcfg[c] = st.column_config.DateColumn(c, help=help_txt, format="YYYY-MM-DD")
         elif c in datetime_cols:
@@ -595,8 +604,8 @@ def render_table(display, *, key, selectable=False, pct_cols=(), date_cols=(),
             on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
         )
         rows = event.selection.rows
-        if rows and "WO" in display.columns:
-            return display.iloc[rows[0]]["WO"]
+        if rows and select_col in display.columns:
+            return display.iloc[rows[0]][select_col]
         return None
 
     data = display
@@ -1076,6 +1085,326 @@ def po_item_view(p_items):
 
 
 # ============================================================
+# PO DETAILS (Phase 2)  —  inbound purchase orders (UK/EU)
+# Source: queries/po_tracker.sql  ->  ANALYTICS_DB.REPORTING.REPORT__BRAND_MANAGEMENT_V7__PURCHASE_ORDERS
+# Grain: one row per PO x line item. Fill rates are UNCAPPED (>100% = over-receipts).
+# ============================================================
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_po_data():
+    sql = PO_QUERY_PATH.read_text()
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+
+    date_cols = [
+        "order_placed_date", "ship_date", "arrived_date", "finished_arrived_date",
+        "cancel_date", "po_last_received_date", "item_last_received_date",
+    ]
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    numeric_cols = [
+        "po_number", "item_id",
+        "wholesale_price", "retail_price", "wholesale_ordered", "wholesale_received",
+        "original_ordered_units", "ordered_units", "current_units", "current_on_order",
+        "received_units", "remained_blanket_order_quantity",
+        "total_issues", "demand_fill_rate_pct", "vendor_fill_rate_pct",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["po_status"] = _po_item_status(df)
+    pos = _build_po_aggregates(df)
+    return df, pos, datetime.now()
+
+
+def _po_item_status(df):
+    """Unified lifecycle status at PO line-item grain (see PO_STATUS_ORDER)."""
+    recv = pd.to_numeric(df.get("received_units"), errors="coerce").fillna(0)
+    cur = pd.to_numeric(df.get("current_units"), errors="coerce").fillna(0)
+    iss = pd.to_numeric(df.get("total_issues"), errors="coerce").fillna(0)
+    status = pd.Series("🟢 In progress", index=df.index)
+    status = status.mask(recv <= 0, "🟡 Placed")
+    status = status.mask((recv > 0) & (recv < cur), "🟠 Partial")
+    status = status.mask((cur > 0) & (recv >= cur), "✅ Complete")
+    status = status.mask(iss > 0, "🔴 Issue")   # issue overrides — highest attention
+    return status
+
+
+def _build_po_aggregates(df):
+    """Roll line items up to one row per PO."""
+    g = df.groupby("po_number", as_index=False).agg(
+        vendor_name=("vendor_name", "first"),
+        country_name=("country_name", "first"),
+        warehouse_name=("warehouse_name", "first"),
+        purchase_state=("purchase_state", "first"),
+        lines=("item_id", "count"),
+        original_ordered=("original_ordered_units", "sum"),
+        ordered=("ordered_units", "sum"),
+        received=("received_units", "sum"),
+        on_order=("current_on_order", "sum"),
+        order_placed=("order_placed_date", "min"),
+        last_received=("po_last_received_date", "max"),
+        issues=("total_issues", "sum"),
+    )
+    g["left"] = (g["ordered"] - g["received"]).clip(lower=0)
+    g["demand_fill_pct"] = np.where(
+        g["original_ordered"].fillna(0) > 0,
+        (g["received"].fillna(0) * 100.0 / g["original_ordered"].replace(0, np.nan)).round(1), 0)
+    g["vendor_fill_pct"] = np.where(
+        g["ordered"].fillna(0) > 0,
+        (g["received"].fillna(0) * 100.0 / g["ordered"].replace(0, np.nan)).round(1), 0)
+    g["demand_fill_pct"] = pd.to_numeric(g["demand_fill_pct"], errors="coerce").fillna(0)
+    g["vendor_fill_pct"] = pd.to_numeric(g["vendor_fill_pct"], errors="coerce").fillna(0)
+
+    sev = {s: i for i, s in enumerate(PO_STATUS_ORDER)}
+    tmp = df[["po_number", "po_status"]].copy()
+    tmp["_sev"] = tmp["po_status"].map(sev).fillna(len(PO_STATUS_ORDER))
+    worst = (tmp.sort_values("_sev").drop_duplicates("po_number", keep="first")
+             .set_index("po_number")["po_status"])
+    g["status"] = g["po_number"].map(worst)
+    return g
+
+
+def po_filter_panel(df, key, *, date_col=None, status_col=None, search_cols=None):
+    """Filters for PO Details: Vendor, Country, Warehouse, State, Status, date range, search."""
+    out = df.copy()
+    with st.expander("🔎 Filters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        for col, label, cont in [("vendor_name", "Vendor", c1), ("country_name", "Country", c2),
+                                 ("warehouse_name", "Warehouse", c3), ("purchase_state", "State", c4)]:
+            if col in out.columns:
+                opts = sorted([str(v) for v in out[col].dropna().unique()
+                               if str(v).strip() and str(v).lower() != "nan"])
+                pick = cont.multiselect(label, opts, key=f"{key}_{col}", placeholder=f"All {label.lower()}")
+                if pick:
+                    out = out[out[col].astype(str).isin(pick)]
+        d1, d2, d3, d4 = st.columns([1, 1, 1, 2])
+        if status_col and status_col in out.columns:
+            sopts = [s for s in PO_STATUS_ORDER if (out[status_col] == s).any()]
+            sp = d1.selectbox("Status", ["All"] + sopts, key=f"{key}_status")
+            if sp != "All":
+                out = out[out[status_col] == sp]
+        if date_col and date_col in out.columns:
+            sfrom = d2.date_input("Order placed — from", value=None, key=f"{key}_from", format="YYYY-MM-DD")
+            sto = d3.date_input("Order placed — to", value=None, key=f"{key}_to", format="YYYY-MM-DD")
+            dt = pd.to_datetime(out[date_col], errors="coerce")
+            if sfrom:
+                out = out[dt >= pd.Timestamp(sfrom)]
+                dt = dt.loc[out.index]
+            if sto:
+                out = out[dt <= (pd.Timestamp(sto) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+        if search_cols:
+            q = d4.text_input("Search", "", key=f"{key}_search",
+                              placeholder="paste several — comma / new line = match any")
+            if q:
+                out = out[_str_contains_any(out, search_cols, q)]
+    return out
+
+
+_PO_ITEM_COLS = [
+    ("po_number", "PO #"), ("po_status", "Status"),
+    ("order_placed_date", "Order Placed"), ("ship_date", "Ship Date"), ("arrived_date", "Arrived"),
+    ("po_last_received_date", "PO Last Recv"), ("item_last_received_date", "Item Last Recv"),
+    ("finished_arrived_date", "Finished Arrived"), ("cancel_date", "Cancel Date"),
+    ("sku", "SKU"), ("asin", "ASIN"), ("master_id", "Master ID"), ("item_id", "Item ID"),
+    ("part_number", "Part #"), ("title", "Title"),
+    ("vendor_name", "Vendor"), ("country_name", "Country"), ("warehouse_name", "WH"),
+    ("purchase_state", "State"), ("note", "Note"),
+    ("original_ordered_units", "Orig Ordered"), ("ordered_units", "Ordered"),
+    ("current_units", "Current"), ("current_on_order", "On Order"),
+    ("received_units", "Received"), ("remained_blanket_order_quantity", "Remained Blanket"),
+    ("wholesale_price", "Wholesale £"), ("retail_price", "Retail £"),
+    ("wholesale_ordered", "WS Ordered £"), ("wholesale_received", "WS Received £"),
+    ("demand_fill_rate_pct", "Demand Fill %"), ("vendor_fill_rate_pct", "Vendor Fill %"),
+    ("total_issues", "Issues"),
+]
+_PO_ITEM_DEFAULT = ["PO #", "Status", "Order Placed", "Ship Date", "PO Last Recv", "SKU", "ASIN",
+                    "Master ID", "Title", "Vendor", "Country", "WH", "State", "Orig Ordered",
+                    "Ordered", "Received", "On Order", "Demand Fill %", "Vendor Fill %", "Issues"]
+_PO_ITEM_DATE_COLS = ["Order Placed", "Ship Date", "Arrived", "PO Last Recv", "Item Last Recv",
+                      "Finished Arrived", "Cancel Date"]
+
+
+def _po_item_display(df, include_po=True):
+    d = df.copy()
+    for c in ("po_number", "item_id"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+    pairs = [(r, l) for r, l in _PO_ITEM_COLS if r in d.columns and (include_po or r != "po_number")]
+    disp = d[[r for r, _ in pairs]].rename(columns=dict(pairs))
+    default = [l for l in _PO_ITEM_DEFAULT if l in disp.columns and (include_po or l != "PO #")]
+    return disp, default
+
+
+def po_details_kpi(po_df, po_pos):
+    ordered = pd.to_numeric(po_df.get("ordered_units"), errors="coerce").fillna(0).sum()
+    received = pd.to_numeric(po_df.get("received_units"), errors="coerce").fillna(0).sum()
+    issues = int((pd.to_numeric(po_df.get("total_issues"), errors="coerce").fillna(0) > 0).sum())
+    fill = (received * 100.0 / ordered) if ordered else 0
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("POs", f"{len(po_pos):,}")
+    c2.metric("Line items", f"{len(po_df):,}")
+    c3.metric("Units ordered", f"{int(ordered):,}")
+    c4.metric("Vendor fill", f"{fill:.0f}%")
+    c5.metric("Lines w/ issues", f"{issues:,}")
+
+
+def po_details_list(po_pos):
+    filtered = po_filter_panel(
+        po_pos, "fp_pod", date_col="order_placed", status_col="status",
+        search_cols=["po_number", "vendor_name", "country_name", "warehouse_name"],
+    )
+    sev = {s: i for i, s in enumerate(PO_STATUS_ORDER)}
+    filtered = (filtered.assign(_sev=filtered["status"].map(sev).fillna(len(PO_STATUS_ORDER)))
+                .sort_values(["_sev", "po_number"]).drop(columns="_sev"))
+    display = filtered[
+        ["po_number", "status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
+         "order_placed", "last_received", "lines", "original_ordered", "ordered", "received", "left",
+         "on_order", "demand_fill_pct", "vendor_fill_pct", "issues"]
+    ].rename(columns={
+        "po_number": "PO #", "status": "Status", "vendor_name": "Vendor", "country_name": "Country",
+        "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
+        "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
+        "ordered": "Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
+        "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %", "issues": "Issues",
+    })
+    display["PO #"] = pd.to_numeric(display["PO #"], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+    cols = column_picker(list(display.columns), key="cols_pod", required=["PO #"])
+    display = display[cols]
+
+    table_toolbar(display, key="tb_pod", file_stem="po_details",
+                  id_cols=["PO #", "Vendor"], count_label=f"{len(display)} of {len(po_pos)} POs")
+    sel = render_table(
+        display, key=_grid_key("grid_pod"), selectable=True, select_col="PO #",
+        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        date_cols=["Order Placed", "Last Received"], pin_cols=["PO #"],
+        color_rows=True, height=500,
+    )
+    if sel is not None:
+        po = _safe_int(sel)
+        if st.button(f"➡ Open PO {po}", type="primary", key="open_pod", use_container_width=True):
+            st.session_state.selected_po_detail = po
+            st.rerun()
+
+
+def po_details_items(po_df):
+    filtered = po_filter_panel(
+        po_df, "fp_podi", date_col="order_placed_date", status_col="po_status",
+        search_cols=["po_number", "sku", "asin", "master_id", "title", "vendor_name"],
+    )
+    disp, default = _po_item_display(filtered, include_po=True)
+    cols = column_picker(list(disp.columns), key="cols_podi", default_labels=default, required=["PO #"])
+    disp = disp[cols]
+    table_toolbar(disp, key="tb_podi", file_stem="po_items",
+                  id_cols=["PO #", "SKU", "ASIN", "Master ID"], count_label=f"{len(disp):,} line items")
+    render_table(
+        disp, key=_grid_key("grid_podi"),
+        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["PO #"], color_rows=True, height=600,
+    )
+
+
+def po_details_drilldown(po, po_df, po_pos, wo_df):
+    row = po_pos[po_pos["po_number"] == po].iloc[0]
+    top1, top2 = st.columns([1, 5])
+    if top1.button("← Back to list", use_container_width=True, key="back_pod"):
+        _reset_selection()
+        st.rerun()
+    top2.markdown(f"### PO {po} — {row['vendor_name']} · {row['warehouse_name']} · {row['status']}")
+    st.caption(f"{row['country_name']} · state: {row['purchase_state']} · "
+               f"{_safe_int(row['lines'])} line(s) · placed {_safe_date_str(row['order_placed'])}")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Orig Ordered", f"{_safe_int(row['original_ordered']):,}")
+    c2.metric("Ordered", f"{_safe_int(row['ordered']):,}")
+    c3.metric("Received", f"{_safe_int(row['received']):,}")
+    c4.metric("Left", f"{_safe_int(row['left']):,}")
+    c5.metric("Demand Fill", f"{row['demand_fill_pct']:.0f}%")
+    c6.metric("Vendor Fill", f"{row['vendor_fill_pct']:.0f}%")
+
+    items = po_df[po_df["po_number"] == po].copy()
+    st.markdown("---")
+    st.markdown(f"#### 📄 Items in PO {po}")
+    filtered = po_filter_panel(
+        items, f"fp_pod_items_{po}", date_col="order_placed_date", status_col="po_status",
+        search_cols=["sku", "asin", "master_id", "title"],
+    )
+    disp, default = _po_item_display(filtered, include_po=False)
+    cols = column_picker(list(disp.columns), key=f"cols_pod_items_{po}", default_labels=default, required=["SKU"])
+    disp = disp[cols]
+    table_toolbar(disp, key=f"tb_pod_items_{po}", file_stem=f"po_{po}_items",
+                  id_cols=["SKU", "ASIN", "Master ID"], count_label=f"{len(disp)} line items")
+    render_table(
+        disp, key=_grid_key(f"grid_pod_items_{po}"),
+        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["SKU"], color_rows=True, height=460,
+    )
+
+    st.markdown("---")
+    st.markdown("#### 🔗 Associated Work Orders")
+    if "po_number_raw" in wo_df.columns:
+        awo = wo_df[wo_df["po_number_raw"].astype(str) == str(po)].copy()
+    else:
+        awo = wo_df.iloc[0:0]
+    if awo.empty:
+        st.caption("No work orders linked to this PO in the current WO dataset (year-to-date).")
+    else:
+        awo_disp = awo[["work_order_number", "work_order_item_id", "status_simple", "po_block_flag",
+                        "original_request", "processed", "woi_processing_pct", "ship_by"]].rename(columns={
+            "work_order_number": "WO", "work_order_item_id": "WOI ID", "status_simple": "Status",
+            "po_block_flag": "Flag", "original_request": "Orig", "processed": "Processed",
+            "woi_processing_pct": "%", "ship_by": "Ship By",
+        })
+        table_toolbar(awo_disp, key=f"tb_pod_awo_{po}", file_stem=f"po_{po}_workorders",
+                      id_cols=["WO", "WOI ID"], count_label=f"{len(awo_disp)} WO item(s)")
+        render_table(
+            awo_disp, key=_grid_key(f"grid_pod_awo_{po}"),
+            pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"],
+            color_rows=True, height=300,
+        )
+
+
+def po_details_tab(wo_df):
+    try:
+        with st.spinner("Loading PO data from Snowflake..."):
+            po_df, po_pos, _ = fetch_po_data()
+    except Exception as e:
+        st.error(f"Couldn't load PO Details: {e}")
+        st.caption("Confirm the app can read ANALYTICS_DB.REPORTING and that queries/po_tracker.sql is deployed.")
+        return
+
+    wh = st.session_state.get("global_wh", "Both")
+    if wh != "Both":
+        po_df = po_df[po_df["warehouse_name"] == wh].copy()
+        po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
+
+    sel = st.session_state.get("selected_po_detail")
+    if sel is not None and sel in po_pos["po_number"].values:
+        po_details_drilldown(sel, po_df, po_pos, wo_df)
+        return
+
+    po_details_kpi(po_df, po_pos)
+    st.markdown("---")
+    view = st.radio("View", ["📋 PO Level", "📄 Item Level"], horizontal=True,
+                    key="po_details_view", label_visibility="collapsed")
+    st.caption("Inbound POs (UK/EU) · fill rates are uncapped (>100% = over-receipts) · "
+               "💡 tick a PO then Open PO · drag-select + Ctrl+C to copy")
+    if view == "📋 PO Level":
+        po_details_list(po_pos)
+    else:
+        po_details_items(po_df)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -1106,14 +1435,17 @@ def main():
     kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
-    tab_storage, tab_po = st.tabs([
+    tab_storage, tab_po, tab_pod = st.tabs([
         f"📦 Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
         f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
+        "🧾 PO Details",
     ])
     with tab_storage:
         storage_tab(df, wos)
     with tab_po:
         po_tab(df, wos)
+    with tab_pod:
+        po_details_tab(df)
 
 
 if __name__ == "__main__":
