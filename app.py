@@ -1405,6 +1405,139 @@ def po_details_tab(wo_df):
 
 
 # ============================================================
+# OVERVIEW (Phase 3a) — exceptions-first landing
+# ============================================================
+OV_AGING_DAYS = 21  # PO placed but nothing received beyond this = at risk
+
+
+def _ov_po_str(s):
+    return pd.to_numeric(s, errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+
+
+def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260):
+    render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
+                 pin_cols=pin_cols, color_rows=color_rows, height=height)
+
+
+def overview_tab(df, wos):
+    po_df = po_pos = None
+    try:
+        po_df, po_pos, _ = fetch_po_data()
+        wh = st.session_state.get("global_wh", "Both")
+        if wh != "Both":
+            po_df = po_df[po_df["warehouse_name"] == wh].copy()
+            po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
+    except Exception:
+        po_df = po_pos = None
+
+    # ---- Pipeline stage counts ----
+    st.markdown("#### 🚚 Pipeline — where inventory sits")
+    c = st.columns(6)
+    if po_pos is not None:
+        state = po_pos["purchase_state"].astype(str).str.lower()
+        c[0].metric("POs placed", f"{int((state == 'placed').sum()):,}")
+        c[1].metric("POs receiving", f"{int((state == 'receiving').sum()):,}")
+        c[2].metric("POs arrived", f"{int((state == 'arrived').sum()):,}")
+    else:
+        c[0].metric("POs", "n/a")
+        c[1].caption("PO data unavailable")
+    c[3].metric("WO items open", f"{int((df['status_simple'] == 'Open').sum()):,}")
+    c[4].metric("WO items blocked", f"{int(df['is_blocked_pfs'].fillna(False).sum()):,}")
+    c[5].metric("WO items done", f"{int((df['status_simple'] == 'Closed').sum()):,}")
+
+    st.markdown("---")
+    st.markdown("#### 🚨 Needs attention")
+
+    # A) Blocked WOIs (PFS)
+    blocked = df[df["is_blocked_pfs"].fillna(False)].copy()
+    with st.expander(f"🔴 Blocked work-order items ({len(blocked):,})", expanded=True):
+        if blocked.empty:
+            st.caption("None blocked in PFS right now.")
+        else:
+            d = blocked.sort_values("days_overdue", ascending=False)[
+                ["work_order_item_id", "work_order_number", "source_brand", "block_reason_pfs",
+                 "warehouse", "ship_by", "days_overdue"]
+            ].rename(columns={
+                "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
+                "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
+                "days_overdue": "Days Overdue"})
+            _ov_render(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
+
+    # B) Overdue, still-open WOIs
+    od = df[(pd.to_numeric(df["days_overdue"], errors="coerce").fillna(0) > 0)
+            & (df["status_simple"] == "Open")].copy()
+    with st.expander(f"⏰ Overdue open WO items ({len(od):,})"):
+        if od.empty:
+            st.caption("Nothing overdue and open.")
+        else:
+            d = od.sort_values("days_overdue", ascending=False)[
+                ["work_order_item_id", "work_order_number", "source_brand", "po_block_flag",
+                 "days_overdue", "ship_by", "warehouse"]
+            ].rename(columns={
+                "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
+                "po_block_flag": "Flag", "days_overdue": "Days Overdue", "ship_by": "Ship By",
+                "warehouse": "WH"})
+            _ov_render(d, "ov_overdue", date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True)
+
+    if po_df is not None:
+        recv = pd.to_numeric(po_df["received_units"], errors="coerce").fillna(0)
+        cur = pd.to_numeric(po_df["current_units"], errors="coerce").fillna(0)
+
+        # C) PO lines with receiving issues
+        iss = po_df[pd.to_numeric(po_df["total_issues"], errors="coerce").fillna(0) > 0].copy()
+        with st.expander(f"⚠️ PO lines with receiving issues ({len(iss):,})"):
+            if iss.empty:
+                st.caption("No open receiving issues.")
+            else:
+                d = iss.sort_values("total_issues", ascending=False)[
+                    ["po_number", "po_status", "vendor_name", "sku", "title",
+                     "ordered_units", "received_units", "total_issues"]
+                ].rename(columns={
+                    "po_number": "PO #", "po_status": "Status", "vendor_name": "Vendor", "sku": "SKU",
+                    "title": "Title", "ordered_units": "Ordered", "received_units": "Received",
+                    "total_issues": "Issues"})
+                d["PO #"] = _ov_po_str(d["PO #"])
+                _ov_render(d, "ov_issues", pin_cols=["PO #"], color_rows=True)
+
+        # D) Placed long ago, nothing received
+        aging = po_df[(recv <= 0) & (po_df["purchase_state"].astype(str).str.lower() != "arrived")].copy()
+        aging["_age"] = (pd.Timestamp(datetime.now().date())
+                         - pd.to_datetime(aging["order_placed_date"], errors="coerce")).dt.days
+        aging = aging[aging["_age"] >= OV_AGING_DAYS]
+        with st.expander(f"🐢 Placed {OV_AGING_DAYS}d+ ago, nothing received ({len(aging):,})"):
+            if aging.empty:
+                st.caption("None — inbound is keeping up.")
+            else:
+                d = aging.sort_values("_age", ascending=False)[
+                    ["po_number", "vendor_name", "sku", "title", "order_placed_date", "_age",
+                     "ordered_units", "purchase_state"]
+                ].rename(columns={
+                    "po_number": "PO #", "vendor_name": "Vendor", "sku": "SKU", "title": "Title",
+                    "order_placed_date": "Order Placed", "_age": "Days Since Placed",
+                    "ordered_units": "Ordered", "purchase_state": "State"})
+                d["PO #"] = _ov_po_str(d["PO #"])
+                _ov_render(d, "ov_aging", date_cols=["Order Placed"], pin_cols=["PO #"])
+
+        # E) Over-receipts (received > ordered)
+        over = po_df[(recv > cur) & (cur > 0)].copy()
+        with st.expander(f"📈 Over-receipts — received > ordered ({len(over):,})"):
+            if over.empty:
+                st.caption("No over-receipts.")
+            else:
+                d = over.sort_values("vendor_fill_rate_pct", ascending=False)[
+                    ["po_number", "vendor_name", "sku", "title", "current_units",
+                     "received_units", "vendor_fill_rate_pct"]
+                ].rename(columns={
+                    "po_number": "PO #", "vendor_name": "Vendor", "sku": "SKU", "title": "Title",
+                    "current_units": "Ordered", "received_units": "Received",
+                    "vendor_fill_rate_pct": "Vendor Fill %"})
+                d["PO #"] = _ov_po_str(d["PO #"])
+                _ov_render(d, "ov_over", numpct_cols=["Vendor Fill %"], pin_cols=["PO #"])
+    else:
+        st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -1435,11 +1568,14 @@ def main():
     kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
-    tab_storage, tab_po, tab_pod = st.tabs([
+    tab_overview, tab_storage, tab_po, tab_pod = st.tabs([
+        "📊 Overview",
         f"📦 Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
         f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
         "🧾 PO Details",
     ])
+    with tab_overview:
+        overview_tab(df, wos)
     with tab_storage:
         storage_tab(df, wos)
     with tab_po:
