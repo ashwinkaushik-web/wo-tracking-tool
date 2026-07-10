@@ -1538,6 +1538,140 @@ def overview_tab(df, wos):
 
 
 # ============================================================
+# SKU JOURNEY (Phase 3b) — one Master ID across POs + work orders
+# ============================================================
+def sku_journey_tab(df, wos):
+    try:
+        po_df, _po_pos, _ = fetch_po_data()
+        wh = st.session_state.get("global_wh", "Both")
+        if wh != "Both":
+            po_df = po_df[po_df["warehouse_name"] == wh].copy()
+    except Exception:
+        po_df = None
+
+    st.markdown("#### 🧭 SKU Journey — one product across POs and work orders")
+    st.caption("Bridged on **Master ID**. Search by Master ID, SKU or title, then pick the product.")
+
+    q = st.text_input("Search Master ID / SKU / title", key="skuj_q",
+                      placeholder="e.g. P0EAVTZV or 'Sorel Caribou'")
+    if not q or not q.strip():
+        st.info("Type a Master ID, SKU or title above to trace a product end to end.")
+        return
+
+    mids = set()
+    if po_df is not None:
+        mp = _str_contains_any(po_df, ["master_id", "sku", "asin", "title", "vendor_name"], q)
+        mids |= set(po_df.loc[mp, "master_id"].dropna().astype(str))
+    mw = _str_contains_any(df, ["master_id", "listing_id", "finished_good_name", "source_brand", "work_order_item_id"], q)
+    mids |= set(df.loc[mw, "master_id"].dropna().astype(str))
+    mids.discard("")
+    mids.discard("nan")
+    mids = sorted(mids)
+
+    if not mids:
+        st.warning("No product matched that search.")
+        return
+    if len(mids) > 300:
+        st.info(f"{len(mids):,} products match — narrow the search.")
+        return
+
+    labels = {m: m for m in mids}
+
+    def _fill_titles(frame, title_col):
+        if frame is None or frame.empty or title_col not in frame.columns:
+            return
+        sub = frame[frame["master_id"].astype(str).isin(mids)][["master_id", title_col]].dropna(subset=[title_col])
+        if sub.empty:
+            return
+        sub = sub.copy()
+        sub["master_id"] = sub["master_id"].astype(str)
+        sub = sub.drop_duplicates("master_id")
+        for m, t in zip(sub["master_id"], sub[title_col]):
+            if labels.get(m, m) == m and str(t).strip():
+                labels[m] = f"{m} — {t}"
+
+    _fill_titles(po_df, "title")
+    _fill_titles(df, "finished_good_name")
+
+    mid = st.selectbox("Product", mids, format_func=lambda m: labels.get(m, m), key="skuj_pick")
+    if mid:
+        _sku_journey_render(mid, df, po_df)
+
+
+def _sku_journey_render(mid, df, po_df):
+    wo_rows = df[df["master_id"].astype(str) == mid].copy()
+    po_rows = po_df[po_df["master_id"].astype(str) == mid].copy() if po_df is not None else None
+
+    title = brand = ""
+    if po_rows is not None and not po_rows.empty:
+        if po_rows["title"].notna().any():
+            title = str(po_rows["title"].dropna().iloc[0])
+        if po_rows["vendor_name"].notna().any():
+            brand = str(po_rows["vendor_name"].dropna().iloc[0])
+    if not title and not wo_rows.empty and wo_rows["finished_good_name"].notna().any():
+        title = str(wo_rows["finished_good_name"].dropna().iloc[0])
+    if not brand and not wo_rows.empty and wo_rows["source_brand"].notna().any():
+        brand = str(wo_rows["source_brand"].dropna().iloc[0])
+
+    st.markdown(f"### {title or mid}")
+    st.caption(f"Master ID **{mid}**" + (f" · {brand}" if brand else ""))
+
+    ordered = received = n_pos = 0
+    if po_rows is not None and not po_rows.empty:
+        ordered = int(pd.to_numeric(po_rows["ordered_units"], errors="coerce").fillna(0).sum())
+        received = int(pd.to_numeric(po_rows["received_units"], errors="coerce").fillna(0).sum())
+        n_pos = int(po_rows["po_number"].nunique())
+    n_woi = len(wo_rows)
+    wo_open = int((wo_rows["status_simple"] == "Open").sum()) if not wo_rows.empty else 0
+    wo_blocked = int(wo_rows["is_blocked_pfs"].fillna(False).sum()) if not wo_rows.empty else 0
+
+    m = st.columns(6)
+    m[0].metric("POs", f"{n_pos:,}")
+    m[1].metric("Units ordered", f"{ordered:,}")
+    m[2].metric("Units received", f"{received:,}")
+    m[3].metric("WO items", f"{n_woi:,}")
+    m[4].metric("WO open", f"{wo_open:,}")
+    m[5].metric("WO blocked", f"{wo_blocked:,}")
+
+    st.markdown("---")
+    st.markdown("#### 🧾 Purchase orders")
+    if po_rows is None:
+        st.caption("PO data unavailable (check queries/po_tracker.sql).")
+    elif po_rows.empty:
+        st.caption("No POs found for this Master ID.")
+    else:
+        d = po_rows.sort_values("order_placed_date", ascending=False)[
+            ["po_number", "po_status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
+             "order_placed_date", "ordered_units", "received_units", "demand_fill_rate_pct",
+             "vendor_fill_rate_pct", "total_issues"]
+        ].rename(columns={
+            "po_number": "PO #", "po_status": "Status", "vendor_name": "Vendor", "country_name": "Country",
+            "warehouse_name": "WH", "purchase_state": "State", "order_placed_date": "Order Placed",
+            "ordered_units": "Ordered", "received_units": "Received", "demand_fill_rate_pct": "Demand Fill %",
+            "vendor_fill_rate_pct": "Vendor Fill %", "total_issues": "Issues"})
+        d["PO #"] = _ov_po_str(d["PO #"])
+        _ov_render(d, f"skuj_po_{mid}", date_cols=["Order Placed"],
+                   numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"],
+                   color_rows=True, height=300)
+
+    st.markdown("#### 📦 Work orders")
+    if wo_rows.empty:
+        st.caption("No work orders found for this Master ID (WO data is year-to-date).")
+    else:
+        d = wo_rows.sort_values("ship_by")[
+            ["work_order_item_id", "work_order_number", "source_category", "source", "status_simple",
+             "po_block_flag", "processing_status", "original_request", "processed",
+             "woi_processing_pct", "ship_by", "warehouse"]
+        ].rename(columns={
+            "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_category": "Type",
+            "source": "Source", "status_simple": "Status", "po_block_flag": "Flag",
+            "processing_status": "Block Status", "original_request": "Orig", "processed": "Processed",
+            "woi_processing_pct": "%", "ship_by": "Ship By", "warehouse": "WH"})
+        render_table(d, key=_grid_key(f"skuj_wo_{mid}"), pct_cols=["%"], date_cols=["Ship By"],
+                     pin_cols=["WOI ID"], color_rows=True, height=320)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -1568,20 +1702,23 @@ def main():
     kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
-    tab_overview, tab_storage, tab_po, tab_pod = st.tabs([
+    tab_overview, tab_pod, tab_po, tab_storage, tab_sku = st.tabs([
         "📊 Overview",
-        f"📦 Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
-        f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
         "🧾 PO Details",
+        f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
+        f"📦 Manual/Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
+        "🧭 SKU Journey",
     ])
     with tab_overview:
         overview_tab(df, wos)
-    with tab_storage:
-        storage_tab(df, wos)
-    with tab_po:
-        po_tab(df, wos)
     with tab_pod:
         po_details_tab(df)
+    with tab_po:
+        po_tab(df, wos)
+    with tab_storage:
+        storage_tab(df, wos)
+    with tab_sku:
+        sku_journey_tab(df, wos)
 
 
 if __name__ == "__main__":
