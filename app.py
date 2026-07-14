@@ -1408,6 +1408,7 @@ def po_details_tab(wo_df):
 # OVERVIEW (Phase 3a) — exceptions-first landing
 # ============================================================
 OV_AGING_DAYS = 21  # PO placed but nothing received beyond this = at risk
+OV_MAX_ROWS = 100   # cap rows shown per exception panel (full count stays in the header)
 
 
 def _ov_po_str(s):
@@ -1430,23 +1431,38 @@ def overview_tab(df, wos):
     except Exception:
         po_df = po_pos = None
 
-    # ---- Pipeline stage counts ----
-    st.markdown("#### 🚚 Pipeline — where inventory sits")
-    c = st.columns(6)
+    def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False):
+        # Cap rendered rows for speed; the full total is already in the panel header.
+        _ov_render(dshow.head(OV_MAX_ROWS), key, date_cols=date_cols,
+                   numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows)
+        if len(dshow) > OV_MAX_ROWS:
+            st.caption(f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}.")
+
+    # ---- Inbound (POs) ----
+    st.markdown("#### 📥 Inbound — purchase orders (placed since 2025-07-01)")
     if po_pos is not None:
         state = po_pos["purchase_state"].astype(str).str.lower()
-        c[0].metric("POs placed", f"{int((state == 'placed').sum()):,}")
-        c[1].metric("POs receiving", f"{int((state == 'receiving').sum()):,}")
-        c[2].metric("POs arrived", f"{int((state == 'arrived').sum()):,}")
+        c = st.columns(4)
+        c[0].metric("Total POs", f"{len(po_pos):,}")
+        c[1].metric("Placed", f"{int((state == 'placed').sum()):,}")
+        c[2].metric("Receiving", f"{int((state == 'receiving').sum()):,}")
+        c[3].metric("Arrived", f"{int((state == 'arrived').sum()):,}")
     else:
-        c[0].metric("POs", "n/a")
-        c[1].caption("PO data unavailable")
-    c[3].metric("WO items open", f"{int((df['status_simple'] == 'Open').sum()):,}")
-    c[4].metric("WO items blocked", f"{int(df['is_blocked_pfs'].fillna(False).sum()):,}")
-    c[5].metric("WO items done", f"{int((df['status_simple'] == 'Closed').sum()):,}")
+        st.caption("PO data unavailable — check queries/po_tracker.sql.")
+
+    # ---- Warehouse (work orders) ----
+    st.markdown("#### 🏭 Warehouse — work-order items (year-to-date)")
+    overdue_open = int(((pd.to_numeric(df["days_overdue"], errors="coerce").fillna(0) > 0)
+                        & (df["status_simple"] == "Open")).sum())
+    c = st.columns(4)
+    c[0].metric("Open", f"{int((df['status_simple'] == 'Open').sum()):,}")
+    c[1].metric("Blocked", f"{int(df['is_blocked_pfs'].fillna(False).sum()):,}")
+    c[2].metric("Overdue (open)", f"{overdue_open:,}")
+    c[3].metric("Done", f"{int((df['status_simple'] == 'Closed').sum()):,}")
 
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
+    st.caption("Worst cases first. Header counts are the full totals; each table shows the top 100.")
 
     # A) Blocked WOIs (PFS)
     blocked = df[df["is_blocked_pfs"].fillna(False)].copy()
@@ -1461,7 +1477,7 @@ def overview_tab(df, wos):
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
                 "days_overdue": "Days Overdue"})
-            _ov_render(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
+            _panel(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
 
     # B) Overdue, still-open WOIs
     od = df[(pd.to_numeric(df["days_overdue"], errors="coerce").fillna(0) > 0)
@@ -1477,7 +1493,7 @@ def overview_tab(df, wos):
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "po_block_flag": "Flag", "days_overdue": "Days Overdue", "ship_by": "Ship By",
                 "warehouse": "WH"})
-            _ov_render(d, "ov_overdue", date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True)
+            _panel(d, "ov_overdue", date_cols=["Ship By"], pin_cols=["WOI ID"], color_rows=True)
 
     if po_df is not None:
         recv = pd.to_numeric(po_df["received_units"], errors="coerce").fillna(0)
@@ -1486,21 +1502,26 @@ def overview_tab(df, wos):
         # C) PO lines with receiving issues
         iss = po_df[pd.to_numeric(po_df["total_issues"], errors="coerce").fillna(0) > 0].copy()
         with st.expander(f"⚠️ PO lines with receiving issues ({len(iss):,})"):
+            st.caption('"Issues" = receiving problems logged against the line in the PO report '
+                       "(e.g. concealed damage, shortage) — a count, not units.")
             if iss.empty:
-                st.caption("No open receiving issues.")
+                st.caption("No receiving issues logged.")
             else:
                 d = iss.sort_values("total_issues", ascending=False)[
-                    ["po_number", "po_status", "vendor_name", "sku", "title",
-                     "ordered_units", "received_units", "total_issues"]
+                    ["po_number", "po_status", "vendor_name", "sku", "title", "ordered_units",
+                     "received_units", "demand_fill_rate_pct", "vendor_fill_rate_pct", "total_issues"]
                 ].rename(columns={
                     "po_number": "PO #", "po_status": "Status", "vendor_name": "Vendor", "sku": "SKU",
                     "title": "Title", "ordered_units": "Ordered", "received_units": "Received",
+                    "demand_fill_rate_pct": "Demand Fill %", "vendor_fill_rate_pct": "Vendor Fill %",
                     "total_issues": "Issues"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                _ov_render(d, "ov_issues", pin_cols=["PO #"], color_rows=True)
+                _panel(d, "ov_issues", numpct_cols=["Demand Fill %", "Vendor Fill %"],
+                       pin_cols=["PO #"], color_rows=True)
 
-        # D) Placed long ago, nothing received
-        aging = po_df[(recv <= 0) & (po_df["purchase_state"].astype(str).str.lower() != "arrived")].copy()
+        # D) Placed long ago, nothing received (active POs only)
+        active = po_df["purchase_state"].astype(str).str.lower().isin(["placed", "receiving"])
+        aging = po_df[(recv <= 0) & active].copy()
         aging["_age"] = (pd.Timestamp(datetime.now().date())
                          - pd.to_datetime(aging["order_placed_date"], errors="coerce")).dt.days
         aging = aging[aging["_age"] >= OV_AGING_DAYS]
@@ -1510,13 +1531,15 @@ def overview_tab(df, wos):
             else:
                 d = aging.sort_values("_age", ascending=False)[
                     ["po_number", "vendor_name", "sku", "title", "order_placed_date", "_age",
-                     "ordered_units", "purchase_state"]
+                     "ordered_units", "demand_fill_rate_pct", "purchase_state"]
                 ].rename(columns={
                     "po_number": "PO #", "vendor_name": "Vendor", "sku": "SKU", "title": "Title",
                     "order_placed_date": "Order Placed", "_age": "Days Since Placed",
-                    "ordered_units": "Ordered", "purchase_state": "State"})
+                    "ordered_units": "Ordered", "demand_fill_rate_pct": "Demand Fill %",
+                    "purchase_state": "State"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                _ov_render(d, "ov_aging", date_cols=["Order Placed"], pin_cols=["PO #"])
+                _panel(d, "ov_aging", date_cols=["Order Placed"],
+                       numpct_cols=["Demand Fill %"], pin_cols=["PO #"])
 
         # E) Over-receipts (received > ordered)
         over = po_df[(recv > cur) & (cur > 0)].copy()
@@ -1525,14 +1548,14 @@ def overview_tab(df, wos):
                 st.caption("No over-receipts.")
             else:
                 d = over.sort_values("vendor_fill_rate_pct", ascending=False)[
-                    ["po_number", "vendor_name", "sku", "title", "current_units",
-                     "received_units", "vendor_fill_rate_pct"]
+                    ["po_number", "vendor_name", "sku", "title", "current_units", "received_units",
+                     "demand_fill_rate_pct", "vendor_fill_rate_pct"]
                 ].rename(columns={
                     "po_number": "PO #", "vendor_name": "Vendor", "sku": "SKU", "title": "Title",
                     "current_units": "Ordered", "received_units": "Received",
-                    "vendor_fill_rate_pct": "Vendor Fill %"})
+                    "demand_fill_rate_pct": "Demand Fill %", "vendor_fill_rate_pct": "Vendor Fill %"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                _ov_render(d, "ov_over", numpct_cols=["Vendor Fill %"], pin_cols=["PO #"])
+                _panel(d, "ov_over", numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"])
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
@@ -1702,23 +1725,35 @@ def main():
     kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
-    tab_overview, tab_pod, tab_po, tab_storage, tab_sku = st.tabs([
-        "📊 Overview",
-        "🧾 PO Details",
-        f"🚚 PO WOs ({len(wos[wos['source_category']=='PO'])})",
-        f"📦 Manual/Storage WOs ({len(wos[wos['source_category']=='Storage'])})",
-        "🧭 SKU Journey",
-    ])
-    with tab_overview:
+    # Single-page nav (only the selected view runs — st.tabs renders every tab body
+    # on each rerun, which blew past Streamlit Cloud's memory). POs are one section
+    # with a PO Details / PO WOs sub-toggle; SKU Journey sits up front as a lookup.
+    n_po = len(wos[wos["source_category"] == "PO"])
+    n_storage = len(wos[wos["source_category"] == "Storage"])
+    nav_overview = "📊 Overview"
+    nav_sku = "🧭 SKU Journey"
+    nav_pos = "🚚 POs"
+    nav_storage = f"📦 Manual/Storage WOs ({n_storage})"
+    choice = st.radio(
+        "View", [nav_overview, nav_sku, nav_pos, nav_storage],
+        horizontal=True, label_visibility="collapsed", key="main_nav",
+    )
+    st.markdown("---")
+    if choice == nav_overview:
         overview_tab(df, wos)
-    with tab_pod:
-        po_details_tab(df)
-    with tab_po:
-        po_tab(df, wos)
-    with tab_storage:
-        storage_tab(df, wos)
-    with tab_sku:
+    elif choice == nav_sku:
         sku_journey_tab(df, wos)
+    elif choice == nav_pos:
+        sub_pod = "🧾 PO Details"
+        sub_pwo = f"🚚 PO WOs ({n_po})"
+        sub = st.radio("PO view", [sub_pod, sub_pwo], horizontal=True,
+                       label_visibility="collapsed", key="po_subnav")
+        if sub == sub_pod:
+            po_details_tab(df)
+        else:
+            po_tab(df, wos)
+    elif choice == nav_storage:
+        storage_tab(df, wos)
 
 
 if __name__ == "__main__":
