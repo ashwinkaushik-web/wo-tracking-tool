@@ -12,6 +12,7 @@ and a multi-term Search. Plus a Columns picker, CSV + Excel export, a
 """
 
 import io
+import json
 import re
 import html as _html
 import streamlit as st
@@ -47,6 +48,7 @@ st.markdown("""
 
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 PO_QUERY_PATH = Path(__file__).parent / "queries" / "po_tracker.sql"
+PO_WO_AGG_PATH = Path(__file__).parent / "queries" / "po_wo_agg.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
 FLAG_ORDER = [
@@ -789,15 +791,13 @@ def storage_tab(df, wos):
         storage_wo_drilldown(sel, s_items, s_wos)
         return
 
-    storage_kpi_strip(s_items, s_wos)
-    st.markdown("---")
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="storage_view", label_visibility="collapsed")
-    st.caption("Blocked detection: **PFS table** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy")
+    st.caption("Blocked detection: **PFS table** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy · cards react to the filters")
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
     else:
-        storage_item_view(s_items)
+        storage_item_view(s_items, s_wos)
 
 
 def storage_wo_view(s_wos, s_items):
@@ -807,6 +807,8 @@ def storage_wo_view(s_wos, s_items):
         search_cols=["work_order_number", "top_brand", "top_block_reason"],
     )
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
+    fitems = s_items[s_items["work_order_number"].isin(filtered["work_order_number"])]
+    storage_kpi_strip(fitems, filtered)
     display = filtered[
         ["work_order_number", "earliest_ship", "warehouse", "top_brand", "items", "open_items",
          "pfs_blocks", "top_block_reason", "orig", "processed", "pct", "max_age"]
@@ -887,13 +889,15 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     )
 
 
-def storage_item_view(s_items):
+def storage_item_view(s_items, s_wos):
     filtered = filter_panel(
         s_items, "fp_sit", brand_col="source_brand", ship_col="ship_by",
         reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
     )
     filtered = hide_unlisted(filtered, "hl_sit")
+    fwos = s_wos[s_wos["work_order_number"].isin(filtered["work_order_number"])]
+    storage_kpi_strip(filtered, fwos)
     display = filtered[
         ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
          "master_id", "listing_id", "finished_good_name", "source_brand",
@@ -936,15 +940,13 @@ def po_tab(df, wos):
         po_wo_drilldown(sel, p_items, p_wos)
         return
 
-    po_kpi_strip(p_items, p_wos)
-    st.markdown("---")
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="po_view", label_visibility="collapsed")
-    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy")
+    st.caption("Block flag: **14/21 days past later of WO/PO ship-by** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy · cards react to the filters")
     if view == "📋 WO Level":
         po_wo_view(p_wos, p_items)
     else:
-        po_item_view(p_items)
+        po_item_view(p_items, p_wos)
 
 
 def po_wo_view(p_wos, p_items):
@@ -953,6 +955,8 @@ def po_wo_view(p_wos, p_items):
         ship_label="Ref ship-by", flag_col="worst_po_flag", status_kind="wo",
         search_cols=["work_order_number", "po_number_raw", "top_brand"],
     )
+    fitems = p_items[p_items["work_order_number"].isin(filtered["work_order_number"])]
+    po_kpi_strip(fitems, filtered)
     display = filtered[
         ["work_order_number", "po_number_raw", "earliest_ref_ship", "warehouse", "top_brand", "items", "open_items",
          "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age"]
@@ -1042,7 +1046,7 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     )
 
 
-def po_item_view(p_items):
+def po_item_view(p_items, p_wos):
     filtered = filter_panel(
         p_items, "fp_pit", brand_col="source_brand", ship_col="po_ref_ship_by_date",
         ship_label="Ref ship-by", flag_col="po_block_flag", status_kind="item",
@@ -1050,6 +1054,8 @@ def po_item_view(p_items):
     )
     filtered = hide_unlisted(filtered, "hl_pit")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
+    fwos = p_wos[p_wos["work_order_number"].isin(filtered["work_order_number"])]
+    po_kpi_strip(filtered, fwos)
     display = filtered[
         ["work_order_item_id", "work_order_number", "po_number_raw",
          "po_ref_ship_by_date", "po_requested_delivery_date",
@@ -1125,6 +1131,24 @@ def fetch_po_data():
     df["po_status"] = _po_item_status(df)
     pos = _build_po_aggregates(df)
     return df, pos, datetime.now()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_po_wo_agg():
+    """Per-PO rollup of the work orders linked to each PO (queries/po_wo_agg.sql)."""
+    sql = PO_WO_AGG_PATH.read_text()
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        agg = pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+    for c in agg.columns:
+        agg[c] = pd.to_numeric(agg[c], errors="coerce")
+    return agg
 
 
 def _po_item_status(df):
@@ -1246,20 +1270,22 @@ def _po_item_display(df, include_po=True):
     return disp, default
 
 
-def po_details_kpi(po_df, po_pos):
-    ordered = pd.to_numeric(po_df.get("ordered_units"), errors="coerce").fillna(0).sum()
-    received = pd.to_numeric(po_df.get("received_units"), errors="coerce").fillna(0).sum()
-    issues = int((pd.to_numeric(po_df.get("total_issues"), errors="coerce").fillna(0) > 0).sum())
+def po_details_kpi(lines):
+    """PO summary cards computed from the (filtered) PO line-item frame."""
+    ordered = pd.to_numeric(lines.get("ordered_units"), errors="coerce").fillna(0).sum()
+    received = pd.to_numeric(lines.get("received_units"), errors="coerce").fillna(0).sum()
+    issues = int((pd.to_numeric(lines.get("total_issues"), errors="coerce").fillna(0) > 0).sum())
     fill = (received * 100.0 / ordered) if ordered else 0
+    n_pos = lines["po_number"].nunique() if "po_number" in lines.columns else 0
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("POs", f"{len(po_pos):,}")
-    c2.metric("Line items", f"{len(po_df):,}")
+    c1.metric("POs", f"{n_pos:,}")
+    c2.metric("Line items", f"{len(lines):,}")
     c3.metric("Units ordered", f"{int(ordered):,}")
     c4.metric("Vendor fill", f"{fill:.0f}%")
     c5.metric("Lines w/ issues", f"{issues:,}")
 
 
-def po_details_list(po_pos):
+def po_details_list(po_pos, po_df):
     filtered = po_filter_panel(
         po_pos, "fp_pod", date_col="order_placed", status_col="status",
         search_cols=["po_number", "vendor_name", "country_name", "warehouse_name"],
@@ -1267,16 +1293,25 @@ def po_details_list(po_pos):
     sev = {s: i for i, s in enumerate(PO_STATUS_ORDER)}
     filtered = (filtered.assign(_sev=filtered["status"].map(sev).fillna(len(PO_STATUS_ORDER)))
                 .sort_values(["_sev", "po_number"]).drop(columns="_sev"))
-    display = filtered[
-        ["po_number", "status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
-         "order_placed", "last_received", "lines", "original_ordered", "ordered", "received", "left",
-         "on_order", "demand_fill_pct", "vendor_fill_pct"]
-    ].rename(columns={
+    lines = po_df[po_df["po_number"].isin(filtered["po_number"])] if po_df is not None else po_df
+    po_details_kpi(lines)
+    if "wo_count" in filtered.columns:
+        nwith = int((filtered["wo_count"] > 0).sum())
+        st.caption(f"🔗 {nwith:,} of {len(filtered):,} POs have matching work orders "
+                   f"({nwith * 100 // max(len(filtered), 1)}%). WO-side quantities are in the table below.")
+    base_cols = ["po_number", "status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
+                 "order_placed", "last_received", "lines", "original_ordered", "ordered", "received",
+                 "left", "on_order", "demand_fill_pct", "vendor_fill_pct"]
+    wo_cols = [c for c in ["wo_count", "wo_current", "wo_processed", "wo_ship_created", "wo_shipped", "wo_stowed"]
+               if c in filtered.columns]
+    display = filtered[base_cols + wo_cols].rename(columns={
         "po_number": "PO #", "status": "Status", "vendor_name": "Vendor", "country_name": "Country",
         "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
         "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
+        "wo_count": "WOs", "wo_current": "WO Current", "wo_processed": "WO Processed",
+        "wo_ship_created": "WO Ship Created", "wo_shipped": "WO Shipped", "wo_stowed": "WO Stowed",
     })
     display["PO #"] = pd.to_numeric(display["PO #"], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
     cols = column_picker(list(display.columns), key="cols_pod", required=["PO #"])
@@ -1302,6 +1337,7 @@ def po_details_items(po_df):
         po_df, "fp_podi", date_col="order_placed_date", status_col="po_status",
         search_cols=["po_number", "sku", "asin", "master_id", "title", "vendor_name"],
     )
+    po_details_kpi(filtered)
     disp, default = _po_item_display(filtered, include_po=True)
     cols = column_picker(list(disp.columns), key="cols_podi", default_labels=default, required=["PO #"])
     disp = disp[cols]
@@ -1359,19 +1395,33 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     if awo.empty:
         st.caption("No work orders linked to this PO in the current WO dataset (year-to-date).")
     else:
-        awo_disp = awo[["work_order_number", "work_order_item_id", "listing_id", "status_simple",
-                        "po_block_flag", "original_request", "processed", "woi_processing_pct",
-                        "ship_by"]].rename(columns={
-            "work_order_number": "WO", "work_order_item_id": "WOI ID", "listing_id": "Listing",
-            "status_simple": "Status", "po_block_flag": "Flag", "original_request": "Orig",
-            "processed": "Processed", "woi_processing_pct": "%", "ship_by": "Ship By",
-        })
+        awo_pairs = [
+            ("work_order_item_id", "WOI ID"), ("work_order_number", "WO"),
+            ("master_id", "Master ID"), ("listing_id", "Listing"),
+            ("finished_good_name", "Item Name"), ("source_brand", "Brand"), ("warehouse", "WH"),
+            ("status_simple", "Status"), ("po_block_flag", "Flag"),
+            ("processing_status", "Block Status"), ("block_reason_pfs", "Reason"),
+            ("original_request", "Orig"), ("current_request", "Current"), ("processed", "Processed"),
+            ("order_created", "Ship Created"), ("shipped", "Shipped"), ("storage", "Stowed"),
+            ("woi_processing_pct", "%"), ("po_ref_ship_by_date", "Ref Ship-by"),
+            ("po_days_past_ref_ship_by", "Days Past"), ("days_overdue", "Days Overdue"),
+            ("created_at", "Created At"),
+        ]
+        pairs = [(r, l) for r, l in awo_pairs if r in awo.columns]
+        awo_disp = awo[[r for r, _ in pairs]].rename(columns=dict(pairs))
+        awo_default = [l for l in ["WOI ID", "WO", "Master ID", "Listing", "Item Name", "Brand",
+                                   "WH", "Status", "Flag", "Block Status", "Reason", "Orig",
+                                   "Current", "Processed", "%", "Ref Ship-by", "Days Past",
+                                   "Days Overdue"] if l in awo_disp.columns]
+        acols = column_picker(list(awo_disp.columns), key=f"cols_pod_awo_{po}",
+                              default_labels=awo_default, required=["WOI ID"])
+        awo_disp = awo_disp[acols]
         table_toolbar(awo_disp, key=f"tb_pod_awo_{po}", file_stem=f"po_{po}_workorders",
-                      id_cols=["WO", "WOI ID", "Listing"], count_label=f"{len(awo_disp)} WO item(s)")
+                      id_cols=["WO", "WOI ID", "Listing", "Master ID"], count_label=f"{len(awo_disp)} WO item(s)")
         render_table(
             awo_disp, key=_grid_key(f"grid_pod_awo_{po}"),
-            pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"],
-            color_rows=True, height=300,
+            pct_cols=["%"], date_cols=["Ref Ship-by"], datetime_cols=["Created At"],
+            pin_cols=["WOI ID"], color_rows=True, height=340,
         )
 
 
@@ -1389,19 +1439,28 @@ def po_details_tab(wo_df):
         po_df = po_df[po_df["warehouse_name"] == wh].copy()
         po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
 
+    # Enrich the PO rollup with WO-side quantities (best effort).
+    try:
+        wo_agg = fetch_po_wo_agg()
+        po_pos = po_pos.merge(wo_agg, on="po_number", how="left")
+        for cc in ["wo_count", "woi_count", "wo_current", "wo_processed",
+                   "wo_ship_created", "wo_shipped", "wo_stowed"]:
+            if cc in po_pos.columns:
+                po_pos[cc] = pd.to_numeric(po_pos[cc], errors="coerce").fillna(0).astype(int)
+    except Exception:
+        pass
+
     sel = st.session_state.get("selected_po_detail")
     if sel is not None and sel in po_pos["po_number"].values:
         po_details_drilldown(sel, po_df, po_pos, wo_df)
         return
 
-    po_details_kpi(po_df, po_pos)
-    st.markdown("---")
     view = st.radio("View", ["📋 PO Level", "📄 Item Level"], horizontal=True,
                     key="po_details_view", label_visibility="collapsed")
     st.caption("Inbound POs (UK/EU) · fill rates are uncapped (>100% = over-receipts) · "
-               "💡 tick a PO then Open PO · drag-select + Ctrl+C to copy")
+               "💡 tick a PO then Open PO · drag-select + Ctrl+C to copy · cards react to the filters")
     if view == "📋 PO Level":
-        po_details_list(po_pos)
+        po_details_list(po_pos, po_df)
     else:
         po_details_items(po_df)
 
@@ -1417,12 +1476,27 @@ def _ov_po_str(s):
     return pd.to_numeric(s, errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
 
 
+def _issue_types(val):
+    """Turn the report's Issue Counts JSON (e.g. {"Concealed Damage": 3}) into 'Type (n)' text."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    try:
+        d = val if isinstance(val, dict) else json.loads(str(val))
+    except Exception:
+        return str(val)
+    if not isinstance(d, dict) or not d:
+        return ""
+    return ", ".join(f"{k} ({v})" for k, v in d.items())
+
+
 def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260):
     render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
                  pin_cols=pin_cols, color_rows=color_rows, height=height)
 
 
 def overview_tab(df, wos):
+    kpi_strip(df, wos, st.session_state.get("global_wh", "Both"))
+    st.markdown("---")
     po_df = po_pos = None
     try:
         po_df, po_pos, _ = fetch_po_data()
@@ -1583,19 +1657,21 @@ def overview_tab(df, wos):
         # C) PO lines with receiving issues
         iss = po_df[pd.to_numeric(po_df["total_issues"], errors="coerce").fillna(0) > 0].copy()
         with st.expander(f"⚠️ PO lines with receiving issues ({len(iss):,})"):
-            st.caption('"Issues" = receiving problems logged against the line in the PO report '
-                       "(e.g. concealed damage, shortage) — a count, not units.")
+            st.caption('"Issue Type" = the problem(s) logged in the PO report (e.g. Concealed Damage); '
+                       '"Issues" = the count from that log.')
             if iss.empty:
                 st.caption("No receiving issues logged.")
             else:
+                iss["_itype"] = iss["issue_counts"].apply(_issue_types)
                 d = iss.sort_values("total_issues", ascending=False)[
                     ["po_number", "po_status", "vendor_name", "sku", "title", "ordered_units",
-                     "received_units", "demand_fill_rate_pct", "vendor_fill_rate_pct", "total_issues"]
+                     "received_units", "demand_fill_rate_pct", "vendor_fill_rate_pct",
+                     "total_issues", "_itype"]
                 ].rename(columns={
                     "po_number": "PO #", "po_status": "Status", "vendor_name": "Vendor", "sku": "SKU",
                     "title": "Title", "ordered_units": "Ordered", "received_units": "Received",
                     "demand_fill_rate_pct": "Demand Fill %", "vendor_fill_rate_pct": "Vendor Fill %",
-                    "total_issues": "Issues"})
+                    "total_issues": "Issues", "_itype": "Issue Type"})
                 d["PO #"] = _ov_po_str(d["PO #"])
                 _panel(d, "ov_issues", numpct_cols=["Demand Fill %", "Vendor Fill %"],
                        pin_cols=["PO #"], color_rows=True)
@@ -1803,7 +1879,6 @@ def main():
         wos = wos[wos["warehouse"] == warehouse].copy()
 
     sidebar(last_refresh)
-    kpi_strip(df, wos, warehouse)
     st.markdown("---")
 
     # Single-page nav (only the selected view runs — st.tabs renders every tab body
