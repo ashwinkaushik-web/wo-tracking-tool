@@ -7,3 +7,4 @@ numpy>=1.26,<2.3
 pyarrow>=16,<20
 cryptography>=42
 openpyxl>=3.1
+plotly>=5,<6
