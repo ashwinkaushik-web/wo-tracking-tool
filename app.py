@@ -18,6 +18,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
+import plotly.express as px
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -1467,44 +1468,78 @@ def overview_tab(df, wos):
     c[3].metric("Open", f"{open_woi:,}")
     c[4].metric("Blocked", f"{blocked_woi:,}")
 
-    # ================= Charts =================
+    # ================= Charts (Plotly) =================
     st.markdown("---")
     st.markdown("#### 📊 At a glance")
+
+    def _fig(fig, title, show_legend=False):
+        fig.update_layout(
+            title=dict(text=title, font=dict(size=15)),
+            margin=dict(l=8, r=8, t=44, b=8), height=300,
+            showlegend=show_legend, legend_title_text="",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        fig.update_xaxes(showgrid=False)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+        return fig
+
     r1 = st.columns(3)
     with r1[0]:
-        st.caption("POs by state")
         if po_pos is not None and not po_pos.empty:
-            st.bar_chart(po_pos["purchase_state"].astype(str).str.lower().value_counts(), height=220)
+            s = po_pos["purchase_state"].astype(str).str.lower().value_counts()
+            fig = px.bar(x=s.index, y=s.values, color=s.index, text=s.values,
+                         color_discrete_sequence=px.colors.qualitative.Set2)
+            fig.update_traces(textposition="outside")
+            fig.update_layout(xaxis_title=None, yaxis_title="POs")
+            st.plotly_chart(_fig(fig, "POs by state"), use_container_width=True)
         else:
-            st.caption("—")
+            st.caption("PO data unavailable.")
     with r1[1]:
-        st.caption("PO lines by channel (from note / SKU)")
         if po_df is not None and not po_df.empty:
             blob = (po_df["note"].fillna("").astype(str) + " " + po_df["sku"].fillna("").astype(str)).str.upper()
             chan = pd.Series(np.where(blob.str.contains("FBM"), "FBM",
-                             np.where(blob.str.contains("FBA"), "FBA", "Other / untagged")))
-            st.bar_chart(chan.value_counts(), height=220)
+                             np.where(blob.str.contains("FBA"), "FBA", "Other / untagged"))).value_counts()
+            fig = px.bar(x=chan.index, y=chan.values, color=chan.index, text=chan.values,
+                         color_discrete_map={"FBA": "#1f77b4", "FBM": "#ff7f0e", "Other / untagged": "#9aa0a6"})
+            fig.update_traces(textposition="outside")
+            fig.update_layout(xaxis_title=None, yaxis_title="PO lines")
+            st.plotly_chart(_fig(fig, "PO lines by channel (note / SKU)"), use_container_width=True)
         else:
-            st.caption("—")
+            st.caption("PO data unavailable.")
     with r1[2]:
-        st.caption("WO items by type & status")
         by = df.assign(_done=(df["status_simple"] == "Closed")).groupby("source_category").agg(
             Open=("status_simple", lambda s: (s == "Open").sum()),
-            Done=("_done", "sum")).sort_values("Open", ascending=False)
-        st.bar_chart(by, height=220)
+            Done=("_done", "sum")).reset_index()
+        m = by.melt(id_vars="source_category", value_vars=["Open", "Done"],
+                    var_name="Status", value_name="Items")
+        fig = px.bar(m, x="source_category", y="Items", color="Status", barmode="group", text="Items",
+                     color_discrete_map={"Open": "#f4a259", "Done": "#4c9f70"})
+        fig.update_traces(textposition="outside")
+        fig.update_layout(xaxis_title=None)
+        st.plotly_chart(_fig(fig, "WO items by type & status", show_legend=True), use_container_width=True)
 
     r2 = st.columns(2)
     with r2[0]:
-        st.caption("Blocked WO items by reason")
-        br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts()
-        st.bar_chart(br, height=220) if not br.empty else st.caption("None blocked.")
+        br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts().sort_values()
+        if not br.empty:
+            fig = px.bar(x=br.values, y=br.index, orientation="h", text=br.values,
+                         color_discrete_sequence=["#d1495b"])
+            fig.update_traces(textposition="outside")
+            fig.update_layout(xaxis_title="Blocked items", yaxis_title=None)
+            st.plotly_chart(_fig(fig, "Blocked WO items by reason"), use_container_width=True)
+        else:
+            st.caption("None blocked.")
     with r2[1]:
-        st.caption("POs placed by month")
         if po_pos is not None and not po_pos.empty:
             placed = pd.to_datetime(po_pos["order_placed"], errors="coerce").dropna()
-            st.bar_chart(placed.dt.to_period("M").astype(str).value_counts().sort_index(), height=220)
+            mo = placed.dt.to_period("M").astype(str).value_counts().sort_index()
+            fig = px.line(x=mo.index, y=mo.values, markers=True)
+            fig.update_traces(line_color="#3b7dd8", text=mo.values,
+                              textposition="top center", mode="lines+markers+text")
+            fig.update_layout(xaxis_title=None, yaxis_title="POs placed")
+            st.plotly_chart(_fig(fig, "POs placed by month"), use_container_width=True)
         else:
-            st.caption("—")
+            st.caption("PO data unavailable.")
 
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
