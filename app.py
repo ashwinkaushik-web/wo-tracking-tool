@@ -1269,13 +1269,13 @@ def po_details_list(po_pos):
     display = filtered[
         ["po_number", "status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
          "order_placed", "last_received", "lines", "original_ordered", "ordered", "received", "left",
-         "on_order", "demand_fill_pct", "vendor_fill_pct", "issues"]
+         "on_order", "demand_fill_pct", "vendor_fill_pct"]
     ].rename(columns={
         "po_number": "PO #", "status": "Status", "vendor_name": "Vendor", "country_name": "Country",
         "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
-        "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %", "issues": "Issues",
+        "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
     })
     display["PO #"] = pd.to_numeric(display["PO #"], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
     cols = column_picker(list(display.columns), key="cols_pod", required=["PO #"])
@@ -1358,14 +1358,15 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     if awo.empty:
         st.caption("No work orders linked to this PO in the current WO dataset (year-to-date).")
     else:
-        awo_disp = awo[["work_order_number", "work_order_item_id", "status_simple", "po_block_flag",
-                        "original_request", "processed", "woi_processing_pct", "ship_by"]].rename(columns={
-            "work_order_number": "WO", "work_order_item_id": "WOI ID", "status_simple": "Status",
-            "po_block_flag": "Flag", "original_request": "Orig", "processed": "Processed",
-            "woi_processing_pct": "%", "ship_by": "Ship By",
+        awo_disp = awo[["work_order_number", "work_order_item_id", "listing_id", "status_simple",
+                        "po_block_flag", "original_request", "processed", "woi_processing_pct",
+                        "ship_by"]].rename(columns={
+            "work_order_number": "WO", "work_order_item_id": "WOI ID", "listing_id": "Listing",
+            "status_simple": "Status", "po_block_flag": "Flag", "original_request": "Orig",
+            "processed": "Processed", "woi_processing_pct": "%", "ship_by": "Ship By",
         })
         table_toolbar(awo_disp, key=f"tb_pod_awo_{po}", file_stem=f"po_{po}_workorders",
-                      id_cols=["WO", "WOI ID"], count_label=f"{len(awo_disp)} WO item(s)")
+                      id_cols=["WO", "WOI ID", "Listing"], count_label=f"{len(awo_disp)} WO item(s)")
         render_table(
             awo_disp, key=_grid_key(f"grid_pod_awo_{po}"),
             pct_cols=["%"], date_cols=["Ship By"], pin_cols=["WOI ID"],
@@ -1438,27 +1439,72 @@ def overview_tab(df, wos):
         if len(dshow) > OV_MAX_ROWS:
             st.caption(f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}.")
 
-    # ---- Inbound (POs) ----
-    st.markdown("#### 📥 Inbound — purchase orders (placed since 2025-07-01)")
-    if po_pos is not None:
-        state = po_pos["purchase_state"].astype(str).str.lower()
-        c = st.columns(4)
+    # ================= Purchase orders (tiles) =================
+    st.markdown("#### 📥 Purchase orders (placed since 2025-07-01)")
+    if po_df is not None:
+        po_ordered = int(pd.to_numeric(po_df["ordered_units"], errors="coerce").fillna(0).sum())
+        po_received = int(pd.to_numeric(po_df["received_units"], errors="coerce").fillna(0).sum())
+        po_fill = (po_received * 100.0 / po_ordered) if po_ordered else 0
+        po_iss = int((pd.to_numeric(po_df["total_issues"], errors="coerce").fillna(0) > 0).sum())
+        c = st.columns(5)
         c[0].metric("Total POs", f"{len(po_pos):,}")
-        c[1].metric("Placed", f"{int((state == 'placed').sum()):,}")
-        c[2].metric("Receiving", f"{int((state == 'receiving').sum()):,}")
-        c[3].metric("Arrived", f"{int((state == 'arrived').sum()):,}")
+        c[1].metric("Units ordered", f"{po_ordered:,}")
+        c[2].metric("Units received", f"{po_received:,}")
+        c[3].metric("Vendor fill", f"{po_fill:.0f}%")
+        c[4].metric("Lines w/ issues", f"{po_iss:,}")
     else:
         st.caption("PO data unavailable — check queries/po_tracker.sql.")
 
-    # ---- Warehouse (work orders) ----
-    st.markdown("#### 🏭 Warehouse — work-order items (year-to-date)")
-    overdue_open = int(((pd.to_numeric(df["days_overdue"], errors="coerce").fillna(0) > 0)
-                        & (df["status_simple"] == "Open")).sum())
-    c = st.columns(4)
-    c[0].metric("Open", f"{int((df['status_simple'] == 'Open').sum()):,}")
-    c[1].metric("Blocked", f"{int(df['is_blocked_pfs'].fillna(False).sum()):,}")
-    c[2].metric("Overdue (open)", f"{overdue_open:,}")
-    c[3].metric("Done", f"{int((df['status_simple'] == 'Closed').sum()):,}")
+    # ================= Work orders (tiles) =================
+    st.markdown("#### 🏭 Work orders (year-to-date)")
+    cat = df["source_category"].astype(str)
+    open_woi = int((df["status_simple"] == "Open").sum())
+    blocked_woi = int(df["is_blocked_pfs"].fillna(False).sum())
+    c = st.columns(5)
+    c[0].metric("WO items", f"{len(df):,}")
+    c[1].metric("PO WOs", f"{int((cat == 'PO').sum()):,}")
+    c[2].metric("Manual/Storage WOs", f"{int((cat == 'Storage').sum()):,}")
+    c[3].metric("Open", f"{open_woi:,}")
+    c[4].metric("Blocked", f"{blocked_woi:,}")
+
+    # ================= Charts =================
+    st.markdown("---")
+    st.markdown("#### 📊 At a glance")
+    r1 = st.columns(3)
+    with r1[0]:
+        st.caption("POs by state")
+        if po_pos is not None and not po_pos.empty:
+            st.bar_chart(po_pos["purchase_state"].astype(str).str.lower().value_counts(), height=220)
+        else:
+            st.caption("—")
+    with r1[1]:
+        st.caption("PO lines by channel (from note / SKU)")
+        if po_df is not None and not po_df.empty:
+            blob = (po_df["note"].fillna("").astype(str) + " " + po_df["sku"].fillna("").astype(str)).str.upper()
+            chan = pd.Series(np.where(blob.str.contains("FBM"), "FBM",
+                             np.where(blob.str.contains("FBA"), "FBA", "Other / untagged")))
+            st.bar_chart(chan.value_counts(), height=220)
+        else:
+            st.caption("—")
+    with r1[2]:
+        st.caption("WO items by type & status")
+        by = df.assign(_done=(df["status_simple"] == "Closed")).groupby("source_category").agg(
+            Open=("status_simple", lambda s: (s == "Open").sum()),
+            Done=("_done", "sum")).sort_values("Open", ascending=False)
+        st.bar_chart(by, height=220)
+
+    r2 = st.columns(2)
+    with r2[0]:
+        st.caption("Blocked WO items by reason")
+        br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts()
+        st.bar_chart(br, height=220) if not br.empty else st.caption("None blocked.")
+    with r2[1]:
+        st.caption("POs placed by month")
+        if po_pos is not None and not po_pos.empty:
+            placed = pd.to_datetime(po_pos["order_placed"], errors="coerce").dropna()
+            st.bar_chart(placed.dt.to_period("M").astype(str).value_counts().sort_index(), height=220)
+        else:
+            st.caption("—")
 
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
