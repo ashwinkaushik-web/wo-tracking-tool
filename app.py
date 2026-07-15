@@ -705,7 +705,7 @@ def kpi_strip(df, wos, warehouse_label):
         date_range = "—"
     st.caption(f"📅 **Coverage**: {date_range} · **{unique_pos:,} unique POs** · Warehouse: **{warehouse_label}**")
 
-    st.markdown("##### 📊 Overall Totals (Storage + PO + IR)")
+    st.markdown("#### 📊 Overall Totals (Storage + PO + IR)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Work Orders", f"{len(wos):,}", f"{len(storage_wos)} S · {len(po_wos)} PO · {len(ir_wos)} IR")
     c2.metric("WO Items", f"{len(df):,}", f"{len(storage_items):,} S · {len(po_items):,} PO")
@@ -725,7 +725,7 @@ def storage_kpi_strip(s_items, s_wos):
     total_blocked = len(blocked_items)
     pickable = open_items - total_blocked
 
-    st.markdown("##### 📦 Storage Volume")
+    st.markdown("#### 📦 Storage Volume")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Storage WOs", f"{len(s_wos):,}")
     c2.metric("Storage Items", f"{len(s_items):,}", f"{open_items:,} Open · {closed_items:,} Closed")
@@ -733,7 +733,7 @@ def storage_kpi_strip(s_items, s_wos):
     c4.metric("Current Qty", f"{total_current:,}")
     c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
-    st.markdown(f"##### 🚫 Storage Block Reasons (PFS) — {total_blocked:,} blocked · {pickable:,} pickable")
+    st.markdown(f"#### 🚫 Storage Block Reasons (PFS) — {total_blocked:,} blocked · {pickable:,} pickable")
     reason_counts = blocked_items["block_reason_pfs"].dropna().value_counts()
     top4 = list(reason_counts.head(4).items())
     while len(top4) < 4:
@@ -762,7 +762,7 @@ def po_kpi_strip(p_items, p_wos):
     ontrack = int((p_items["po_block_flag"] == "🟢 On Track").sum())
     complete = int((p_items["po_block_flag"] == "✅ Complete").sum())
 
-    st.markdown("##### 🚚 PO Volume")
+    st.markdown("#### 🚚 PO Volume")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("PO WOs", f"{len(p_wos):,}", f"{unique_pos:,} unique POs")
     c2.metric("PO Items", f"{len(p_items):,}", f"{open_items:,} Open · {closed_items:,} Closed")
@@ -770,7 +770,7 @@ def po_kpi_strip(p_items, p_wos):
     c4.metric("Current Qty", f"{total_current:,}")
     c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
 
-    st.markdown(f"##### 🚦 PO Block Flag Breakdown — {blocked + partial:,} items need attention")
+    st.markdown(f"#### 🚦 PO Block Flag Breakdown — {blocked + partial:,} items need attention")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Blocked 🔴", f"{blocked:,}", "21+ days, 0%")
     c2.metric("Partial 🟠", f"{partial:,}", "14+ days, partial")
@@ -1557,42 +1557,52 @@ def overview_tab(df, wos):
         fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
         return fig
 
+    def _donut(fig, title):
+        fig.update_traces(hole=0.55, textinfo="label+value", textposition="inside", sort=False)
+        fig.update_layout(
+            title=dict(text=title, font=dict(size=15)),
+            margin=dict(l=8, r=8, t=44, b=8), height=300, showlegend=True,
+            legend=dict(orientation="h", y=-0.08), legend_title_text="",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        return fig
+
     r1 = st.columns(3)
+    # 1) PO status mix (donut handles the skew better than bars)
     with r1[0]:
         if po_pos is not None and not po_pos.empty:
             s = po_pos["purchase_state"].astype(str).str.lower().value_counts()
-            fig = px.bar(x=s.index, y=s.values, color=s.index, text=s.values,
+            fig = px.pie(names=s.index, values=s.values,
                          color_discrete_sequence=px.colors.qualitative.Set2)
-            fig.update_traces(textposition="outside")
-            fig.update_layout(xaxis_title=None, yaxis_title="POs")
-            st.plotly_chart(_fig(fig, "POs by state"), use_container_width=True)
+            st.plotly_chart(_donut(fig, "PO status mix"), use_container_width=True)
         else:
             st.caption("PO data unavailable.")
+    # 2) WO items: open / blocked / done (donut)
     with r1[1]:
-        if po_df is not None and not po_df.empty:
-            blob = (po_df["note"].fillna("").astype(str) + " " + po_df["sku"].fillna("").astype(str)).str.upper()
-            chan = pd.Series(np.where(blob.str.contains("FBM"), "FBM",
-                             np.where(blob.str.contains("FBA"), "FBA", "Other / untagged"))).value_counts()
-            fig = px.bar(x=chan.index, y=chan.values, color=chan.index, text=chan.values,
-                         color_discrete_map={"FBA": "#1f77b4", "FBM": "#ff7f0e", "Other / untagged": "#9aa0a6"})
+        blk = df["is_blocked_pfs"].fillna(False)
+        wo_mix = pd.Series({
+            "Open": int(((df["status_simple"] == "Open") & (~blk)).sum()),
+            "Blocked": int(blk.sum()),
+            "Done": int((df["status_simple"] == "Closed").sum()),
+        })
+        fig = px.pie(names=wo_mix.index, values=wo_mix.values, color=wo_mix.index,
+                     color_discrete_map={"Open": "#f4a259", "Blocked": "#d1495b", "Done": "#4c9f70"})
+        st.plotly_chart(_donut(fig, "WO items: open / blocked / done"), use_container_width=True)
+    # 3) Top 10 vendors by outstanding units (ranked horizontal bar)
+    with r1[2]:
+        if po_pos is not None and not po_pos.empty and "left" in po_pos.columns:
+            tv = (po_pos.groupby("vendor_name")["left"].sum()
+                  .sort_values(ascending=False).head(10).sort_values())
+            fig = px.bar(x=tv.values, y=tv.index, orientation="h", text=tv.values,
+                         color_discrete_sequence=["#3b7dd8"])
             fig.update_traces(textposition="outside")
-            fig.update_layout(xaxis_title=None, yaxis_title="PO lines")
-            st.plotly_chart(_fig(fig, "PO lines by channel (note / SKU)"), use_container_width=True)
+            fig.update_layout(xaxis_title="Units outstanding", yaxis_title=None)
+            st.plotly_chart(_fig(fig, "Top vendors — units outstanding"), use_container_width=True)
         else:
             st.caption("PO data unavailable.")
-    with r1[2]:
-        by = df.assign(_done=(df["status_simple"] == "Closed")).groupby("source_category").agg(
-            Open=("status_simple", lambda s: (s == "Open").sum()),
-            Done=("_done", "sum")).reset_index()
-        m = by.melt(id_vars="source_category", value_vars=["Open", "Done"],
-                    var_name="Status", value_name="Items")
-        fig = px.bar(m, x="source_category", y="Items", color="Status", barmode="group", text="Items",
-                     color_discrete_map={"Open": "#f4a259", "Done": "#4c9f70"})
-        fig.update_traces(textposition="outside")
-        fig.update_layout(xaxis_title=None)
-        st.plotly_chart(_fig(fig, "WO items by type & status", show_legend=True), use_container_width=True)
 
     r2 = st.columns(2)
+    # 4) Blocked WO items by reason (horizontal bar)
     with r2[0]:
         br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts().sort_values()
         if not br.empty:
@@ -1603,15 +1613,20 @@ def overview_tab(df, wos):
             st.plotly_chart(_fig(fig, "Blocked WO items by reason"), use_container_width=True)
         else:
             st.caption("None blocked.")
+    # 5) Inbound trend: units ordered vs received by month (two-series line)
     with r2[1]:
         if po_pos is not None and not po_pos.empty:
-            placed = pd.to_datetime(po_pos["order_placed"], errors="coerce").dropna()
-            mo = placed.dt.to_period("M").astype(str).value_counts().sort_index()
-            fig = px.line(x=mo.index, y=mo.values, markers=True)
-            fig.update_traces(line_color="#3b7dd8", text=mo.values,
-                              textposition="top center", mode="lines+markers+text")
-            fig.update_layout(xaxis_title=None, yaxis_title="POs placed")
-            st.plotly_chart(_fig(fig, "POs placed by month"), use_container_width=True)
+            tmp = po_pos.copy()
+            tmp["_m"] = pd.to_datetime(tmp["order_placed"], errors="coerce").dt.to_period("M").astype(str)
+            tmp = tmp[tmp["_m"] != "NaT"]
+            g = (tmp.groupby("_m").agg(Ordered=("original_ordered", "sum"),
+                                       Received=("received", "sum")).reset_index().sort_values("_m"))
+            gm = g.melt(id_vars="_m", value_vars=["Ordered", "Received"],
+                        var_name="Metric", value_name="Units")
+            fig = px.line(gm, x="_m", y="Units", color="Metric", markers=True,
+                          color_discrete_map={"Ordered": "#3b7dd8", "Received": "#4c9f70"})
+            fig.update_layout(xaxis_title=None, yaxis_title="Units")
+            st.plotly_chart(_fig(fig, "Units ordered vs received by month", show_legend=True), use_container_width=True)
         else:
             st.caption("PO data unavailable.")
 
