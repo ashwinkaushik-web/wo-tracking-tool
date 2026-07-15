@@ -1855,6 +1855,16 @@ def _sku_journey_render(mid, df, po_df):
 # MAIN
 # ============================================================
 def main():
+    # Keep filter + view selections alive across drill-in → back navigation.
+    # Streamlit drops widget state for widgets not rendered during a drilldown,
+    # which otherwise wipes the filters when you return to the list. Re-assigning
+    # the relevant keys to themselves marks them as user-set so they survive.
+    for _k in list(st.session_state.keys()):
+        if _k.startswith("fp_") or _k in ("global_wh", "main_nav", "po_subnav",
+                                          "storage_view", "po_view", "po_details_view",
+                                          "skuj_q", "skuj_pick"):
+            st.session_state[_k] = st.session_state[_k]
+
     h1, h2 = st.columns([3, 1.3])
     with h1:
         st.title("📊 WO Tracking Tool")
