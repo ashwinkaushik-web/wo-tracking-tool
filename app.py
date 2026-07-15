@@ -1567,7 +1567,7 @@ def overview_tab(df, wos):
         )
         return fig
 
-    r1 = st.columns(3)
+    r1 = st.columns(2)
     # 1) PO status mix (donut handles the skew better than bars)
     with r1[0]:
         if po_pos is not None and not po_pos.empty:
@@ -1588,8 +1588,10 @@ def overview_tab(df, wos):
         fig = px.pie(names=wo_mix.index, values=wo_mix.values, color=wo_mix.index,
                      color_discrete_map={"Open": "#f4a259", "Blocked": "#d1495b", "Done": "#4c9f70"})
         st.plotly_chart(_donut(fig, "WO items: open / blocked / done"), use_container_width=True)
+
+    r2 = st.columns(2)
     # 3) Top 10 vendors by outstanding units (ranked horizontal bar)
-    with r1[2]:
+    with r2[0]:
         if po_pos is not None and not po_pos.empty and "left" in po_pos.columns:
             tv = (po_pos.groupby("vendor_name")["left"].sum()
                   .sort_values(ascending=False).head(10).sort_values())
@@ -1600,10 +1602,8 @@ def overview_tab(df, wos):
             st.plotly_chart(_fig(fig, "Top vendors — units outstanding"), use_container_width=True)
         else:
             st.caption("PO data unavailable.")
-
-    r2 = st.columns(2)
     # 4) Blocked WO items by reason (horizontal bar)
-    with r2[0]:
+    with r2[1]:
         br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts().sort_values()
         if not br.empty:
             fig = px.bar(x=br.values, y=br.index, orientation="h", text=br.values,
@@ -1613,8 +1613,10 @@ def overview_tab(df, wos):
             st.plotly_chart(_fig(fig, "Blocked WO items by reason"), use_container_width=True)
         else:
             st.caption("None blocked.")
+
+    r3 = st.columns(2)
     # 5) Inbound trend: units ordered vs received by month (two-series line)
-    with r2[1]:
+    with r3[0]:
         if po_pos is not None and not po_pos.empty:
             tmp = po_pos.copy()
             tmp["_m"] = pd.to_datetime(tmp["order_placed"], errors="coerce").dt.to_period("M").astype(str)
@@ -1627,6 +1629,22 @@ def overview_tab(df, wos):
                           color_discrete_map={"Ordered": "#3b7dd8", "Received": "#4c9f70"})
             fig.update_layout(xaxis_title=None, yaxis_title="Units")
             st.plotly_chart(_fig(fig, "Units ordered vs received by month", show_legend=True), use_container_width=True)
+        else:
+            st.caption("PO data unavailable.")
+    # 6) PO vendor-fill distribution (how many POs under / on / over target)
+    with r3[1]:
+        if po_pos is not None and not po_pos.empty and "vendor_fill_pct" in po_pos.columns:
+            vf = pd.to_numeric(po_pos["vendor_fill_pct"], errors="coerce").fillna(0)
+            order = ["<80%", "80–99%", "100%", ">100%"]
+            dist = (pd.cut(vf, bins=[-0.1, 79.999, 99.999, 100.001, float("inf")], labels=order)
+                    .value_counts().reindex(order).fillna(0).astype(int))
+            fig = px.bar(x=list(dist.index), y=list(dist.values), text=list(dist.values),
+                         color=list(dist.index),
+                         color_discrete_map={"<80%": "#d1495b", "80–99%": "#f4a259",
+                                             "100%": "#4c9f70", ">100%": "#3b7dd8"})
+            fig.update_traces(textposition="outside")
+            fig.update_layout(xaxis_title=None, yaxis_title="POs")
+            st.plotly_chart(_fig(fig, "PO vendor-fill distribution"), use_container_width=True)
         else:
             st.caption("PO data unavailable.")
 
