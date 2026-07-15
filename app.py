@@ -1545,6 +1545,21 @@ def overview_tab(df, wos):
     # ================= Charts (Plotly) =================
     st.markdown("---")
     st.markdown("#### 📊 At a glance")
+    with st.expander("ℹ️ What each chart shows"):
+        st.markdown(
+            "- **PO status mix** — share of POs by lifecycle state (placed / receiving / arrived / "
+            "reconciled). Source: PO report, one row per PO (UK/EU, placed since 2025-07-01).\n"
+            "- **WO items: open / blocked / done** — warehouse processing split. Blocked = PFS "
+            "'Unpickable'; Open = open & not blocked; Done = closed. Source: WO data (year-to-date).\n"
+            "- **Top vendors — units outstanding** — vendors with the most units still to receive "
+            "(ordered − received), top 10. Source: PO report rolled up per vendor.\n"
+            "- **Blocked WO items by reason** — why WO items are blocked (Listing Failed, Replen "
+            "Needed, No Inventory…). Source: WO data, blocked items.\n"
+            "- **Units ordered vs received by month** — inbound flow: units ordered vs received by "
+            "PO placed month. Source: PO report.\n"
+            "- **PO vendor-fill distribution** — POs bucketed by fill level (received ÷ current "
+            "order): <80% under-fill · 80–99% · 100% on-target · >100% over-receipt. Source: PO report."
+        )
 
     def _fig(fig, title, show_legend=False):
         fig.update_layout(
