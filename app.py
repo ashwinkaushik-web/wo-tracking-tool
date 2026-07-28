@@ -1293,6 +1293,10 @@ def po_details_list(po_pos, po_df):
     sev = {s: i for i, s in enumerate(PO_STATUS_ORDER)}
     filtered = (filtered.assign(_sev=filtered["status"].map(sev).fillna(len(PO_STATUS_ORDER)))
                 .sort_values(["_sev", "po_number"]).drop(columns="_sev"))
+    if "wo_count" in filtered.columns:
+        if st.checkbox("🧾 Show only POs with no work order", key="pod_only_nowo",
+                       help="POs that have no linked work order yet — a WO likely needs raising."):
+            filtered = filtered[filtered["wo_count"] == 0]
     lines = po_df[po_df["po_number"].isin(filtered["po_number"])] if po_df is not None else po_df
     po_details_kpi(lines)
     if "wo_count" in filtered.columns:
@@ -1468,8 +1472,9 @@ def po_details_tab(wo_df):
 # ============================================================
 # OVERVIEW (Phase 3a) — exceptions-first landing
 # ============================================================
-OV_AGING_DAYS = 21  # PO placed but nothing received beyond this = at risk
-OV_MAX_ROWS = 100   # cap rows shown per exception panel (full count stays in the header)
+OV_AGING_DAYS = 21     # PO placed but nothing received beyond this = at risk
+OV_MAX_ROWS = 100      # cap rows shown per exception panel (full count stays in the header)
+NO_WO_GRACE_DAYS = 2   # active PO with no WO beyond this grace = flag for a WO to be raised
 
 
 def _ov_po_str(s):
@@ -1504,6 +1509,14 @@ def overview_tab(df, wos):
         if wh != "Both":
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
+        # Attach WO count per PO so we can flag POs with no work order (best effort).
+        try:
+            _wa = fetch_po_wo_agg()
+            po_pos = po_pos.merge(_wa[["po_number", "wo_count"]], on="po_number", how="left")
+            po_pos["wo_count"] = pd.to_numeric(po_pos["wo_count"], errors="coerce").fillna(0).astype(int)
+        except Exception:
+            if po_pos is not None and "wo_count" not in po_pos.columns:
+                po_pos["wo_count"] = 0
     except Exception:
         po_df = po_pos = None
 
@@ -1761,6 +1774,36 @@ def overview_tab(df, wos):
                     "demand_fill_rate_pct": "Demand Fill %", "vendor_fill_rate_pct": "Vendor Fill %"})
                 d["PO #"] = _ov_po_str(d["PO #"])
                 _panel(d, "ov_over", numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"])
+
+        # F) POs placed with no work order (active, past the grace period)
+        if po_pos is not None and "wo_count" in po_pos.columns:
+            nowo = po_pos.copy()
+            nowo["_age"] = (pd.Timestamp(datetime.now().date())
+                            - pd.to_datetime(nowo["order_placed"], errors="coerce")).dt.days
+            state = nowo["purchase_state"].astype(str).str.lower()
+            nowo = nowo[(nowo["wo_count"] == 0)
+                        & (~state.isin(["ready_to_reconcile", "cancelled", "canceled"]))
+                        & (nowo["_age"].fillna(0) >= NO_WO_GRACE_DAYS)]
+        else:
+            nowo = None
+        _n_nowo = 0 if nowo is None else len(nowo)
+        with st.expander(f"🧾 POs placed with no work order ({_n_nowo:,})", expanded=(_n_nowo > 0)):
+            st.caption(f"Active POs placed {NO_WO_GRACE_DAYS}+ days ago with no linked work order — a WO "
+                       "likely needs raising. Reconciled/cancelled POs are excluded.")
+            if nowo is None:
+                st.caption("PO→WO link unavailable (couldn't load the WO rollup).")
+            elif nowo.empty:
+                st.caption("None — every active PO has a work order.")
+            else:
+                d = nowo.sort_values("_age", ascending=False)[
+                    ["po_number", "vendor_name", "country_name", "warehouse_name", "purchase_state",
+                     "order_placed", "_age", "original_ordered", "received"]
+                ].rename(columns={
+                    "po_number": "PO #", "vendor_name": "Vendor", "country_name": "Country",
+                    "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
+                    "_age": "Days Since Placed", "original_ordered": "Ordered", "received": "Received"})
+                d["PO #"] = _ov_po_str(d["PO #"])
+                _panel(d, "ov_nowo", date_cols=["Order Placed"], pin_cols=["PO #"], color_rows=True)
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
@@ -1910,7 +1953,7 @@ def main():
     for _k in list(st.session_state.keys()):
         if _k.startswith("fp_") or _k in ("global_wh", "main_nav", "po_subnav",
                                           "storage_view", "po_view", "po_details_view",
-                                          "skuj_q", "skuj_pick"):
+                                          "pod_only_nowo", "skuj_q", "skuj_pick"):
             st.session_state[_k] = st.session_state[_k]
 
     h1, h2 = st.columns([3, 1.3])
