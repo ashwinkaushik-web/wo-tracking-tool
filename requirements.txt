@@ -1,6 +1,9 @@
 # Pinned below the bleeding edge — Streamlit Cloud re-resolves on each deploy.
 # pandas 3.x / numpy 2.5 / pyarrow 25 segfault during Arrow dataframe rendering.
-streamlit>=1.40,<1.60
+# starlette 1.4.0 changed GZipResponder.__init__ (added thread_minimum_size),
+# which crashes streamlit 1.59.2's server on boot — hold starlette < 1.4.
+streamlit==1.59.2
+starlette<1.4
 snowflake-connector-python>=3.12
 pandas>=2.2,<3
 numpy>=1.26,<2.3
