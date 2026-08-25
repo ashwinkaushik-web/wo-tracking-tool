@@ -10,6 +10,7 @@ SELECT
       rpt.PO_NUMBER                          AS po_number
     , rpt.PURCHASE_ORDER_TYPE                AS po_type
     , rpt.PURCHASE_STATE                     AS purchase_state
+    , rpt.FULFILLMENT_METHOD                 AS fulfillment_method
     , rpt.VENDOR_NAME                        AS vendor_name
     , rpt.COUNTRY_NAME                       AS country_name
     , rpt.WAREHOUSE_NAME                     AS warehouse_name
