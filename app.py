@@ -49,6 +49,7 @@ st.markdown("""
 QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 PO_QUERY_PATH = Path(__file__).parent / "queries" / "po_tracker.sql"
 PO_WO_AGG_PATH = Path(__file__).parent / "queries" / "po_wo_agg.sql"
+PO_ITEM_GAP_PATH = Path(__file__).parent / "queries" / "po_item_wo_gap.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
 FLAG_ORDER = [
@@ -1151,6 +1152,32 @@ def fetch_po_wo_agg():
     return agg
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_po_item_wo_gap():
+    """Item-level (PO x Master ID) WO coverage gaps — No WO / Partial WO lines
+    only (queries/po_item_wo_gap.sql). Different grain from fetch_po_wo_agg,
+    which rolls up to one row per whole PO."""
+    sql = PO_ITEM_GAP_PATH.read_text()
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+
+    if "order_placed_date" in df.columns:
+        df["order_placed_date"] = pd.to_datetime(df["order_placed_date"], errors="coerce")
+
+    numeric_cols = ["po_number", "ordered_units", "received_units", "outstanding_units", "wo_qty"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def _po_item_status(df):
     """Unified lifecycle status at PO line-item grain (see PO_STATUS_ORDER)."""
     recv = pd.to_numeric(df.get("received_units"), errors="coerce").fillna(0)
@@ -1171,12 +1198,18 @@ def _build_po_aggregates(df):
         country_name=("country_name", "first"),
         warehouse_name=("warehouse_name", "first"),
         purchase_state=("purchase_state", "first"),
+        po_type=("po_type", "first"),
+        fulfillment=("fulfillment_method",
+                     lambda s: next((str(x).strip() for x in s
+                                     if pd.notna(x) and str(x).strip()), "")),
         lines=("item_id", "count"),
         original_ordered=("original_ordered_units", "sum"),
         ordered=("ordered_units", "sum"),
         received=("received_units", "sum"),
         on_order=("current_on_order", "sum"),
         order_placed=("order_placed_date", "min"),
+        ship_date=("ship_date", "min"),
+        first_arrival=("arrived_date", "min"),
         last_received=("po_last_received_date", "max"),
         issues=("total_issues", "sum"),
     )
@@ -1304,13 +1337,18 @@ def po_details_list(po_pos, po_df):
         st.caption(f"🔗 {nwith:,} of {len(filtered):,} POs have matching work orders "
                    f"({nwith * 100 // max(len(filtered), 1)}%). WO-side quantities are in the table below.")
     base_cols = ["po_number", "status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
-                 "order_placed", "last_received", "lines", "original_ordered", "ordered", "received",
+                 "po_type", "fulfillment",
+                 "order_placed", "ship_date", "first_arrival", "last_received", "lines",
+                 "original_ordered", "ordered", "received",
                  "left", "on_order", "demand_fill_pct", "vendor_fill_pct"]
+    base_cols = [c for c in base_cols if c in filtered.columns]
     wo_cols = [c for c in ["wo_count", "wo_current", "wo_processed", "wo_ship_created", "wo_shipped", "wo_stowed"]
                if c in filtered.columns]
     display = filtered[base_cols + wo_cols].rename(columns={
         "po_number": "PO #", "status": "Status", "vendor_name": "Vendor", "country_name": "Country",
-        "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
+        "warehouse_name": "WH", "purchase_state": "State", "po_type": "PO Type",
+        "fulfillment": "Fulfillment", "order_placed": "Order Placed",
+        "ship_date": "Ship Date", "first_arrival": "First Arrival",
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
         "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
@@ -1326,7 +1364,7 @@ def po_details_list(po_pos, po_df):
     sel = render_table(
         display, key=_grid_key("grid_pod"), selectable=True, select_col="PO #",
         numpct_cols=["Demand Fill %", "Vendor Fill %"],
-        date_cols=["Order Placed", "Last Received"], pin_cols=["PO #"],
+        date_cols=["Order Placed", "Ship Date", "First Arrival", "Last Received"], pin_cols=["PO #"],
         color_rows=True, height=500,
     )
     if sel is not None:
@@ -1474,7 +1512,7 @@ def po_details_tab(wo_df):
 # ============================================================
 OV_AGING_DAYS = 21     # PO placed but nothing received beyond this = at risk
 OV_MAX_ROWS = 100      # cap rows shown per exception panel (full count stays in the header)
-NO_WO_GRACE_DAYS = 2   # active PO with no WO beyond this grace = flag for a WO to be raised
+NO_WO_GRACE_DAYS = 0   # 0 = flag POs the moment they're placed (per Owen: get ahead early)
 
 
 def _ov_po_str(s):
@@ -1787,23 +1825,82 @@ def overview_tab(df, wos):
         else:
             nowo = None
         _n_nowo = 0 if nowo is None else len(nowo)
-        with st.expander(f"🧾 POs placed with no work order ({_n_nowo:,})", expanded=(_n_nowo > 0)):
-            st.caption(f"Active POs placed {NO_WO_GRACE_DAYS}+ days ago with no linked work order — a WO "
-                       "likely needs raising. Reconciled/cancelled POs are excluded.")
+        with st.expander(f"🧾 POs placed/arriving with no work order ({_n_nowo:,})", expanded=(_n_nowo > 0)):
+            st.caption("Placed or arriving POs with no linked work order — flagged from the moment "
+                       "they're placed, so a WO can be raised before arrival. "
+                       "Reconciled/cancelled POs are excluded.")
             if nowo is None:
                 st.caption("PO→WO link unavailable (couldn't load the WO rollup).")
             elif nowo.empty:
                 st.caption("None — every active PO has a work order.")
             else:
-                d = nowo.sort_values("_age", ascending=False)[
-                    ["po_number", "vendor_name", "country_name", "warehouse_name", "purchase_state",
-                     "order_placed", "_age", "original_ordered", "received"]
-                ].rename(columns={
+                keep = ["po_number", "vendor_name", "country_name", "warehouse_name", "purchase_state",
+                        "po_type", "fulfillment", "order_placed", "ship_date", "first_arrival", "_age",
+                        "original_ordered", "received"]
+                keep = [c for c in keep if c in nowo.columns]
+                d = nowo.sort_values("_age", ascending=False)[keep].rename(columns={
                     "po_number": "PO #", "vendor_name": "Vendor", "country_name": "Country",
-                    "warehouse_name": "WH", "purchase_state": "State", "order_placed": "Order Placed",
+                    "warehouse_name": "WH", "purchase_state": "State", "po_type": "PO Type",
+                    "fulfillment": "Fulfillment", "order_placed": "Order Placed",
+                    "ship_date": "Ship Date", "first_arrival": "First Arrival",
                     "_age": "Days Since Placed", "original_ordered": "Ordered", "received": "Received"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                _panel(d, "ov_nowo", date_cols=["Order Placed"], pin_cols=["PO #"], color_rows=True)
+                st.download_button(
+                    "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                    file_name=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_nowo")
+                _panel(d, "ov_nowo",
+                       date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
+                       pin_cols=["PO #"], color_rows=True)
+
+        # G) PO items without full WO coverage — ITEM level (a PO can be
+        # partly fine and partly a gap; different grain from panel F above).
+        try:
+            item_gap = fetch_po_item_wo_gap()
+            if wh != "Both" and "warehouse_name" in item_gap.columns:
+                item_gap = item_gap[item_gap["warehouse_name"] == wh].copy()
+        except Exception:
+            item_gap = None
+        _n_gap = 0 if item_gap is None else len(item_gap)
+        _n_nowo_items = 0 if item_gap is None else int((item_gap["coverage_state"] == "No WO").sum())
+        _n_partial_items = 0 if item_gap is None else int((item_gap["coverage_state"] == "Partial WO").sum())
+        with st.expander(f"🧩 PO items without full work-order coverage ({_n_gap:,})"):
+            st.caption("Item-level — a PO can have some items fully covered and others not. **No WO** = "
+                       "nothing raised for this item yet. **Partial WO** = a WO exists but for fewer units "
+                       "than are still outstanding. \"Reason\" explains a No-WO line that may not be a live "
+                       "gap (e.g. already fully received); items handled via a Manual/Storage WO instead of "
+                       "a PO-linked one are flagged here too, not hidden.")
+            if item_gap is None:
+                st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
+            elif item_gap.empty:
+                st.caption("None — every PO item has full work-order coverage.")
+            else:
+                mcol = st.columns(3)
+                mcol[0].metric("Item-lines flagged", f"{_n_gap:,}")
+                mcol[1].metric("No WO", f"{_n_nowo_items:,}")
+                mcol[2].metric("Partial WO", f"{_n_partial_items:,}")
+                if "reason" in item_gap.columns:
+                    genuine = int((item_gap["reason"] == "Genuine gap — needs WO raised").sum())
+                    if genuine:
+                        st.caption(f"Of the No-WO lines, **{genuine:,}** are a genuine gap needing a WO "
+                                   "raised — the rest are already received, on a closed PO, or covered "
+                                   "via a Storage WO.")
+                keep = ["po_number", "sku", "title", "vendor_name", "country_name", "warehouse_name",
+                        "purchase_state", "order_placed_date", "ordered_units", "received_units",
+                        "outstanding_units", "wo_qty", "coverage_state", "reason"]
+                keep = [c for c in keep if c in item_gap.columns]
+                d = item_gap.sort_values(["coverage_state", "outstanding_units"], ascending=[True, False])[keep].rename(columns={
+                    "po_number": "PO #", "sku": "SKU", "title": "Title", "vendor_name": "Vendor",
+                    "country_name": "Country", "warehouse_name": "WH", "purchase_state": "State",
+                    "order_placed_date": "Order Placed", "ordered_units": "Ordered",
+                    "received_units": "Received", "outstanding_units": "Outstanding",
+                    "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason"})
+                d["PO #"] = _ov_po_str(d["PO #"])
+                st.download_button(
+                    "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                    file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_item_gap")
+                _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"], color_rows=True)
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
