@@ -3,11 +3,18 @@
 -- Here: one row per PO x Master ID, comparing outstanding PO quantity against
 -- the quantity actually raised on PO-linked work orders for that same item.
 --
+-- Scope: EXCLUDES 'ready_to_reconcile' (R2R) POs. R2R means the PO has
+-- already fully arrived/received and is just pending finance close-out —
+-- per Owen's feedback (2026-08), these dominate the raw exception count
+-- (~74% of flagged lines) and aren't relevant to "will this PO have a
+-- WO problem when it arrives." Only 'placed', 'receiving', 'arrived' —
+-- i.e. POs still in the active pipeline — are shown.
+--
 -- Validated against Snowflake (2025-07-01+, Northampton/Wroclaw):
---   62,893 item-lines fully covered · 3,718 no WO at all · 414 partial.
---   Of the "no WO" lines: 3,470 are already fully received (not actionable —
---   received via a route that predates/bypasses WO tracking), 247 are a
---   genuine gap needing a WO raised, 1 is on a closed/cancelled PO.
+--   Pre-filter (all states): 62,893 fully covered · 3,718 no WO · 414 partial.
+--   ~3,187 of the flagged (no-WO + partial) lines were ready_to_reconcile —
+--   now excluded — leaving 1,087 active-pipeline lines: 572 No WO, 515
+--   Partial WO, across POs still placed / receiving / arrived.
 --
 -- Only returns NO-WO and PARTIAL lines (fully-covered lines are dropped here —
 -- the app doesn't need 62k+ healthy rows, only the exceptions).
@@ -28,6 +35,7 @@ WITH po_items AS (
     WHERE rpt.WAREHOUSE_NAME IN ('Northampton', 'Wroclaw')
       AND rpt.ORDER_PLACED_DATE >= '2025-07-01'
       AND rpt.MASTER_ID IS NOT NULL
+      AND LOWER(rpt.PURCHASE_STATE) <> 'ready_to_reconcile'
     GROUP BY CAST(rpt.PO_NUMBER AS VARCHAR), rpt.MASTER_ID
 ),
 po_woi AS (
@@ -89,8 +97,8 @@ SELECT
     CASE
         WHEN po_woi.wo_qty IS NOT NULL THEN NULL  -- only rate a reason for true no-WO lines
         WHEN (po_items.ordered_units - po_items.received_units) <= 0 THEN 'Fully received — WO likely not required'
-        WHEN LOWER(po_items.purchase_state) IN ('ready_to_reconcile', 'cancelled', 'canceled')
-            THEN 'PO reconciled/cancelled'
+        WHEN LOWER(po_items.purchase_state) IN ('cancelled', 'canceled')
+            THEN 'PO cancelled'
         WHEN sm.master_id IS NOT NULL THEN 'Covered via Storage WO (not PO-linked)'
         ELSE 'Genuine gap — needs WO raised'
     END                                                  AS reason
