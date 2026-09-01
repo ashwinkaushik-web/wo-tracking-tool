@@ -124,3 +124,16 @@ Built to replace manual CSV exports + Tableau snapshots that were already 8 days
 - 32,959 total YTD WOIs tracked
 
 Block detection rules verified with Owen Davies (UK/EU Merchandise Planning) and ground-truthed against Snowflake `in_progress_at` audit data — the timestamp field is unreliable, so we use WOI-level processing percentages instead.
+
+## 💬 Slack messenger (`slack_messaging/`)
+
+A small **💬 Slack** button in the app header opens a popup where a user picks
+who they are, chooses to post to the **team channel** or **DM a person**, types
+a note, and sends it to Slack. Self-contained in the `slack_messaging/` folder
+and imported by `app.py` via `slack_messenger_button()`.
+
+- **Config:** `st.secrets["slack"]` — `bot_token`, `channel_id`, `channel_name`,
+  and a `[slack.people]` name→user-ID map. No secrets in code.
+- **Graceful:** with no `[slack]` secrets it shows a "not configured" note, so the
+  app runs fine without it.
+- **Setup:** see [`slack_messaging/SETUP.md`](slack_messaging/SETUP.md).

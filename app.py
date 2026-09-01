@@ -25,6 +25,10 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime
 from pathlib import Path
+try:
+    from slack_messaging import slack_messenger_button
+except Exception:  # feature is optional — never break the app if it's absent
+    slack_messenger_button = None
 
 # ============================================================
 # CONFIG
@@ -2053,7 +2057,7 @@ def main():
                                           "pod_only_nowo", "skuj_q", "skuj_pick"):
             st.session_state[_k] = st.session_state[_k]
 
-    h1, h2 = st.columns([3, 1.3])
+    h1, h2, h3 = st.columns([3, 1.3, 0.9])
     with h1:
         st.title("📊 WO Tracking Tool")
         st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
@@ -2063,6 +2067,9 @@ def main():
             "Warehouse", ["Both", "Northampton", "Wroclaw"],
             horizontal=True, label_visibility="collapsed", key="global_wh",
         )
+    with h3:
+        if slack_messenger_button:
+            slack_messenger_button()
 
     try:
         with st.spinner("Loading WO data from Snowflake..."):
