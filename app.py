@@ -26,9 +26,10 @@ from cryptography.hazmat.primitives import serialization
 from datetime import datetime
 from pathlib import Path
 try:
-    from slack_messaging import slack_messenger_button
+    from slack_messaging import slack_messenger_button, slack_send_panel_button
 except Exception:  # feature is optional — never break the app if it's absent
     slack_messenger_button = None
+    slack_send_panel_button = None
 
 # ============================================================
 # CONFIG
@@ -1849,10 +1850,20 @@ def overview_tab(df, wos):
                     "ship_date": "Ship Date", "first_arrival": "First Arrival",
                     "_age": "Days Since Placed", "original_ordered": "Ordered", "received": "Received"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                st.download_button(
-                    "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
-                    file_name=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
-                    mime="text/csv", key="dl_nowo")
+                _dlc, _slc = st.columns(2)
+                with _dlc:
+                    st.download_button(
+                        "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                        file_name=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
+                        mime="text/csv", key="dl_nowo", use_container_width=True)
+                with _slc:
+                    if slack_send_panel_button is not None:
+                        slack_send_panel_button(
+                            "slack_nowo", df=d,
+                            filename=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
+                            note=f"PO-level no-WO list — {len(d):,} POs placed/arriving with no linked "
+                                 "work order (attached from WO Tracker). Please review / raise WOs.",
+                            use_container_width=True)
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
                        pin_cols=["PO #"], color_rows=True)
@@ -1900,10 +1911,20 @@ def overview_tab(df, wos):
                     "received_units": "Received", "outstanding_units": "Outstanding",
                     "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                st.download_button(
-                    "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
-                    file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
-                    mime="text/csv", key="dl_item_gap")
+                _dlc2, _slc2 = st.columns(2)
+                with _dlc2:
+                    st.download_button(
+                        "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                        file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
+                        mime="text/csv", key="dl_item_gap", use_container_width=True)
+                with _slc2:
+                    if slack_send_panel_button is not None:
+                        slack_send_panel_button(
+                            "slack_item_gap", df=d,
+                            filename=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
+                            note=f"Item-level WO coverage gaps — {len(d):,} item-lines without full "
+                                 "work-order coverage (attached from WO Tracker).",
+                            use_container_width=True)
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"], color_rows=True)
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")

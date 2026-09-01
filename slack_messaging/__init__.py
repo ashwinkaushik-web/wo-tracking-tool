@@ -36,7 +36,7 @@ import urllib.error
 
 import streamlit as st
 
-__all__ = ["slack_messenger_button"]
+__all__ = ["slack_messenger_button", "slack_send_panel_button"]
 
 
 def _slack_cfg():
@@ -214,6 +214,12 @@ def _slack_dialog():
                    "`[slack.people]` entries in the app secrets.")
         return
 
+    # Optional context set by a panel's "Send to Slack" button: a prefilled note
+    # and/or a ready-made attachment (a CSV built in-memory — no download needed).
+    ctx = st.session_state.get("_slack_ctx") or {}
+    default_note = ctx.get("note", "")
+    tool_file = ctx.get("attachment")   # {"name": str, "bytes": bytes} or None
+
     with st.form("slack_msg_form", clear_on_submit=False):
         if names:
             sender = st.selectbox("From", names, index=None, placeholder="Pick your name")
@@ -224,13 +230,20 @@ def _slack_dialog():
         target_label = st.selectbox("Send to", targets, index=0 if targets else None)
 
         note = st.text_area(
-            "Message", height=120,
+            "Message", value=default_note, height=120,
             placeholder="e.g. Please raise a WO for PO 12345 (SKU ABC-123) — arriving Friday, no WO yet.",
         )
-        uploaded = st.file_uploader(
-            "Attach a file (optional)",
-            help="e.g. the 'Download this list (CSV)' export from a panel.",
-        )
+
+        include_tool_file = False
+        if tool_file:
+            include_tool_file = st.checkbox(
+                f"📎 Attach **{tool_file['name']}** (from this view)", value=True)
+            uploaded = st.file_uploader("…or attach a different file instead")
+        else:
+            uploaded = st.file_uploader(
+                "Attach a file (optional)",
+                help="e.g. the 'Download this list (CSV)' export from a panel.",
+            )
         submitted = st.form_submit_button("Send to Slack", type="primary", use_container_width=True)
 
     if submitted:
@@ -247,9 +260,12 @@ def _slack_dialog():
             nm = target_label.split("·", 1)[1].strip()
             target = {"kind": "dm", "user_id": people.get(nm), "name": nm}
 
+        # A freshly uploaded file wins; otherwise use the tool-provided attachment.
         upload = None
         if uploaded is not None:
             upload = {"name": uploaded.name, "bytes": uploaded.getvalue()}
+        elif tool_file and include_tool_file:
+            upload = tool_file
 
         with st.spinner("Sending…"):
             ok, msg = _slack_send(cfg, sender, target, note, upload=upload)
@@ -261,7 +277,31 @@ def _slack_dialog():
 
 
 def slack_messenger_button():
-    """Small header launcher for the Slack messenger dialog."""
+    """Small header launcher for the Slack messenger dialog (blank compose)."""
     st.markdown("##### 💬 Message")
     if st.button("Slack", use_container_width=True, help="Send a message to the team on Slack"):
+        st.session_state.pop("_slack_ctx", None)   # blank compose, no prefill
+        _slack_dialog()
+
+
+def slack_send_panel_button(key, *, df, filename, note="", label="📤 Send to Slack",
+                            use_container_width=False):
+    """Render a button that opens the Slack dialog pre-loaded with ``df`` as an
+    in-memory CSV attachment and a prefilled ``note`` — no manual download needed.
+
+    Call it right next to a panel's download button:
+
+        slack_send_panel_button("slack_nowo", df=d,
+            filename="pos_without_wo.csv",
+            note="PO-level no-WO list attached from WO Tracker.")
+    """
+    if st.button(label, key=key, use_container_width=use_container_width,
+                 help="Send this list to Slack with the table attached as a CSV"):
+        st.session_state["_slack_ctx"] = {
+            "note": note,
+            "attachment": {
+                "name": filename,
+                "bytes": df.to_csv(index=False).encode("utf-8"),
+            },
+        }
         _slack_dialog()
