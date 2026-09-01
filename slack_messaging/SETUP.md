@@ -1,5 +1,7 @@
 # In-App Slack Messenger — Setup
 
+> Feature module: `slack_messaging/` · entry point: `slack_messenger_button()` imported in `app.py`.
+
 The WO Tracking Tool has a **💬 Slack** button in the top-right header. It opens a
 small popup where a user picks who they are, chooses to post to the **team channel**
 or **DM a person**, types a message, and sends it to Slack.
