@@ -127,13 +127,14 @@ Block detection rules verified with Owen Davies (UK/EU Merchandise Planning) and
 
 ## 💬 Slack messenger (`slack_messaging/`)
 
-A small **💬 Slack** button in the app header opens a popup where a user picks
-who they are, chooses to post to the **team channel** or **DM a person**, types
-a note, and sends it to Slack. Self-contained in the `slack_messaging/` folder
-and imported by `app.py` via `slack_messenger_button()`.
+A small **💬 Slack** button in the app header opens a popup where a user picks who
+they are, chooses a **channel** or a **person (DM)**, types a note, optionally
+**attaches a file** (e.g. a panel's CSV export), and sends it to Slack. Self-contained
+in `slack_messaging/` and imported by `app.py` via `slack_messenger_button()`.
 
-- **Config:** `st.secrets["slack"]` — `bot_token`, `channel_id`, `channel_name`,
+- **Config:** `st.secrets["slack"]` — `bot_token`, a `[slack.channels]` label→ID map,
   and a `[slack.people]` name→user-ID map. No secrets in code.
-- **Graceful:** with no `[slack]` secrets it shows a "not configured" note, so the
-  app runs fine without it.
+- **Scopes:** `chat:write`, `im:write`, `files:write` (+ optional `users:read`).
+- **Add more** channels/people by adding secret lines — no code change.
+- **Graceful:** with no `[slack]` secrets it shows a "not configured" note.
 - **Setup:** see [`slack_messaging/SETUP.md`](slack_messaging/SETUP.md).

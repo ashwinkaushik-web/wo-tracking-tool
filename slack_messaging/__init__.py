@@ -11,19 +11,26 @@ Self-contained feature module for the WO Tracking Tool. Import
 Config lives entirely in ``st.secrets`` — nothing sensitive in code. Shape:
 
     [slack]
-    bot_token    = "xoxb-..."          # bot token: chat:write (+ im:write for DMs)
-    channel_id   = "C0123456789"        # target channel ID (not the #name)
-    channel_name = "#wo-tracker"        # display label only
+    bot_token = "xoxb-..."               # scopes: chat:write, im:write, files:write
 
-    [slack.people]                      # name shown in dropdown -> Slack user ID
+    [slack.channels]                     # label shown in dropdown -> channel ID
+    "#wo-trial"     = "C0BU1CU0885"
+    "#eu-warehouse" = "C0XXXXXXXXX"
+
+    [slack.people]                       # name shown in dropdown -> Slack user ID
     "Ashwin Kaushik" = "U0123456789"
-    "Owen ..."       = "U0987654321"
+    "Owen Davies"    = "U0987654321"
+
+Back-compat: a single ``channel_id`` / ``channel_name`` pair (the original
+shape) is still accepted and treated as one channel.
 
 If the [slack] section is missing/empty the messenger degrades to a short
 "not configured yet" note instead of erroring. See SETUP.md in this folder.
 """
 
 import json
+import uuid
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -41,21 +48,27 @@ def _slack_cfg():
     token = s.get("bot_token")
     if not token:
         return None
-    people = {}
-    try:
-        people = {str(k): str(v) for k, v in dict(s.get("people", {})).items()}
-    except Exception:
-        people = {}
+
+    def _as_map(v):
+        try:
+            return {str(k): str(v2) for k, v2 in dict(v).items()}
+        except Exception:
+            return {}
+
+    channels = _as_map(s.get("channels", {}))
+    # Back-compat: fold a legacy single channel into the channels map.
+    if not channels and s.get("channel_id"):
+        channels = {s.get("channel_name", "#channel"): s.get("channel_id")}
+
     return {
         "token": token,
-        "channel_id": s.get("channel_id"),
-        "channel_name": s.get("channel_name", "the team channel"),
-        "people": people,
+        "channels": channels,
+        "people": _as_map(s.get("people", {})),
     }
 
 
-def _slack_api(token, method, payload):
-    """POST to a Slack Web API method. Returns (body_dict, error_str)."""
+def _slack_post(token, method, payload):
+    """POST JSON to a Slack Web API method. Returns (body_dict, error_str)."""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"https://slack.com/api/{method}",
@@ -66,8 +79,23 @@ def _slack_api(token, method, payload):
         },
         method="POST",
     )
+    return _read(req)
+
+
+def _slack_get(token, method, params):
+    """GET a Slack Web API method with query params. Returns (body_dict, error)."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        f"https://slack.com/api/{method}?{qs}",
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    return _read(req)
+
+
+def _read(req):
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return None, f"HTTP {e.code}"
@@ -80,35 +108,88 @@ def _slack_api(token, method, payload):
     return body, None
 
 
-def _slack_send(cfg, sender, target, note):
-    """Compose and post the message. target = {'kind': 'channel'} or
-    {'kind': 'dm', 'user_id': 'U...', 'name': '...'}. Returns (ok, message)."""
-    note = (note or "").strip()
-    if not note:
-        return False, "Message is empty — nothing to send."
-
-    text = f":clipboard: *WO Tracking Tool* — message from *{sender or 'someone'}*\n\n{note}"
-
+def _resolve_channel(cfg, target):
+    """Return (channel_id, error). For a DM, open the bot↔user IM first."""
     if target["kind"] == "channel":
-        channel = cfg.get("channel_id")
-        if not channel:
-            return False, "No channel is configured (slack.channel_id)."
-    else:
-        user_id = target.get("user_id")
-        if not user_id:
-            return False, "That person has no Slack user ID in the people list."
-        # Open (or reuse) the DM channel first — most reliable path for DMs.
-        opened, err = _slack_api(cfg["token"], "conversations.open", {"users": user_id})
-        if err:
-            # Fall back to posting to the user ID directly.
-            channel = user_id
-        else:
-            channel = opened["channel"]["id"]
+        cid = target.get("channel_id")
+        return (cid, None) if cid else (None, "No channel ID configured.")
+    user_id = target.get("user_id")
+    if not user_id:
+        return None, "That person has no Slack user ID in the people list."
+    opened, err = _slack_post(cfg["token"], "conversations.open", {"users": user_id})
+    if err:
+        # Fall back to posting to the user ID directly.
+        return user_id, None
+    return opened["channel"]["id"], None
 
-    _, err = _slack_api(cfg["token"], "chat.postMessage", {"channel": channel, "text": text})
+
+def _upload_file(token, channel_id, filename, data_bytes, comment):
+    """Upload + share a file via the modern external-upload flow. Returns (ok, err)."""
+    # 1) Reserve an upload URL.
+    info, err = _slack_get(token, "files.getUploadURLExternal",
+                           {"filename": filename, "length": len(data_bytes)})
+    if err:
+        return False, f"getUploadURL: {err}"
+    upload_url, file_id = info["upload_url"], info["file_id"]
+
+    # 2) POST the bytes to the reserved URL as multipart/form-data.
+    boundary = uuid.uuid4().hex
+    pre = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    post = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = pre + data_bytes + post
+    up_req = urllib.request.Request(
+        upload_url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(up_req, timeout=60) as resp:
+            if resp.status != 200:
+                return False, f"upload HTTP {resp.status}"
+    except Exception as e:
+        return False, f"upload failed: {e}"
+
+    # 3) Complete + share to the channel/DM, with the message as the comment.
+    payload = {"files": [{"id": file_id, "title": filename}], "channel_id": channel_id}
+    if comment:
+        payload["initial_comment"] = comment
+    _, err = _slack_post(token, "files.completeUploadExternal", payload)
+    if err:
+        return False, f"completeUpload: {err}"
+    return True, None
+
+
+def _slack_send(cfg, sender, target, note, upload=None):
+    """Send a message (and optional file). upload = {'name','bytes'} or None.
+    Returns (ok, message)."""
+    note = (note or "").strip()
+    if not note and upload is None:
+        return False, "Add a message or attach a file."
+
+    if note:
+        text = f":clipboard: *WO Tracking Tool* — message from *{sender or 'someone'}*\n\n{note}"
+    else:
+        text = f":clipboard: *WO Tracking Tool* — file from *{sender or 'someone'}*"
+
+    channel, err = _resolve_channel(cfg, target)
     if err:
         return False, err
-    where = cfg["channel_name"] if target["kind"] == "channel" else f"@{target.get('name', 'user')}"
+
+    where = target.get("name", "the channel") if target["kind"] == "channel" else f"@{target.get('name', 'user')}"
+
+    if upload is not None:
+        ok, err = _upload_file(cfg["token"], channel, upload["name"], upload["bytes"], text)
+        if not ok:
+            return False, err
+        return True, f"Sent to {where} with {upload['name']}."
+
+    _, err = _slack_post(cfg["token"], "chat.postMessage", {"channel": channel, "text": text})
+    if err:
+        return False, err
     return True, f"Sent to {where}."
 
 
@@ -118,13 +199,20 @@ def _slack_dialog():
     if cfg is None:
         st.info(
             "Slack messaging isn't configured yet. Add a `[slack]` section to the app "
-            "secrets (bot token, channel ID, and a `[slack.people]` name → user-ID map). "
-            "See **slack_messaging/SETUP.md** in the repo for the exact steps."
+            "secrets (bot token, `[slack.channels]`, and a `[slack.people]` name → user-ID "
+            "map). See **slack_messaging/SETUP.md** in the repo for the exact steps."
         )
         return
 
-    people = cfg["people"]
+    channels = cfg["channels"]          # {label: channel_id}
+    people = cfg["people"]              # {name: user_id}
+    chan_labels = list(channels.keys())
     names = list(people.keys())
+
+    if not chan_labels and not names:
+        st.warning("No channels or people configured. Add `[slack.channels]` and/or "
+                   "`[slack.people]` entries in the app secrets.")
+        return
 
     with st.form("slack_msg_form", clear_on_submit=False):
         if names:
@@ -132,12 +220,16 @@ def _slack_dialog():
         else:
             sender = st.text_input("From (your name)")
 
-        targets = [f"📢 Channel · {cfg['channel_name']}"] + [f"📩 DM · {n}" for n in names]
-        target_label = st.selectbox("Send to", targets, index=0)
+        targets = [f"📢 {c}" for c in chan_labels] + [f"📩 DM · {n}" for n in names]
+        target_label = st.selectbox("Send to", targets, index=0 if targets else None)
 
         note = st.text_area(
-            "Message", height=130,
+            "Message", height=120,
             placeholder="e.g. Please raise a WO for PO 12345 (SKU ABC-123) — arriving Friday, no WO yet.",
+        )
+        uploaded = st.file_uploader(
+            "Attach a file (optional)",
+            help="e.g. the 'Download this list (CSV)' export from a panel.",
         )
         submitted = st.form_submit_button("Send to Slack", type="primary", use_container_width=True)
 
@@ -145,13 +237,22 @@ def _slack_dialog():
         if not sender:
             st.error("Pick who the message is from first.")
             return
-        if target_label.startswith("📢"):
-            target = {"kind": "channel"}
+        if not target_label:
+            st.error("Pick a channel or person to send to.")
+            return
+        if target_label.startswith("📢 "):
+            label = target_label[2:].strip()
+            target = {"kind": "channel", "channel_id": channels.get(label), "name": label}
         else:
             nm = target_label.split("·", 1)[1].strip()
             target = {"kind": "dm", "user_id": people.get(nm), "name": nm}
+
+        upload = None
+        if uploaded is not None:
+            upload = {"name": uploaded.name, "bytes": uploaded.getvalue()}
+
         with st.spinner("Sending…"):
-            ok, msg = _slack_send(cfg, sender, target, note)
+            ok, msg = _slack_send(cfg, sender, target, note, upload=upload)
         if ok:
             st.success(f"✅ {msg}")
             st.caption("You can close this dialog.")

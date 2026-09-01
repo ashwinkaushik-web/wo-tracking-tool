@@ -2,68 +2,76 @@
 
 > Feature module: `slack_messaging/` · entry point: `slack_messenger_button()` imported in `app.py`.
 
-The WO Tracking Tool has a **💬 Slack** button in the top-right header. It opens a
-small popup where a user picks who they are, chooses to post to the **team channel**
-or **DM a person**, types a message, and sends it to Slack.
+The WO Tracking Tool has a **💬 Slack** button in the header. It opens a popup where a
+user picks who they are, chooses a **channel** or a **person (DM)**, types a message,
+optionally **attaches a file**, and sends it to Slack.
 
-Nothing works until the secrets below are added. No token or ID lives in the code —
-everything is read from `st.secrets`.
+Nothing works until the secrets below are added. No token or ID lives in the code.
 
 ---
 
 ## 1. Create a Slack app + bot token
 
-1. Go to <https://api.slack.com/apps> → **Create New App** → *From scratch*.
-2. Name it (e.g. `WO Tracker Bot`) and pick the workspace.
-3. **OAuth & Permissions** → *Scopes* → *Bot Token Scopes*, add:
+1. <https://api.slack.com/apps> → **Create New App** → *From scratch* → name it, pick the workspace.
+2. **OAuth & Permissions** → **Bot Token Scopes**, add:
    - `chat:write` — post messages
    - `im:write` — open/DM a person
-   - `users:read` *(optional)* — nice-to-have for future name lookups
-4. **Install to Workspace** → approve. Copy the **Bot User OAuth Token** (starts with `xoxb-`).
-5. **Invite the bot to the target channel**: in Slack, open the channel and type
-   `/invite @WO Tracker Bot`. A bot can only post to channels it's a member of.
+   - `files:write` — **attach files** (required for the file picker)
+   - `users:read` *(optional)*
+3. **Install to Workspace** → **Allow** → copy the **Bot User OAuth Token** (`xoxb-...`).
+   - If you add `files:write` later, you must **reinstall** the app for it to take effect,
+     then re-copy the token.
+4. **Invite the bot to every channel it should post to:** in Slack, in that channel, run
+   `/invite @<your bot name>`. A bot can only post/upload where it is a member.
 
-## 2. Find the IDs you need
+## 2. Find the IDs
 
-- **Channel ID** — open the channel in Slack → *channel name* → *About* → bottom shows
-  an ID like `C0123456789`. (Or right-click the channel → *Copy link*; the last path
-  segment is the ID.)
-- **User IDs** (for the people dropdown / DMs) — click a person's profile →
-  *⋮ (More)* → *Copy member ID* → `U0123456789`.
+- **Channel ID** — open the channel → click its name → *About* → bottom shows `C0123456789`.
+- **User IDs** — click a person → *View full profile* → *⋮ More* → *Copy member ID* → `U0123456789`.
+  (The `U…` is the person. A `D…` id is a DM thread — don't use that here.)
 
 ## 3. Add the secrets
 
-In **Streamlit Community Cloud** → your app → *⋮* → **Settings → Secrets**, add:
+Streamlit Cloud → app → **Settings → Secrets**, add **below** the `[snowflake]` block:
 
 ```toml
 [slack]
-bot_token    = "xoxb-your-token-here"
-channel_id   = "C0123456789"
-channel_name = "#wo-tracker"          # display label only
+bot_token = "xoxb-your-token-here"
 
+# One line per channel the bot can post to (label -> channel ID).
+# Invite the bot to each of these channels.
+[slack.channels]
+"#wo-trial"     = "C0BU1CU0885"
+"#eu-warehouse" = "C0XXXXXXXXX"
+
+# One line per person for the From dropdown / DMs (name -> user ID).
 [slack.people]
-"Ashwin Kaushik" = "U0123456789"
-"Owen Smith"     = "U0987654321"
-# add one line per person who should appear in the "From" / "DM" dropdowns
+"Ashwin Kaushik" = "U083SSCU5ML"
+"Owen Davies"    = "U0987654321"
 ```
 
-For **local dev**, put the same block in `.streamlit/secrets.toml` (already gitignored).
+> **Adding more later:** just add another line under `[slack.channels]` (with an
+> `/invite`) or `[slack.people]`, then Save. No code change needed.
+
+Back-compat: the old single `channel_id` / `channel_name` pair still works if present.
 
 ## 4. Test
 
-- Redeploy / rerun the app. Click **💬 Slack** in the header.
-- If secrets are missing, the popup shows a "not configured yet" note instead of the form.
-- Pick your name, choose **📢 Channel** or **📩 DM · <name>**, type a note, **Send to Slack**.
-- Success/failure is shown inline in the popup. A failure quotes Slack's error
-  (e.g. `not_in_channel` → invite the bot; `channel_not_found` → wrong channel_id).
+- Reload the app → **💬 Slack** → pick From, a channel or DM, type a note, optionally
+  attach a file, **Send to Slack**.
+- Success/failure shows inline. Failures quote Slack's error.
 
 ---
 
+## Errors → fixes
+
+- `not_in_channel` → invite the bot to that channel.
+- `channel_not_found` → wrong channel ID.
+- `missing_scope` → add the scope in step 1, then **reinstall** the app.
+- file upload `missing_scope` / `access_denied` → add **`files:write`** and reinstall.
+
 ## Notes / limits
 
-- **No login layer**, so the sender is self-selected from the dropdown — it's an
-  honesty field, not authenticated identity.
-- The button is visible to anyone with the app URL. If that becomes a concern, gate
-  the app behind Streamlit's auth or a shared password.
-- Messages are **fire-and-forget** (no logging yet). A Google-Sheet or Snowflake
-  request log can be added later if the team wants an audit trail.
+- **No login layer** — the sender is self-selected, not authenticated.
+- Anyone with the app URL can send. Gate the app if that's a concern.
+- Files are uploaded straight to Slack; keep attachments reasonably sized.
