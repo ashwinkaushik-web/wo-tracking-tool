@@ -852,6 +852,8 @@ def storage_wo_view(s_wos, s_items):
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
     fitems = s_items[s_items["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(fitems, filtered)
+    if render_flag_guide_inline is not None and "top_block_reason" in filtered.columns:
+        render_flag_guide_inline(set(filtered["top_block_reason"].dropna()))
     display = filtered[
         ["work_order_number", "earliest_ship", "warehouse", "top_brand", "items", "open_items",
          "pfs_blocks", "top_block_reason", "orig", "processed", "pct", "max_age"]
@@ -941,6 +943,8 @@ def storage_item_view(s_items, s_wos):
     filtered = hide_unlisted(filtered, "hl_sit")
     fwos = s_wos[s_wos["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(filtered, fwos)
+    if render_flag_guide_inline is not None and "block_reason_pfs" in filtered.columns:
+        render_flag_guide_inline(set(filtered["block_reason_pfs"].dropna()))
     display = filtered[
         ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
          "master_id", "listing_id", "finished_good_name", "source_brand",
