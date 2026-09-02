@@ -169,6 +169,13 @@ def _entries_for(reasons):
     return out
 
 
+def flag_action(text):
+    """Short recommended action for a single reason/coverage value (for a per-row
+    'What to do' table column). Returns '' if the flag isn't in the guide."""
+    entries = _entries_for([text])
+    return entries[0]["action"] if entries else ""
+
+
 def render_flag_guide_inline(reasons, title="ℹ️ What these flags mean & what to do", expanded=False):
     """Compact, in-panel guidance — only the flags actually present in this panel."""
     entries = _entries_for(reasons)
