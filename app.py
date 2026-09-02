@@ -63,6 +63,7 @@ QUERY_PATH = Path(__file__).parent / "queries" / "wo_tracker.sql"
 PO_QUERY_PATH = Path(__file__).parent / "queries" / "po_tracker.sql"
 PO_WO_AGG_PATH = Path(__file__).parent / "queries" / "po_wo_agg.sql"
 PO_ITEM_GAP_PATH = Path(__file__).parent / "queries" / "po_item_wo_gap.sql"
+UNPICK_DETAIL_PATH = Path(__file__).parent / "queries" / "wo_unpickable_detail.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 
 FLAG_ORDER = [
@@ -881,6 +882,56 @@ def storage_wo_view(s_wos, s_items):
             st.rerun()
 
 
+def render_root_cause_detail(items, key):
+    """Per-item root-cause drill-down for the blocked items in a WO: exact block
+    status, marketplace, active unpickable reason(s) + resolvable qty, and the
+    recommended action. Degrades gracefully if the deeper query is unavailable."""
+    if items is None or len(items) == 0 or "is_blocked_pfs" not in items.columns:
+        return
+    blk = items[items["is_blocked_pfs"].fillna(False)].copy()
+    if blk.empty:
+        return
+    with st.expander(f"🔎 Root-cause detail ({len(blk)} blocked item(s))"):
+        base_cols = [c for c in ["work_order_item_id", "source_brand", "block_reason_pfs",
+                                 "marketplace", "marketplace_country", "pick_type",
+                                 "processing_status", "listing_id", "master_id"] if c in blk.columns]
+        d = blk[base_cols].copy()
+
+        det = fetch_wo_unpickable_detail()
+        if det is not None and "woi_id" in det.columns and "work_order_item_id" in d.columns:
+            keep = [c for c in ["woi_id", "active_reasons", "resolvable_qty"] if c in det.columns]
+            d = d.merge(det[keep], left_on="work_order_item_id", right_on="woi_id",
+                        how="left").drop(columns=["woi_id"], errors="ignore")
+        else:
+            st.caption("Deeper unpickable detail (resolvable qty / exact reasons) is unavailable — "
+                       "showing the block attributes from the main feed only.")
+
+        if flag_action is not None and "block_reason_pfs" in d.columns:
+            d["What to do"] = d["block_reason_pfs"].map(flag_action)
+
+        if {"marketplace", "marketplace_country"}.issubset(d.columns):
+            d["Marketplace"] = d.apply(
+                lambda r: f"{'' if pd.isna(r['marketplace']) else r['marketplace']}"
+                          + (f" ({r['marketplace_country']})"
+                             if pd.notna(r.get("marketplace_country")) and str(r.get("marketplace_country")).strip()
+                             else ""), axis=1)
+            d = d.drop(columns=["marketplace", "marketplace_country"])
+        elif "marketplace" in d.columns:
+            d = d.rename(columns={"marketplace": "Marketplace"})
+
+        d = d.rename(columns={
+            "work_order_item_id": "WOI ID", "source_brand": "Brand", "block_reason_pfs": "Reason",
+            "pick_type": "Pick Type", "processing_status": "Raw Block Status",
+            "active_reasons": "Active Reasons", "resolvable_qty": "Resolvable Qty",
+            "listing_id": "Listing", "master_id": "Master ID"})
+        order = [c for c in ["WOI ID", "Brand", "Reason", "Marketplace", "Active Reasons",
+                             "Resolvable Qty", "Raw Block Status", "Pick Type", "Listing",
+                             "Master ID", "What to do"] if c in d.columns]
+        st.dataframe(d[order], use_container_width=True, hide_index=True)
+        st.caption("Active unpickable rows only (deleted_at IS NULL). Resolvable Qty is blank for "
+                   "No-Inventory / Expired — nothing in the warehouse resolves those.")
+
+
 def storage_wo_drilldown(wo_id, s_items, s_wos):
     wo_row = s_wos[s_wos["work_order_number"] == wo_id].iloc[0]
     top1, top2 = st.columns([1, 5])
@@ -908,6 +959,7 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
         search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
     )
     filtered = hide_unlisted(filtered, f"hl_swo_items_{wo_id}")
+    render_root_cause_detail(filtered, f"rc_swo_{wo_id}")
     display = filtered[
         ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "master_id",
          "listing_id", "finished_good_name", "source_brand",
@@ -1055,6 +1107,7 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     if flag_counts:
         breakdown = " · ".join([f"{k}: **{v}**" for k, v in flag_counts.items()])
         st.markdown(f"**Flag breakdown:** {breakdown}")
+    render_root_cause_detail(items, f"rc_pwo_{wo_id}")
 
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
@@ -1227,6 +1280,30 @@ def fetch_po_item_wo_gap():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_wo_unpickable_detail():
+    """Per-WOI active unpickable-reason detail (queries/wo_unpickable_detail.sql):
+    reason name(s) + resolvable quantity. Defensive — returns None if the query
+    file or table is unavailable, so the drill-down degrades instead of crashing."""
+    try:
+        sql = UNPICK_DETAIL_PATH.read_text()
+        conn = get_snowflake_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [c[0].lower() for c in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+        finally:
+            cur.close()
+        for col in ("woi_id", "resolvable_qty", "reason_rows"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return None
 
 
 def _po_item_status(df):

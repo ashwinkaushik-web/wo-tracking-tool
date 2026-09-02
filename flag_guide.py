@@ -139,6 +139,49 @@ FLAG_GUIDE = [
         "source_label": "unpickable_reasons.md (id 1) · work_order_items_unpickable.md",
         "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
     },
+    {
+        "reason": "⌛ Inventory Expired (blocked WO item)",
+        "meaning": "On-hand stock for the item is past its expiration date, so it can't be picked.",
+        "cause": "Emitted in the 'nothing resolvable' branch when expired quantity > 0 and all resolvable "
+                 "buckets are 0. Carries no resolvable_quantity (a blank there isn't '0 units').",
+        "action": "Dispose/remove the expired lots and replenish with in-date stock — no in-system action "
+                  "unlocks these units.",
+        "confidence": "IS-backed (cause); action inferred",
+        "source_label": "unpickable_reasons.md (id 4) · work_order_items_unpickable.md",
+        "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
+    },
+    {
+        "reason": "⏳ Pending Sellable (blocked WO item)",
+        "meaning": "Inventory is present but in a pending-sellable state (not yet released), so currently "
+                   "unpickable but resolvable.",
+        "cause": "Driven by the total_pending_quantity bucket; emitted with a resolvable_quantity when the "
+                 "pending bucket is non-zero.",
+        "action": "Progress the inventory through its sellable transition (quality / putaway / status release) "
+                  "so the pending quantity becomes sellable.",
+        "confidence": "IS-backed (cause); action inferred",
+        "source_label": "unpickable_reasons.md (id 7) · work_order_items_unpickable.md",
+        "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
+    },
+    {
+        "reason": "📅 Missing Exp Date (blocked WO item)",
+        "meaning": "Stock is on hand but blocked because the required expiration-date data hasn't been entered.",
+        "cause": "missing_expiration_date flag → the pickable-qty-needing-exp-date bucket; emitted with a "
+                 "resolvable_quantity.",
+        "action": "Enter the missing expiration date for the affected lot/location; those units then become pickable.",
+        "confidence": "IS-backed",
+        "source_label": "unpickable_reasons.md (id 3) · work_order_items_unpickable.md",
+        "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
+    },
+    {
+        "reason": "🔖 Missing Lot (blocked WO item)",
+        "meaning": "Stock is on hand but blocked because a required lot number hasn't been entered.",
+        "cause": "missing_lot_number flag → the pickable-qty-needing-lot-number bucket; emitted with a "
+                 "resolvable_quantity.",
+        "action": "Enter the missing lot number for the affected inventory; those units then become pickable.",
+        "confidence": "IS-backed",
+        "source_label": "unpickable_reasons.md (id 8) · work_order_items_unpickable.md",
+        "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
+    },
 ]
 
 
@@ -155,6 +198,10 @@ _MATCH = {
     "📈 Over-receipt (received > ordered)": ["over-receipt", "over receipt", "received > ordered"],
     "🔁 Replen Needed (blocked WO item)": ["replen"],
     "🚱 No Inventory (blocked WO item)": ["no inventory", "no available inventory"],
+    "⌛ Inventory Expired (blocked WO item)": ["expired"],
+    "⏳ Pending Sellable (blocked WO item)": ["pending sellable"],
+    "📅 Missing Exp Date (blocked WO item)": ["missing exp", "expiration date", "requires expiration"],
+    "🔖 Missing Lot (blocked WO item)": ["missing lot", "lot number", "requires lot"],
 }
 
 
