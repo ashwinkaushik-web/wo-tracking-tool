@@ -580,17 +580,24 @@ COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler i
 
 
 def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=(), numpct_cols=(),
-                 date_cols=(), datetime_cols=(), pin_cols=(), color_rows=False, height=480):
+                 date_cols=(), datetime_cols=(), pin_cols=(), color_rows=False, height=480,
+                 link_cols=None):
     """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
     Selectable tables show a tick column; returns the ticked WO (or None).
 
     Every column also gets a hover "?" tooltip pulled from COLUMN_GLOSSARY, so
-    going to a column header tells you what it actually means."""
+    going to a column header tells you what it actually means.
+
+    link_cols: {column_name: display_text} — render that column (which holds URLs)
+    as a clickable link showing display_text (e.g. "↗ Shelf")."""
+    link_cols = link_cols or {}
     colcfg = {}
     pin_set = set(pin_cols)
     for c in display.columns:
         help_txt = COLUMN_GLOSSARY.get(c)  # None = no tooltip, which is fine
-        if c in pct_cols:
+        if c in link_cols:
+            colcfg[c] = st.column_config.LinkColumn(c, help=help_txt, display_text=link_cols[c])
+        elif c in pct_cols:
             colcfg[c] = st.column_config.ProgressColumn(
                 c, help=help_txt, min_value=0, max_value=100, format="%.1f%%")
         elif c in numpct_cols:
@@ -1537,9 +1544,24 @@ def _issue_types(val):
     return ", ".join(f"{k} ({v})" for k, v in d.items())
 
 
-def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260):
+def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260,
+               link_cols=None):
     render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
-                 pin_cols=pin_cols, color_rows=color_rows, height=height)
+                 pin_cols=pin_cols, color_rows=color_rows, height=height, link_cols=link_cols)
+
+
+# Shelf (order-management) deep link for a PO, keyed on the plain PO number.
+SHELF_PO_URL = "https://www.useshelf.com/order-management/po/preview/details/{}"
+
+
+def _add_shelf_link(d, po_col="PO #"):
+    """Return d with an 'Open' column linking each PO to its Shelf detail page."""
+    if po_col not in d.columns:
+        return d
+    d = d.copy()
+    d["Open"] = d[po_col].astype(str).str.strip().apply(
+        lambda x: SHELF_PO_URL.format(x) if x else "")
+    return d
 
 
 def overview_tab(df, wos):
@@ -1563,10 +1585,12 @@ def overview_tab(df, wos):
     except Exception:
         po_df = po_pos = None
 
-    def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False):
+    def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False,
+               link_cols=None):
         # Cap rendered rows for speed; the full total is already in the panel header.
         _ov_render(dshow.head(OV_MAX_ROWS), key, date_cols=date_cols,
-                   numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows)
+                   numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows,
+                   link_cols=link_cols)
         if len(dshow) > OV_MAX_ROWS:
             st.caption(f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}.")
 
@@ -1864,9 +1888,10 @@ def overview_tab(df, wos):
                             note=f"PO-level no-WO list — {len(d):,} POs placed/arriving with no linked "
                                  "work order (attached from WO Tracker). Please review / raise WOs.",
                             use_container_width=True)
+                d = _add_shelf_link(d)
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True)
+                       pin_cols=["PO #"], color_rows=True, link_cols={"Open": "↗ Shelf"})
 
         # G) PO items without full WO coverage — ITEM level (a PO can be
         # partly fine and partly a gap; different grain from panel F above).
@@ -1925,7 +1950,9 @@ def overview_tab(df, wos):
                             note=f"Item-level WO coverage gaps — {len(d):,} item-lines without full "
                                  "work-order coverage (attached from WO Tracker).",
                             use_container_width=True)
-                _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"], color_rows=True)
+                d = _add_shelf_link(d)
+                _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
+                       color_rows=True, link_cols={"Open": "↗ Shelf"})
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
