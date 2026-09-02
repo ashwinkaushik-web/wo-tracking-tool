@@ -227,7 +227,10 @@ def _slack_dialog():
             sender = st.text_input("From (your name)")
 
         targets = [f"📢 {c}" for c in chan_labels] + [f"📩 DM · {n}" for n in names]
-        target_label = st.selectbox("Send to", targets, index=0 if targets else None)
+        target_labels = st.multiselect(
+            "Send to (one or more)", targets,
+            default=targets[:1] if targets else [],
+            help="Pick any mix of channels and people — the message goes to all of them.")
 
         note = st.text_area(
             "Message", value=default_note, height=120,
@@ -250,15 +253,9 @@ def _slack_dialog():
         if not sender:
             st.error("Pick who the message is from first.")
             return
-        if not target_label:
-            st.error("Pick a channel or person to send to.")
+        if not target_labels:
+            st.error("Pick at least one channel or person to send to.")
             return
-        if target_label.startswith("📢 "):
-            label = target_label[2:].strip()
-            target = {"kind": "channel", "channel_id": channels.get(label), "name": label}
-        else:
-            nm = target_label.split("·", 1)[1].strip()
-            target = {"kind": "dm", "user_id": people.get(nm), "name": nm}
 
         # A freshly uploaded file wins; otherwise use the tool-provided attachment.
         upload = None
@@ -267,13 +264,25 @@ def _slack_dialog():
         elif tool_file and include_tool_file:
             upload = tool_file
 
-        with st.spinner("Sending…"):
-            ok, msg = _slack_send(cfg, sender, target, note, upload=upload)
-        if ok:
-            st.success(f"✅ {msg}")
+        # Fan out to every selected recipient; report per-recipient success/failure.
+        sent, failed = [], []
+        with st.spinner(f"Sending to {len(target_labels)} recipient(s)…"):
+            for label in target_labels:
+                if label.startswith("📢 "):
+                    nm = label[2:].strip()
+                    target = {"kind": "channel", "channel_id": channels.get(nm), "name": nm}
+                else:
+                    nm = label.split("·", 1)[1].strip()
+                    target = {"kind": "dm", "user_id": people.get(nm), "name": nm}
+                ok, msg = _slack_send(cfg, sender, target, note, upload=upload)
+                (sent if ok else failed).append((nm, msg))
+
+        if sent:
+            st.success("✅ Sent to: " + ", ".join(n for n, _ in sent))
+        if failed:
+            st.error("❌ Failed: " + "; ".join(f"{n} — {m}" for n, m in failed))
+        if sent and not failed:
             st.caption("You can close this dialog.")
-        else:
-            st.error(f"❌ Not sent — {msg}")
 
 
 def slack_messenger_button():
