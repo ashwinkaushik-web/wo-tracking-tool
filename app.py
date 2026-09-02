@@ -33,10 +33,11 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_send_panel_button = None
     slack_table_sender = None
 try:
-    from flag_guide import render_flag_guide, render_flag_guide_inline
+    from flag_guide import render_flag_guide, render_flag_guide_inline, flag_action
 except Exception:  # optional — never break the app if it's absent
     render_flag_guide = None
     render_flag_guide_inline = None
+    flag_action = None
 
 # ============================================================
 # CONFIG
@@ -863,6 +864,8 @@ def storage_wo_view(s_wos, s_items):
         "top_block_reason": "Top Reason", "orig": "Orig", "processed": "Processed",
         "pct": "% Processed", "max_age": "Age (d)", "earliest_ship": "Ship By",
     })
+    if flag_action is not None and "Top Reason" in display.columns:
+        display["What to do"] = display["Top Reason"].map(flag_action)
     cols = column_picker(list(display.columns), key="cols_swo", required=["WO"])
     display = display[cols]
 
@@ -962,6 +965,8 @@ def storage_item_view(s_items, s_wos):
         "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
         "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
     })
+    if flag_action is not None and "Reason" in display.columns:
+        display["What to do"] = display["Reason"].map(flag_action)
     cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
     display = display[cols]
 
@@ -1804,6 +1809,8 @@ def overview_tab(df, wos):
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
                 "days_overdue": "Days Overdue"})
+            if flag_action is not None:
+                d["What to do"] = d["Reason"].map(flag_action)
             if render_flag_guide_inline is not None:
                 render_flag_guide_inline(set(d["Reason"].dropna()))
             _panel(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
@@ -1985,6 +1992,10 @@ def overview_tab(df, wos):
                     "received_units": "Received", "outstanding_units": "Outstanding",
                     "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason"})
                 d["PO #"] = _ov_po_str(d["PO #"])
+                if flag_action is not None:
+                    _src = d["Reason"].astype(str)
+                    _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
+                    d["What to do"] = _src.map(flag_action)
                 _dlc2, _slc2 = st.columns(2)
                 with _dlc2:
                     st.download_button(
