@@ -119,6 +119,47 @@ FLAG_GUIDE = [
 ]
 
 
+# Substrings (lowercase) that map a panel's reason/coverage text to a guide entry.
+_MATCH = {
+    "🧾 PO placed/arriving with no work order": ["no work order", "placed/arriving", "no wo"],
+    "🧩 Genuine gap — needs WO raised": ["genuine gap"],
+    "✅ Fully received — WO likely not required": ["fully received"],
+    "🚫 PO reconciled/cancelled": ["reconcil", "cancel"],
+    "📦 Covered via Storage WO (not PO-linked)": ["storage wo"],
+    "🟠 Partial WO": ["partial"],
+    "🔴 Listing Failed (blocked WO item)": ["listing failed"],
+    "🔴 Listing Not Shippable (blocked WO item)": ["not shippable"],
+    "📈 Over-receipt (received > ordered)": ["over-receipt", "over receipt", "received > ordered"],
+}
+
+
+def _entries_for(reasons):
+    """Guide entries whose match-substrings appear in any of the given reason strings."""
+    reasons_l = [str(r).lower() for r in reasons if str(r).strip() and str(r).lower() != "nan"]
+    out = []
+    for e in FLAG_GUIDE:
+        subs = _MATCH.get(e["reason"], [])
+        if any(any(s in rl for s in subs) for rl in reasons_l):
+            out.append(e)
+    return out
+
+
+def render_flag_guide_inline(reasons, title="ℹ️ What these flags mean & what to do", expanded=False):
+    """Compact, in-panel guidance — only the flags actually present in this panel."""
+    entries = _entries_for(reasons)
+    if not entries:
+        return
+    with st.expander(title, expanded=expanded):
+        for e in entries:
+            st.markdown(
+                f"**{e['reason']}** — {e['meaning']}  \n"
+                f"→ *{e['action']}*  \n"
+                f"<small>Root cause: {e['cause']} "
+                f"([{e['source_label']}]({_IS_REPO}{e['source_path']}) · Information Station)</small>",
+                unsafe_allow_html=True,
+            )
+
+
 def render_flag_guide(expanded=False):
     """Render the Flag guide as one expandable Overview section."""
     with st.expander("ℹ️ Flag guide — why these happen & what to do", expanded=expanded):
