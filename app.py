@@ -33,9 +33,10 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_send_panel_button = None
     slack_table_sender = None
 try:
-    from flag_guide import render_flag_guide
+    from flag_guide import render_flag_guide, render_flag_guide_inline
 except Exception:  # optional — never break the app if it's absent
     render_flag_guide = None
+    render_flag_guide_inline = None
 
 # ============================================================
 # CONFIG
@@ -851,6 +852,8 @@ def storage_wo_view(s_wos, s_items):
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
     fitems = s_items[s_items["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(fitems, filtered)
+    if render_flag_guide_inline is not None and "top_block_reason" in filtered.columns:
+        render_flag_guide_inline(set(filtered["top_block_reason"].dropna()))
     display = filtered[
         ["work_order_number", "earliest_ship", "warehouse", "top_brand", "items", "open_items",
          "pfs_blocks", "top_block_reason", "orig", "processed", "pct", "max_age"]
@@ -940,6 +943,8 @@ def storage_item_view(s_items, s_wos):
     filtered = hide_unlisted(filtered, "hl_sit")
     fwos = s_wos[s_wos["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(filtered, fwos)
+    if render_flag_guide_inline is not None and "block_reason_pfs" in filtered.columns:
+        render_flag_guide_inline(set(filtered["block_reason_pfs"].dropna()))
     display = filtered[
         ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
          "master_id", "listing_id", "finished_good_name", "source_brand",
@@ -1799,6 +1804,8 @@ def overview_tab(df, wos):
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
                 "days_overdue": "Days Overdue"})
+            if render_flag_guide_inline is not None:
+                render_flag_guide_inline(set(d["Reason"].dropna()))
             _panel(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
 
     # B) Overdue, still-open WOIs
@@ -1897,6 +1904,8 @@ def overview_tab(df, wos):
             st.caption("Placed or arriving POs with no linked work order — flagged from the moment "
                        "they're placed, so a WO can be raised before arrival. "
                        "Reconciled/cancelled POs are excluded.")
+            if render_flag_guide_inline is not None and nowo is not None and not nowo.empty:
+                render_flag_guide_inline(["no work order"])
             if nowo is None:
                 st.caption("PO→WO link unavailable (couldn't load the WO rollup).")
             elif nowo.empty:
@@ -1990,6 +1999,11 @@ def overview_tab(df, wos):
                             note=f"Item-level WO coverage gaps — {len(d):,} item-lines without full "
                                  "work-order coverage (attached from WO Tracker).",
                             use_container_width=True)
+                if render_flag_guide_inline is not None:
+                    _gap_reasons = set(item_gap["reason"].dropna())
+                    if (item_gap["coverage_state"] == "Partial WO").any():
+                        _gap_reasons.add("Partial WO")
+                    render_flag_guide_inline(_gap_reasons)
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
                        color_rows=True,
                        slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],

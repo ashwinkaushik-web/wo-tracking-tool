@@ -116,7 +116,73 @@ FLAG_GUIDE = [
         "source_label": "po_wo_flow.md (Overage Detection)",
         "source_path": "context/data/01-architecture/flows/po_wo_flow.md",
     },
+    {
+        "reason": "🔁 Replen Needed (blocked WO item)",
+        "meaning": "Units exist in the building but not in a pickable location, so the line can't be "
+                   "filled until stock is moved into a pickable bin.",
+        "cause": "The inventory rollup classes these units as non-pickable (on-hand but not "
+                 "marketplace-order-pickable). The row's resolvable_quantity is how many units a replen unlocks.",
+        "action": "Replenish the SKU — move stock into a pickable location. The resolvable_quantity on the "
+                  "row tells you how many units that frees up for picking.",
+        "confidence": "IS-backed",
+        "source_label": "unpickable_reasons.md (id 2) · work_order_items_unpickable.md",
+        "source_path": "context/data/02-database/tables/stg_amaczar/unpickable_reasons.md",
+    },
+    {
+        "reason": "🚱 No Inventory (blocked WO item)",
+        "meaning": "No usable inventory exists to satisfy the line — nothing pickable, replenishable, or pending.",
+        "cause": "Emitted when total resolvable (replen + expiry + lot + pending) = 0 and the stock isn't merely "
+                 "expired. These rows carry no resolvable_quantity because there's nothing in the warehouse to resolve.",
+        "action": "No in-warehouse move unlocks it — it clears only when new inventory is brought in "
+                  "(inbound/receipt). Check sourcing / raise a PO or IR if the demand is still needed.",
+        "confidence": "IS-backed (meaning & cause); the sourcing next-step is inferred",
+        "source_label": "unpickable_reasons.md (id 1) · work_order_items_unpickable.md",
+        "source_path": "context/data/08-github-code/modules/work_order_items_unpickable.md",
+    },
 ]
+
+
+# Substrings (lowercase) that map a panel's reason/coverage text to a guide entry.
+_MATCH = {
+    "🧾 PO placed/arriving with no work order": ["no work order", "placed/arriving", "no wo"],
+    "🧩 Genuine gap — needs WO raised": ["genuine gap"],
+    "✅ Fully received — WO likely not required": ["fully received"],
+    "🚫 PO reconciled/cancelled": ["reconcil", "cancel"],
+    "📦 Covered via Storage WO (not PO-linked)": ["storage wo"],
+    "🟠 Partial WO": ["partial"],
+    "🔴 Listing Failed (blocked WO item)": ["listing failed"],
+    "🔴 Listing Not Shippable (blocked WO item)": ["not shippable"],
+    "📈 Over-receipt (received > ordered)": ["over-receipt", "over receipt", "received > ordered"],
+    "🔁 Replen Needed (blocked WO item)": ["replen"],
+    "🚱 No Inventory (blocked WO item)": ["no inventory", "no available inventory"],
+}
+
+
+def _entries_for(reasons):
+    """Guide entries whose match-substrings appear in any of the given reason strings."""
+    reasons_l = [str(r).lower() for r in reasons if str(r).strip() and str(r).lower() != "nan"]
+    out = []
+    for e in FLAG_GUIDE:
+        subs = _MATCH.get(e["reason"], [])
+        if any(any(s in rl for s in subs) for rl in reasons_l):
+            out.append(e)
+    return out
+
+
+def render_flag_guide_inline(reasons, title="ℹ️ What these flags mean & what to do", expanded=False):
+    """Compact, in-panel guidance — only the flags actually present in this panel."""
+    entries = _entries_for(reasons)
+    if not entries:
+        return
+    with st.expander(title, expanded=expanded):
+        for e in entries:
+            st.markdown(
+                f"**{e['reason']}** — {e['meaning']}  \n"
+                f"→ *{e['action']}*  \n"
+                f"<small>Root cause: {e['cause']} "
+                f"([{e['source_label']}]({_IS_REPO}{e['source_path']}) · Information Station)</small>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_flag_guide(expanded=False):
