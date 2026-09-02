@@ -596,9 +596,13 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
     link_cols = link_cols or {}
     colcfg = {}
     pin_set = set(pin_cols)
+    po_cols = [c for c in display.columns if c in PO_LINK_COLUMNS]
     for c in display.columns:
         help_txt = COLUMN_GLOSSARY.get(c)  # None = no tooltip, which is fine
-        if c in link_cols:
+        if c in po_cols:
+            # PO number itself becomes a clickable Shelf link (number stays visible).
+            colcfg[c] = st.column_config.LinkColumn(c, help=help_txt, display_text=r"details/(\d+)")
+        elif c in link_cols:
             colcfg[c] = st.column_config.LinkColumn(c, help=help_txt, display_text=link_cols[c])
         elif c in pct_cols:
             colcfg[c] = st.column_config.ProgressColumn(
@@ -624,9 +628,18 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
             slack_table_sender(key, df, label_cols=slack_label_cols,
                                filename=slack_filename, allow_whole=slack_whole)
 
+    # For rendering only, swap PO-number columns for their Shelf URLs so LinkColumn
+    # can make them clickable. The original `display` (plain numbers) is what the
+    # Slack sender attaches and what Ctrl+C copies — exports/copy stay clean.
+    render_df = display
+    if po_cols:
+        render_df = display.copy()
+        for c in po_cols:
+            render_df[c] = _po_link_series(render_df[c])
+
     if selectable:
         event = st.dataframe(
-            display, use_container_width=True, hide_index=True, height=height,
+            render_df, use_container_width=True, hide_index=True, height=height,
             on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
         )
         _slack(display)
@@ -635,13 +648,13 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
             return display.iloc[rows[0]][select_col]
         return None
 
-    data = display
+    data = render_df
     if color_rows:
-        if len(display) <= COLOR_ROW_LIMIT:
+        if len(render_df) <= COLOR_ROW_LIMIT:
             try:
-                data = display.style.apply(_row_style, axis=1)
+                data = render_df.style.apply(_row_style, axis=1)
             except Exception:
-                data = display
+                data = render_df
         else:
             st.caption(
                 f"Row colours are hidden above {COLOR_ROW_LIMIT:,} rows to keep the table fast — "
@@ -1566,17 +1579,20 @@ def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_row
 
 
 # Shelf (order-management) deep link for a PO, keyed on the plain PO number.
+# render_table() turns any of these display columns into clickable Shelf links.
 SHELF_PO_URL = "https://www.useshelf.com/order-management/po/preview/details/{}"
+PO_LINK_COLUMNS = {"PO #"}
 
 
-def _add_shelf_link(d, po_col="PO #"):
-    """Return d with an 'Open' column linking each PO to its Shelf detail page."""
-    if po_col not in d.columns:
-        return d
-    d = d.copy()
-    d["Open"] = d[po_col].astype(str).str.strip().apply(
-        lambda x: SHELF_PO_URL.format(x) if x else "")
-    return d
+def _po_link_series(s):
+    """Map a PO-number column to Shelf URLs (blank for non-numeric/empty)."""
+    def _u(x):
+        x = str(x).strip()
+        if not x or x.lower() == "nan":
+            return ""
+        x = x.split(".")[0]  # tolerate "149348.0"
+        return SHELF_PO_URL.format(x) if x.isdigit() else ""
+    return s.map(_u)
 
 
 def overview_tab(df, wos):
@@ -1905,10 +1921,9 @@ def overview_tab(df, wos):
                             note=f"PO-level no-WO list — {len(d):,} POs placed/arriving with no linked "
                                  "work order (attached from WO Tracker). Please review / raise WOs.",
                             use_container_width=True)
-                d = _add_shelf_link(d)
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True, link_cols={"Open": "↗ Shelf"},
+                       pin_cols=["PO #"], color_rows=True,
                        slack_whole=False, slack_label_cols=["PO #", "Vendor"],
                        slack_filename="po_without_wo.csv")
 
@@ -1969,9 +1984,8 @@ def overview_tab(df, wos):
                             note=f"Item-level WO coverage gaps — {len(d):,} item-lines without full "
                                  "work-order coverage (attached from WO Tracker).",
                             use_container_width=True)
-                d = _add_shelf_link(d)
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
-                       color_rows=True, link_cols={"Open": "↗ Shelf"},
+                       color_rows=True,
                        slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],
                        slack_filename="po_items_without_full_wo.csv")
     else:
