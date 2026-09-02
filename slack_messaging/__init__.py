@@ -36,7 +36,7 @@ import urllib.error
 
 import streamlit as st
 
-__all__ = ["slack_messenger_button", "slack_send_panel_button"]
+__all__ = ["slack_messenger_button", "slack_send_panel_button", "slack_table_sender"]
 
 
 def _slack_cfg():
@@ -305,3 +305,66 @@ def slack_send_panel_button(key, *, df, filename, note="", label="📤 Send to S
             },
         }
         _slack_dialog()
+
+
+def _row_note(row, columns):
+    """Compact 'field: value' summary of one row for the message body."""
+    lines = []
+    for c in columns:
+        if c == "Open":
+            continue
+        v = row[c]
+        s = "" if v is None else str(v)
+        if s.strip() and s.lower() != "nan":
+            lines.append(f"• *{c}*: {s}")
+    return "\n".join(lines)
+
+
+def slack_table_sender(key, df, *, label_cols=None, filename="wo_tracker_table.csv",
+                       allow_whole=True):
+    """Compact '📤 Send to Slack' control shown under any table. Lets the user send
+    the whole (visible) table as a CSV, or pick a single line and send just that row
+    (as a 1-row CSV + a prefilled details message). Works on every table via
+    render_table; the dialog itself handles the not-configured case."""
+    if df is None or len(df) == 0:
+        return
+    cols = [c for c in (label_cols or list(df.columns)[:3]) if c in df.columns] or list(df.columns[:1])
+
+    with st.expander("📤 Send to Slack"):
+        modes = (["A single line", "Whole table"] if allow_whole else ["A single line"])
+        mode = st.radio("What to send", modes, horizontal=True,
+                        key=f"{key}_slk_mode", label_visibility="collapsed")
+
+        if mode == "Whole table":
+            if st.button("Compose in Slack →", key=f"{key}_slk_all", use_container_width=True):
+                st.session_state["_slack_ctx"] = {
+                    "note": f"{len(df):,} rows from the WO Tracking Tool (attached).",
+                    "attachment": {"name": filename, "bytes": df.to_csv(index=False).encode("utf-8")},
+                }
+                _slack_dialog()
+        else:
+            # Cap the dropdown so a huge table doesn't build a giant widget every run.
+            pick_cap = 250
+            n_opts = min(len(df), pick_cap)
+            if len(df) > pick_cap:
+                st.caption(f"Showing the first {pick_cap:,} of {len(df):,} rows — "
+                           "filter/search the table to reach the rest.")
+
+            def _fmt(i):
+                r = df.iloc[i]
+                parts = [str(r[c]) for c in cols
+                         if str(r[c]).strip() and str(r[c]).lower() != "nan"]
+                return " · ".join(parts) if parts else f"Row {i + 1}"
+
+            idx = st.selectbox("Pick a line", options=list(range(n_opts)), format_func=_fmt,
+                               index=None, placeholder="Choose a line…", key=f"{key}_slk_pick")
+            if st.button("Compose in Slack →", key=f"{key}_slk_row",
+                         disabled=(idx is None), use_container_width=True) and idx is not None:
+                row = df.iloc[[idx]]
+                note = "Single line flagged from the WO Tracking Tool —\n" + _row_note(row.iloc[0], df.columns)
+                st.session_state["_slack_ctx"] = {
+                    "note": note,
+                    "attachment": {"name": filename.replace(".csv", "_line.csv"),
+                                   "bytes": row.to_csv(index=False).encode("utf-8")},
+                }
+                _slack_dialog()

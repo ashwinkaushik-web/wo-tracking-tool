@@ -26,10 +26,12 @@ from cryptography.hazmat.primitives import serialization
 from datetime import datetime
 from pathlib import Path
 try:
-    from slack_messaging import slack_messenger_button, slack_send_panel_button
+    from slack_messaging import (slack_messenger_button, slack_send_panel_button,
+                                 slack_table_sender)
 except Exception:  # feature is optional — never break the app if it's absent
     slack_messenger_button = None
     slack_send_panel_button = None
+    slack_table_sender = None
 
 # ============================================================
 # CONFIG
@@ -581,7 +583,8 @@ COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler i
 
 def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=(), numpct_cols=(),
                  date_cols=(), datetime_cols=(), pin_cols=(), color_rows=False, height=480,
-                 link_cols=None):
+                 link_cols=None, slack=True, slack_label_cols=None, slack_whole=True,
+                 slack_filename="wo_tracker_table.csv"):
     """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
     Selectable tables show a tick column; returns the ticked WO (or None).
 
@@ -614,11 +617,19 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
         elif help_txt:
             colcfg[c] = st.column_config.Column(c, help=help_txt)
 
+    def _slack(df):
+        # Universal "📤 Send to Slack" control under every table (whole table or a
+        # single line, attached as CSV). No-op if the feature module isn't loaded.
+        if slack and slack_table_sender is not None:
+            slack_table_sender(key, df, label_cols=slack_label_cols,
+                               filename=slack_filename, allow_whole=slack_whole)
+
     if selectable:
         event = st.dataframe(
             display, use_container_width=True, hide_index=True, height=height,
             on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
         )
+        _slack(display)
         rows = event.selection.rows
         if rows and select_col in display.columns:
             return display.iloc[rows[0]][select_col]
@@ -637,6 +648,7 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
                 "filter or search to narrow it down and the colours come back."
             )
     st.dataframe(data, use_container_width=True, hide_index=True, height=height, column_config=colcfg)
+    _slack(display)
     return None
 
 
@@ -1545,9 +1557,12 @@ def _issue_types(val):
 
 
 def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260,
-               link_cols=None):
+               link_cols=None, slack_whole=True, slack_label_cols=None,
+               slack_filename="wo_tracker_table.csv"):
     render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
-                 pin_cols=pin_cols, color_rows=color_rows, height=height, link_cols=link_cols)
+                 pin_cols=pin_cols, color_rows=color_rows, height=height, link_cols=link_cols,
+                 slack_whole=slack_whole, slack_label_cols=slack_label_cols,
+                 slack_filename=slack_filename)
 
 
 # Shelf (order-management) deep link for a PO, keyed on the plain PO number.
@@ -1586,11 +1601,13 @@ def overview_tab(df, wos):
         po_df = po_pos = None
 
     def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False,
-               link_cols=None):
+               link_cols=None, slack_whole=True, slack_label_cols=None,
+               slack_filename="wo_tracker_table.csv"):
         # Cap rendered rows for speed; the full total is already in the panel header.
         _ov_render(dshow.head(OV_MAX_ROWS), key, date_cols=date_cols,
                    numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows,
-                   link_cols=link_cols)
+                   link_cols=link_cols, slack_whole=slack_whole,
+                   slack_label_cols=slack_label_cols, slack_filename=slack_filename)
         if len(dshow) > OV_MAX_ROWS:
             st.caption(f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}.")
 
@@ -1891,7 +1908,9 @@ def overview_tab(df, wos):
                 d = _add_shelf_link(d)
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True, link_cols={"Open": "↗ Shelf"})
+                       pin_cols=["PO #"], color_rows=True, link_cols={"Open": "↗ Shelf"},
+                       slack_whole=False, slack_label_cols=["PO #", "Vendor"],
+                       slack_filename="po_without_wo.csv")
 
         # G) PO items without full WO coverage — ITEM level (a PO can be
         # partly fine and partly a gap; different grain from panel F above).
@@ -1952,7 +1971,9 @@ def overview_tab(df, wos):
                             use_container_width=True)
                 d = _add_shelf_link(d)
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
-                       color_rows=True, link_cols={"Open": "↗ Shelf"})
+                       color_rows=True, link_cols={"Open": "↗ Shelf"},
+                       slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],
+                       slack_filename="po_items_without_full_wo.csv")
     else:
         st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
