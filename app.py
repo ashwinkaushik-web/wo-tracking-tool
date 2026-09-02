@@ -32,6 +32,10 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_messenger_button = None
     slack_send_panel_button = None
     slack_table_sender = None
+try:
+    from flag_guide import render_flag_guide
+except Exception:  # optional — never break the app if it's absent
+    render_flag_guide = None
 
 # ============================================================
 # CONFIG
@@ -1779,6 +1783,8 @@ def overview_tab(df, wos):
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
     st.caption("Worst cases first. Header counts are the full totals; each table shows the top 100.")
+    if render_flag_guide is not None:
+        render_flag_guide()
 
     # A) Blocked WOIs (PFS)
     blocked = df[df["is_blocked_pfs"].fillna(False)].copy()
