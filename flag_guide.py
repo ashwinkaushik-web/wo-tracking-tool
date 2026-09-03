@@ -223,6 +223,52 @@ def flag_action(text):
     return entries[0]["action"] if entries else ""
 
 
+def flag_action_detailed(reason, *, marketplace=None, resolvable_qty=None, active_reasons=None):
+    """Per-line 'What to do', made specific with this row's own attributes instead of
+    the same boilerplate sentence for every row. Falls back to flag_action(reason)
+    when no extra detail is available (e.g. the deeper unpickable-detail query didn't
+    return a match for this WOI).
+
+    marketplace: "<name> (<country>)" or similar display string, or None/blank.
+    resolvable_qty: units a fix would free up, or None/NaN (genuinely blank for
+        No-Inventory / Inventory-Expired — don't read that as "0 units").
+    active_reasons: the exact stacked reason string for this line (e.g.
+        "Listing Failed Eligibility Check | Listing is Marked Not Shippable"),
+        or None if only one reason applies / not available.
+    """
+    base = flag_action(reason)
+    if not base:
+        return ""
+
+    bits = []
+    # Multiple reasons stacked on one line is itself part of the root cause —
+    # surface it before the generic action so a "double-blocked" line reads as such.
+    if active_reasons and str(active_reasons).strip():
+        parts = [p.strip() for p in str(active_reasons).split("|") if p.strip()]
+        if len(parts) > 1:
+            bits.append(f"This line is blocked by {len(parts)} reasons: {', '.join(parts)}.")
+
+    if marketplace and str(marketplace).strip():
+        bits.append(f"Marketplace: {marketplace}.")
+
+    try:
+        qty_ok = resolvable_qty is not None and not (
+            isinstance(resolvable_qty, float) and resolvable_qty != resolvable_qty  # NaN check, no numpy/pandas dep
+        )
+    except Exception:
+        qty_ok = False
+    if qty_ok and str(resolvable_qty).strip():
+        try:
+            qty_num = float(resolvable_qty)
+            bits.append(f"Fixing this unlocks {qty_num:,.0f} unit(s).")
+        except (TypeError, ValueError):
+            pass
+
+    if not bits:
+        return base
+    return base + " " + " ".join(bits)
+
+
 def render_flag_guide_inline(reasons, title="ℹ️ What these flags mean & what to do", expanded=False):
     """Compact, in-panel guidance — only the flags actually present in this panel."""
     entries = _entries_for(reasons)

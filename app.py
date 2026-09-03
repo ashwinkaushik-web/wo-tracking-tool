@@ -36,12 +36,51 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_table_sender = None
 _FLAG_GUIDE_ERROR = None
 try:
-    from flag_guide import render_flag_guide, render_flag_guide_inline, flag_action
+    from flag_guide import (render_flag_guide, render_flag_guide_inline, flag_action,
+                            flag_action_detailed)
 except Exception as _flag_exc:  # keep the app up, but do not hide the failure
     render_flag_guide = None
     render_flag_guide_inline = None
     flag_action = None
+    flag_action_detailed = None
     _FLAG_GUIDE_ERROR = f"{type(_flag_exc).__name__}: {_flag_exc}"
+
+
+def _add_what_to_do(display, reason_col="Reason", woi_col="WOI ID"):
+    """Add a per-row 'What to do' column. Where possible this is made SPECIFIC to
+    the line — its marketplace, the exact stacked reason(s), and the resolvable
+    quantity a fix would unlock — by merging in fetch_wo_unpickable_detail() keyed
+    on WOI ID. Falls back to the generic flag_action(reason) when that deeper
+    detail isn't available (e.g. no WOI ID column, or the query is unreachable)."""
+    if reason_col not in display.columns:
+        return display
+    if flag_action_detailed is None:
+        if flag_action is not None:
+            display["What to do"] = display[reason_col].map(flag_action)
+        return display
+
+    has_mkt = {"marketplace", "marketplace_country"}.issubset(display.columns)
+    if woi_col in display.columns:
+        det = fetch_wo_unpickable_detail()
+        if det is not None and "woi_id" in det.columns:
+            det_keep = [c for c in ["woi_id", "active_reasons", "resolvable_qty"] if c in det.columns]
+            display = display.merge(det[det_keep], left_on=woi_col, right_on="woi_id",
+                                    how="left").drop(columns=["woi_id"], errors="ignore")
+
+    def _mkt(row):
+        if not has_mkt or pd.isna(row.get("marketplace")):
+            return None
+        country = row.get("marketplace_country")
+        suffix = f" ({country})" if pd.notna(country) and str(country).strip() else ""
+        return f"{row['marketplace']}{suffix}"
+
+    display["What to do"] = display.apply(
+        lambda r: flag_action_detailed(
+            r[reason_col], marketplace=_mkt(r),
+            resolvable_qty=r.get("resolvable_qty"), active_reasons=r.get("active_reasons"),
+        ), axis=1)
+    return display.drop(columns=["marketplace", "marketplace_country", "active_reasons",
+                                 "resolvable_qty"], errors="ignore")
 
 
 def _running_build_label() -> str:
@@ -1034,14 +1073,15 @@ def storage_item_view(s_items, s_wos):
     storage_kpi_strip(filtered, fwos)
     if render_flag_guide_inline is not None and "block_reason_pfs" in filtered.columns:
         render_flag_guide_inline(set(filtered["block_reason_pfs"].dropna()))
-    display = filtered[
-        ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
-         "master_id", "listing_id", "finished_good_name", "source_brand",
-         "warehouse", "status_simple", "pick_type",
-         "processing_status", "block_reason_pfs", "original_request", "current_request",
-         "processed", "order_created", "shipped", "storage", "woi_processing_pct",
-         "age_days_from_created", "days_overdue"]
-    ].rename(columns={
+    keep_cols = ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
+                 "master_id", "listing_id", "finished_good_name", "source_brand",
+                 "warehouse", "status_simple", "pick_type",
+                 "processing_status", "block_reason_pfs", "original_request", "current_request",
+                 "processed", "order_created", "shipped", "storage", "woi_processing_pct",
+                 "age_days_from_created", "days_overdue"]
+    if {"marketplace", "marketplace_country"}.issubset(filtered.columns):
+        keep_cols += ["marketplace", "marketplace_country"]
+    display = filtered[keep_cols].rename(columns={
         "work_order_item_id": "WOI ID", "ship_by": "Ship By", "created_at": "Created At",
         "last_edit_at": "Last Edit At", "work_order_number": "WO",
         "master_id": "Master ID", "listing_id": "Listing", "finished_good_name": "Item Name",
@@ -1051,8 +1091,7 @@ def storage_item_view(s_items, s_wos):
         "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
         "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
     })
-    if flag_action is not None and "Reason" in display.columns:
-        display["What to do"] = display["Reason"].map(flag_action)
+    display = _add_what_to_do(display)
     cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
     display = display[cols]
 
@@ -1928,15 +1967,15 @@ def overview_tab(df, wos):
         if blocked.empty:
             st.caption("None blocked in PFS right now.")
         else:
-            d = blocked.sort_values("days_overdue", ascending=False)[
-                ["work_order_item_id", "work_order_number", "source_brand", "block_reason_pfs",
-                 "warehouse", "ship_by", "days_overdue"]
-            ].rename(columns={
+            _blk_cols = ["work_order_item_id", "work_order_number", "source_brand", "block_reason_pfs",
+                        "warehouse", "ship_by", "days_overdue"]
+            if {"marketplace", "marketplace_country"}.issubset(blocked.columns):
+                _blk_cols += ["marketplace", "marketplace_country"]
+            d = blocked.sort_values("days_overdue", ascending=False)[_blk_cols].rename(columns={
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
                 "days_overdue": "Days Overdue"})
-            if flag_action is not None:
-                d["What to do"] = d["Reason"].map(flag_action)
+            d = _add_what_to_do(d)
             if render_flag_guide_inline is not None:
                 render_flag_guide_inline(set(d["Reason"].dropna()))
             _panel(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
