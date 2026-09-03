@@ -11,9 +11,11 @@ and a multi-term Search. Plus a Columns picker, CSV + Excel export, a
 "copy a few values" popover, and a one-click full-table copy.
 """
 
+import hashlib
 import io
 import json
 import re
+import subprocess
 import html as _html
 import streamlit as st
 import streamlit.components.v1 as components
@@ -32,12 +34,44 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_messenger_button = None
     slack_send_panel_button = None
     slack_table_sender = None
+_FLAG_GUIDE_ERROR = None
 try:
     from flag_guide import render_flag_guide, render_flag_guide_inline, flag_action
-except Exception:  # optional — never break the app if it's absent
+except Exception as _flag_exc:  # keep the app up, but do not hide the failure
     render_flag_guide = None
     render_flag_guide_inline = None
     flag_action = None
+    _FLAG_GUIDE_ERROR = f"{type(_flag_exc).__name__}: {_flag_exc}"
+
+
+def _running_build_label() -> str:
+    """Identify the code this process is running — not GitHub `main`.
+
+    Streamlit Cloud often keeps serving an old image after a merge. A git SHA
+    (when `.git` is present) plus a content hash of the two files that usually
+    drift tells you whether a reboot actually picked up the change.
+    """
+    parts = []
+    root = Path(__file__).resolve().parent
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if sha:
+            parts.append(f"git {sha}")
+    except Exception:
+        pass
+    try:
+        h = hashlib.sha1()
+        for name in ("app.py", "flag_guide.py"):
+            p = root / name
+            if p.exists():
+                h.update(p.read_bytes())
+        parts.append(f"files {h.hexdigest()[:7]}")
+    except Exception:
+        pass
+    return " · ".join(parts) or "unknown"
 
 # ============================================================
 # CONFIG
@@ -1690,6 +1724,7 @@ def overview_tab(df, wos):
     kpi_strip(df, wos, st.session_state.get("global_wh", "Both"))
     st.markdown("---")
     po_df = po_pos = None
+    po_fetch_error = None
     try:
         po_df, po_pos, _ = fetch_po_data()
         wh = st.session_state.get("global_wh", "Both")
@@ -1704,8 +1739,9 @@ def overview_tab(df, wos):
         except Exception:
             if po_pos is not None and "wo_count" not in po_pos.columns:
                 po_pos["wo_count"] = 0
-    except Exception:
+    except Exception as exc:
         po_df = po_pos = None
+        po_fetch_error = f"{type(exc).__name__}: {exc}"
 
     def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False,
                link_cols=None, slack_whole=True, slack_label_cols=None,
@@ -1720,6 +1756,11 @@ def overview_tab(df, wos):
 
     # ================= Purchase orders (tiles) =================
     st.markdown("#### 📥 Purchase orders (placed since 2025-07-01)")
+    if po_fetch_error:
+        st.warning(
+            "PO data failed to load (this is not an empty result). "
+            f"{po_fetch_error}"
+        )
     if po_df is not None:
         po_ordered = int(pd.to_numeric(po_df["ordered_units"], errors="coerce").fillna(0).sum())
         po_received = int(pd.to_numeric(po_df["received_units"], errors="coerce").fillna(0).sum())
@@ -1872,6 +1913,14 @@ def overview_tab(df, wos):
     st.caption("Worst cases first. Header counts are the full totals; each table shows the top 100.")
     if render_flag_guide is not None:
         render_flag_guide()
+    elif _FLAG_GUIDE_ERROR:
+        with st.expander("ℹ️ Flag guide — failed to load", expanded=True):
+            st.error("Flag guide did not import. This is not a missing-data state.")
+            st.code(_FLAG_GUIDE_ERROR)
+            st.caption(
+                "If this persists after Manage app → Reboot + hard-refresh, the "
+                "module is missing from the image or crashed on import."
+            )
 
     # A) Blocked WOIs (PFS)
     blocked = df[df["is_blocked_pfs"].fillna(False)].copy()
@@ -2097,23 +2146,31 @@ def overview_tab(df, wos):
                        slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],
                        slack_filename="po_items_without_full_wo.csv")
     else:
-        st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
+        if po_fetch_error:
+            st.caption(f"PO-based exceptions unavailable: {po_fetch_error}")
+        else:
+            st.caption("PO-based exceptions unavailable (PO data didn't load — check queries/po_tracker.sql).")
 
 
 # ============================================================
 # SKU JOURNEY (Phase 3b) — one Master ID across POs + work orders
 # ============================================================
 def sku_journey_tab(df, wos):
+    po_df = None
+    po_fetch_error = None
     try:
         po_df, _po_pos, _ = fetch_po_data()
         wh = st.session_state.get("global_wh", "Both")
         if wh != "Both":
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
-    except Exception:
+    except Exception as exc:
         po_df = None
+        po_fetch_error = f"{type(exc).__name__}: {exc}"
 
     st.markdown("#### 🧭 SKU Journey — one product across POs and work orders")
     st.caption("Bridged on **Master ID**. Search by Master ID, SKU or title, then pick the product.")
+    if po_fetch_error:
+        st.warning(f"PO data failed to load: {po_fetch_error}")
 
     q = st.text_input("Search Master ID / SKU / title", key="skuj_q",
                       placeholder="e.g. P0EAVTZV or 'Sorel Caribou'")
@@ -2306,6 +2363,11 @@ def main():
             po_tab(df, wos)
     elif choice == nav_storage:
         storage_tab(df, wos)
+
+    st.caption(
+        f"Build `{_running_build_label()}` · if a merged change is missing, "
+        "reboot Streamlit Cloud (Manage app → ⋮ → Reboot) then hard-refresh."
+    )
 
 
 if __name__ == "__main__":
