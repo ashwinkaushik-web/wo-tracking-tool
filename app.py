@@ -86,11 +86,64 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+html, body, [data-testid="stAppViewContainer"] {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
 [data-testid="stMetric"] { padding: 0.4rem 0.6rem; }
 [data-testid="stMetricValue"] { font-size: 1.3rem !important; line-height: 1.2 !important; }
-[data-testid="stMetricLabel"] p { font-size: 0.72rem !important; }
-[data-testid="stMetricDelta"] { font-size: 0.68rem !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.8rem !important; color: #222 !important; }
+[data-testid="stMetricDelta"] { font-size: 0.72rem !important; }
 [data-testid="stMetricDelta"] svg { width: 0.7rem !important; height: 0.7rem !important; }
+
+/* Filters / pickers: Streamlit defaults are small, grey, and clip long labels. */
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label {
+  font-size: 0.92rem !important;
+  font-weight: 600 !important;
+  color: #161616 !important;
+  opacity: 1 !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  line-height: 1.3 !important;
+}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p {
+  font-size: 0.86rem !important;
+  color: #333 !important;
+  opacity: 1 !important;
+}
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary p {
+  font-size: 0.95rem !important;
+  font-weight: 600 !important;
+  color: #161616 !important;
+}
+div[data-baseweb="select"] {
+  font-size: 0.92rem !important;
+}
+div[data-baseweb="tag"] span {
+  font-size: 0.9rem !important;
+  font-weight: 600 !important;
+  color: #161616 !important;
+}
+div[data-baseweb="tag"] {
+  max-width: none !important;
+}
+li[role="option"],
+li[role="option"] span,
+ul[role="listbox"] li {
+  font-size: 0.95rem !important;
+  font-weight: 500 !important;
+  color: #161616 !important;
+  line-height: 1.35 !important;
+}
+[data-testid="stRadio"] label p {
+  font-size: 0.9rem !important;
+  font-weight: 600 !important;
+  color: #161616 !important;
+  white-space: nowrap !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -361,6 +414,21 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def _usable_warehouse_name(name):
+    """Pattern 3PLs only — the dim table also has Amazon FCs and liquidator rows."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    low = n.lower()
+    if low.startswith("amazon"):
+        return False
+    if "liquidator" in low:
+        return False
+    if n.startswith("["):
+        return False
+    return True
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_warehouse_dim():
     """Live warehouse id + name from Snowflake. Extra warehouses can be switched
@@ -381,7 +449,7 @@ def fetch_warehouse_dim():
     out = []
     for rid, name in rows:
         name = str(name).strip() if name is not None else ""
-        if not name:
+        if not _usable_warehouse_name(name):
             continue
         try:
             out.append({"id": int(rid), "name": name})
@@ -391,7 +459,7 @@ def fetch_warehouse_dim():
 
 
 def _warehouse_picker_options():
-    """Configured defaults plus any extra names from the warehouse dim table."""
+    """Configured defaults plus Pattern 3PLs from the warehouse dim table."""
     configured = get_warehouses(_warehouse_override())
     try:
         dim = fetch_warehouse_dim()
@@ -399,7 +467,7 @@ def _warehouse_picker_options():
         dim = []
     by_name = {w["name"]: w for w in dim}
     for w in configured:
-        by_name.setdefault(w["name"], w)
+        by_name[w["name"]] = w
     return sorted(by_name.values(), key=lambda w: (w["name"] or "").lower())
 
 
@@ -1468,12 +1536,17 @@ def parse_catalog_ids(raw):
 
 
 def build_catalog_query(ids):
-    """Catalogue Lookup Search-by-ID. Pushes the ID list into q1/q2 so Snowflake
-    does not scan the whole catalog. ``ids`` must already be uppercased."""
+    """Catalogue Lookup Search-by-ID. Pushes the ID list into a VALUES CTE so
+    Snowflake does not scan the whole catalog. ``ids`` must already be uppercased."""
     if not ids:
         raise ValueError("No IDs to look up.")
     quoted = ", ".join("'" + i.replace("'", "''") + "'" for i in ids)
-    return CATALOG_QUERY_PATH.read_text().replace("{upper_list}", quoted)
+    values = ", ".join("('" + i.replace("'", "''") + "')" for i in ids)
+    return (
+        CATALOG_QUERY_PATH.read_text()
+        .replace("{id_values}", values)
+        .replace("{upper_list}", quoted)
+    )
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -1593,37 +1666,38 @@ def catalog_filter_panel(df, key):
         if hide_bad:
             out = out[_catalog_is_raisable(out)]
 
-        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        r1a, r1b = st.columns(2)
         if "Marketplace" in out.columns:
             mkts = _uniq_filter_vals(df["Marketplace"])
-            pick = r1c1.multiselect("Marketplace", mkts, key=f"{key}_mkt", placeholder="All marketplaces")
+            pick = r1a.multiselect("Marketplace", mkts, key=f"{key}_mkt", placeholder="All marketplaces")
             if pick:
                 out = out[out["Marketplace"].astype(str).isin(pick)]
         if "Vendor" in out.columns:
             vends = _uniq_filter_vals(df["Vendor"])
-            pick = r1c2.multiselect("Vendor", vends, key=f"{key}_vendor", placeholder="All vendors")
+            pick = r1b.multiselect("Vendor", vends, key=f"{key}_vendor", placeholder="All vendors")
             if pick:
                 out = out[out["Vendor"].astype(str).isin(pick)]
+        r1c, r1d = st.columns(2)
         if "Fulfillment" in out.columns:
             fulf = _uniq_filter_vals(df["Fulfillment"])
-            pick = r1c3.multiselect("Fulfillment", fulf, key=f"{key}_fulf", placeholder="All types")
+            pick = r1c.multiselect("Fulfillment", fulf, key=f"{key}_fulf", placeholder="All types")
             if pick:
                 out = out[out["Fulfillment"].astype(str).isin(pick)]
         if "Status" in out.columns:
             stats = _uniq_filter_vals(df["Status"])
-            pick = r1c4.multiselect("Status", stats, key=f"{key}_status", placeholder="All statuses")
+            pick = r1d.multiselect("Status", stats, key=f"{key}_status", placeholder="All statuses")
             if pick:
                 out = out[out["Status"].astype(str).isin(pick)]
 
-        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+        r2a, r2b = st.columns(2)
         if "Seller" in out.columns:
             sellers = _uniq_filter_vals(df["Seller"])
-            pick = r2c1.multiselect("Seller", sellers, key=f"{key}_seller", placeholder="All sellers")
+            pick = r2a.multiselect("Seller", sellers, key=f"{key}_seller", placeholder="All sellers")
             if pick:
                 out = out[out["Seller"].astype(str).isin(pick)]
         if "Commingled" in out.columns:
             comm = _uniq_filter_vals(df["Commingled"])
-            pick = r2c2.multiselect("Commingled", comm, key=f"{key}_comm", placeholder="All")
+            pick = r2b.multiselect("Commingled", comm, key=f"{key}_comm", placeholder="All")
             if pick:
                 out = out[out["Commingled"].astype(str).isin(pick)]
 
@@ -1639,12 +1713,12 @@ def catalog_filter_panel(df, key):
                 return
             out = out[b] if choice == "Yes" else out[~b]
 
-        _yn("DNO", "DNO", r2c3)
-        _yn("Active", "Active", r2c4)
+        r2c, r2d, r2e = st.columns(3)
+        _yn("DNO", "DNO", r2c)
+        _yn("Active", "Active", r2d)
+        _yn("Shippable", "Shippable", r2e)
 
-        r3c1, r3c2 = st.columns([1, 3])
-        _yn("Shippable", "Shippable", r3c1)
-        q = r3c2.text_input(
+        q = st.text_input(
             "Search", "", key=f"{key}_search",
             placeholder="paste several — comma / new line = match any",
         )
@@ -1665,6 +1739,30 @@ def _ids_from_frame(frame, cols):
         if c in frame.columns:
             out.extend(frame[c].dropna().astype(str).tolist())
     return out
+
+
+def _catalog_ids_for_lookup(frame):
+    """SKUs only when present. Master ID / ASIN match every marketplace listing
+    for the product and make Catalogue Lookup slow (hundreds of extra rows)."""
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    for col in ("sku", "SKU"):
+        if col not in frame.columns:
+            continue
+        vals = []
+        seen = set()
+        for v in frame[col].dropna().astype(str):
+            s = v.strip()
+            if not s or s.lower() in ("nan", "none"):
+                continue
+            key = s.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            vals.append(s)
+        if vals:
+            return vals
+    return _ids_from_frame(frame, ["listing_id", "asin", "master_id"])
 
 
 def _jump_to_catalog_lookup(ids, *, context="", pack=False):
@@ -1701,32 +1799,27 @@ def _po_pack_context(po, row):
 
 
 def _catalog_slack_note(display, context="", skipped=0):
-    """Prefill for 'please raise a WO' — listing ids in the message body + CSV attached."""
+    """Short raise-WO prefill — listing IDs + CSV, not a product catalogue dump."""
     n = len(display)
-    header = "Please raise a work order for the listing(s) below."
+    head = "Please raise a WO"
     if context:
-        header = f"Please raise a work order — {context}."
-    lines = [header, "", f"{n} listing row(s) attached as CSV from Catalogue Lookup."]
+        head = f"Please raise a WO — {context}"
+    lids = []
+    if "Listing ID" in display.columns:
+        seen = set()
+        for v in display["Listing ID"].astype(str):
+            s = v.strip()
+            if not s or s.lower() in ("nan", "none") or s in seen:
+                continue
+            seen.add(s)
+            lids.append(s)
+    lines = [f"{head}.", f"{n} listing ID(s) in the attached CSV."]
     if skipped:
-        lines.append(f"{skipped} listing(s) excluded by filters (DNO / inactive / not shippable / other).")
-    if "Status" in display.columns:
-        n_dno = int(display["Status"].astype(str).str.contains("DNO", na=False).sum())
-        if n_dno:
-            lines.append(f":warning: {n_dno} of these listing(s) are still flagged DNO.")
-    lines.append("")
-    cap = 40
-    for _, row in display.head(cap).iterrows():
-        lid = str(row.get("Listing ID", "") or "").strip()
-        sku = str(row.get("SKU", "") or "").strip()
-        mid = str(row.get("Master ID", "") or "").strip()
-        name = str(row.get("Product Name", "") or "").strip()
-        mkt = str(row.get("Marketplace", "") or "").strip()
-        bits = [b for b in (lid, sku, mid) if b and b.lower() != "nan"]
-        label = " / ".join(bits) if bits else "(no id)"
-        extra = " — ".join(x for x in (name, mkt) if x and x.lower() != "nan")
-        lines.append(f"• {label}" + (f" — {extra}" if extra else ""))
-    if n > cap:
-        lines.append(f"• … and {n - cap} more in the attached CSV")
+        lines.append(f"{skipped} hidden by filters.")
+    if lids:
+        show, rest = lids[:8], max(n - 8, 0)
+        extra = f" +{rest} more" if rest else ""
+        lines.append("IDs: " + ", ".join(show) + extra)
     return "\n".join(lines)
 
 
@@ -1927,7 +2020,7 @@ def po_details_list(po_pos, po_df):
                 st.session_state.selected_po_detail = po
                 st.rerun()
         lines = po_df[po_df["po_number"] == po] if po_df is not None else None
-        ids = _ids_from_frame(lines, ["sku", "asin", "master_id"])
+        ids = _catalog_ids_for_lookup(lines)
         ctx_row = filtered[filtered["po_number"] == po]
         ctx = _po_pack_context(po, ctx_row.iloc[0]) if ctx_row is not None and not ctx_row.empty else f"PO {po}"
         with b2:
@@ -1954,7 +2047,7 @@ def po_details_items(po_df):
     if st.button("🔎 Look up listings for these items", key="podi_cat",
                  help="Open Catalogue Lookup with the SKUs / Master IDs currently in this table"):
         _jump_to_catalog_lookup(
-            _ids_from_frame(filtered, ["sku", "asin", "master_id"]),
+            _catalog_ids_for_lookup(filtered),
             context=f"{len(filtered):,} PO item(s) from PO Details",
         )
     render_table(
@@ -1975,7 +2068,7 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
                f"{_safe_int(row['lines'])} line(s) · placed {_safe_date_str(row['order_placed'])}")
     pack_l, pack_r = st.columns(2)
     items_for_ids = po_df[po_df["po_number"] == po]
-    ids = _ids_from_frame(items_for_ids, ["sku", "asin", "master_id"])
+    ids = _catalog_ids_for_lookup(items_for_ids)
     ctx = _po_pack_context(po, row)
     with pack_l:
         if st.button("🔎 Look up listings", key=f"pod_dd_cat_{po}", use_container_width=True):
@@ -2496,7 +2589,7 @@ def overview_tab(df, wos):
                                  help="Open Catalogue Lookup with the SKUs / Master IDs from these POs"):
                         pos = set(nowo["po_number"].astype(str))
                         subset = po_df[po_df["po_number"].astype(str).isin(pos)] if po_df is not None else None
-                        ids = _ids_from_frame(subset, ["sku", "asin", "master_id"])
+                        ids = _catalog_ids_for_lookup(subset)
                         po_nums = [x for x in _ov_po_str(nowo["po_number"]).tolist() if x]
                         shown = ", ".join(po_nums[:12])
                         extra = f" (+{len(po_nums) - 12} more)" if len(po_nums) > 12 else ""
@@ -2603,7 +2696,7 @@ def overview_tab(df, wos):
                     if st.button("🔎 Look up listings", key="jump_item_gap_cat",
                                  use_container_width=True,
                                  help="Open Catalogue Lookup with these SKUs / Master IDs"):
-                        ids = _ids_from_frame(item_gap, ["sku", "asin", "master_id"])
+                        ids = _catalog_ids_for_lookup(item_gap)
                         po_nums = []
                         if "po_number" in item_gap.columns:
                             po_nums = [x for x in _ov_po_str(item_gap["po_number"]).tolist() if x]
@@ -2942,7 +3035,7 @@ def catalog_lookup_tab():
         else:
             st.caption("Slack send is not configured — download the CSV and paste into Slack.")
     with send_cols[1]:
-        st.caption("Sends the **filtered** table — listing ids in the message, CSV attached.")
+        st.caption("Sends a short raise-WO note plus listing IDs. Full rows are in the CSV.")
 
     default_cols = [c for c in CATALOG_DEFAULT_COLS if c in filtered.columns]
     cols = column_picker(list(filtered.columns), key="cols_cat",
@@ -2983,10 +3076,13 @@ def main():
     options = _warehouse_picker_options()
     option_names = [w["name"] for w in options]
     default_names = warehouse_names(_warehouse_override())
-    if "wh_scope" not in st.session_state:
-        st.session_state["wh_scope"] = [n for n in default_names if n in option_names] or list(option_names[:2])
+    kept = [n for n in (st.session_state.get("wh_scope") or default_names) if n in option_names]
+    if not kept:
+        kept = [n for n in default_names if n in option_names] or list(option_names[:2])
+    if st.session_state.get("wh_scope") != kept:
+        st.session_state["wh_scope"] = kept
 
-    h1, h2, h3 = st.columns([3, 1.3, 0.9])
+    h1, h2, h3 = st.columns([2.2, 2.4, 0.8])
     with h1:
         st.title("📊 WO Tracking Tool")
         st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
@@ -3020,11 +3116,10 @@ def main():
             "Warehouses to load from Snowflake",
             options=option_names,
             key="wh_scope",
-            help="Default is Northampton + Wroclaw. Tick more names (from the warehouse table) "
-                 "to include them in WO / PO queries. No code change needed.",
+            help="Northampton + Wroclaw by default. Add other Pattern 3PLs (e.g. Dubai). "
+                 "Amazon fulfillment centers are hidden from this list.",
         )
-        st.caption("The header filter only slices what is already loaded. Tick extra warehouses here, "
-                   "then wait for the query to rerun.")
+        st.caption("Pattern warehouses only — not Amazon FCs. The header filter slices what is already loaded.")
 
     picked_names = [n for n in (st.session_state.get("wh_scope") or default_names) if n in option_names]
     by_name = {w["name"]: w for w in options}
