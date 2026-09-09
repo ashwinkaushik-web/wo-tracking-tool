@@ -1517,15 +1517,34 @@ def _wh_is_all(wh=None):
 
 
 def _warn_missing_columns(df, expected, label):
-    """Trust check: app.py and queries/*.sql must ship the same columns."""
+    """Trust check: app.py and queries/*.sql must ship the same columns.
+
+    Returns the list of missing column names (empty if the frame is usable).
+    Callers must not assume expected columns exist after a warning — a
+    diagnostic SQL file can still return rows, just the wrong shape.
+    """
     if df is None:
-        return
+        return list(expected)
     missing = [c for c in expected if c not in df.columns]
-    if missing:
-        st.warning(
-            f"{label} is missing column(s) {missing}. "
-            "SQL and app.py are out of sync — redeploy the query file in the same commit."
+    if not missing:
+        return []
+    cols = {str(c).lower() for c in df.columns}
+    extra = ""
+    if "coverage_state" in missing and (
+        {"workable_type", "work_order_item_id", "workable_id"} & cols
+    ):
+        extra = (
+            " This looks like the diagnostic `SELECT * FROM po_woi` dump, not the "
+            "production gap query. On GitHub, replace `queries/po_item_wo_gap.sql` "
+            "with the Streamlit file (one row per PO × Master ID; must SELECT "
+            "coverage_state, sku, warehouse_name, reason)."
         )
+    st.warning(
+        f"{label} is missing column(s) {missing}. "
+        "SQL and app.py are out of sync — redeploy the query file in the same commit."
+        + extra
+    )
+    return missing
 
 
 def _uniq_filter_vals(series, cap=80):
@@ -2493,6 +2512,7 @@ def overview_tab(df, wos):
 
         # G) PO items without full WO coverage — ITEM level (a PO can be
         # partly fine and partly a gap; different grain from panel F above).
+        gap_ok = False
         try:
             item_gap = fetch_po_item_wo_gap(_wh_scope_arg())
             _warn_missing_columns(
@@ -2500,13 +2520,18 @@ def overview_tab(df, wos):
                 ["coverage_state", "po_number", "sku", "warehouse_name", "reason"],
                 "PO item WO gap (queries/po_item_wo_gap.sql)",
             )
-            if not _wh_is_all(wh) and "warehouse_name" in item_gap.columns:
+            gap_ok = item_gap is not None and "coverage_state" in item_gap.columns
+            if gap_ok and not _wh_is_all(wh) and "warehouse_name" in item_gap.columns:
                 item_gap = item_gap[item_gap["warehouse_name"] == wh].copy()
         except Exception:
             item_gap = None
-        _n_gap = 0 if item_gap is None else len(item_gap)
-        _n_nowo_items = 0 if item_gap is None else int((item_gap["coverage_state"] == "No WO").sum())
-        _n_partial_items = 0 if item_gap is None else int((item_gap["coverage_state"] == "Partial WO").sum())
+            gap_ok = False
+        if not gap_ok:
+            _n_gap = _n_nowo_items = _n_partial_items = 0
+        else:
+            _n_gap = len(item_gap)
+            _n_nowo_items = int((item_gap["coverage_state"] == "No WO").sum())
+            _n_partial_items = int((item_gap["coverage_state"] == "Partial WO").sum())
         with st.expander(f"🧩 PO items without full work-order coverage ({_n_gap:,})"):
             st.caption("Item-level — a PO can have some items fully covered and others not. **No WO** = "
                        "nothing raised for this item yet. **Partial WO** = a WO exists but for fewer units "
@@ -2515,6 +2540,14 @@ def overview_tab(df, wos):
                        "a PO-linked one are flagged here too, not hidden.")
             if item_gap is None:
                 st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
+            elif not gap_ok:
+                st.error(
+                    "GitHub `queries/po_item_wo_gap.sql` is not the production gap query. "
+                    "It must return **coverage_state** (No WO / Partial WO), **sku**, "
+                    "**warehouse_name**, and **reason** — one row per PO × Master ID. "
+                    "Overwrite it with `wo-tracking-tool/queries/po_item_wo_gap.sql` "
+                    "(do not use the diagnostic `SELECT * FROM po_woi` dump), then reboot."
+                )
             elif item_gap.empty:
                 st.caption("None — every PO item has full work-order coverage.")
             else:
@@ -2532,15 +2565,24 @@ def overview_tab(df, wos):
                         "purchase_state", "order_placed_date", "ordered_units", "received_units",
                         "outstanding_units", "wo_qty", "coverage_state", "reason"]
                 keep = [c for c in keep if c in item_gap.columns]
-                d = item_gap.sort_values(["coverage_state", "outstanding_units"], ascending=[True, False])[keep].rename(columns={
+                sort_cols = [c for c in ["coverage_state", "outstanding_units"] if c in item_gap.columns]
+                sorted_gap = (
+                    item_gap.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)])
+                    if sort_cols else item_gap
+                )
+                d = sorted_gap[keep].rename(columns={
                     "po_number": "PO #", "sku": "SKU", "title": "Title", "vendor_name": "Vendor",
                     "country_name": "Country", "warehouse_name": "WH", "purchase_state": "State",
                     "order_placed_date": "Order Placed", "ordered_units": "Ordered",
                     "received_units": "Received", "outstanding_units": "Outstanding",
                     "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason"})
-                d["PO #"] = _ov_po_str(d["PO #"])
-                if flag_action is not None:
-                    _src = d["Reason"].astype(str)
+                if "PO #" in d.columns:
+                    d["PO #"] = _ov_po_str(d["PO #"])
+                if flag_action is not None and "Coverage" in d.columns:
+                    _src = (
+                        d["Reason"].astype(str) if "Reason" in d.columns
+                        else pd.Series("", index=d.index)
+                    )
                     _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
                     d["What to do"] = _src.map(flag_action)
                 _dlc2, _slc2, _lkc2 = st.columns(3)
@@ -2574,10 +2616,15 @@ def overview_tab(df, wos):
                                     + (f" (POs {shown}{extra})" if shown else ""),
                         )
                 if render_flag_guide_inline is not None:
-                    _gap_reasons = set(item_gap["reason"].dropna())
-                    if (item_gap["coverage_state"] == "Partial WO").any():
+                    _gap_reasons = set()
+                    if "reason" in item_gap.columns:
+                        _gap_reasons = set(item_gap["reason"].dropna())
+                    if "coverage_state" in item_gap.columns and (
+                        item_gap["coverage_state"] == "Partial WO"
+                    ).any():
                         _gap_reasons.add("Partial WO")
-                    render_flag_guide_inline(_gap_reasons)
+                    if _gap_reasons:
+                        render_flag_guide_inline(_gap_reasons)
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
                        color_rows=True,
                        slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],
