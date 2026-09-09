@@ -2,12 +2,18 @@
 -- Used by build_catalog_query() in app.py. Three CTEs plus a full outer join:
 --   q1  listings (STG_CATALOG) + DNO settings
 --   q2  catalog view (PATTERN_DB product/listings)
---   q3  latest DNO history flag
--- Filters are pushed into q1/q2 so this does not scan the whole catalog.
+--   q3  latest DNO history flag (per matched listing only — not a full-table MAX scan)
 --
--- The upper_list placeholder is replaced at runtime with a quoted, uppercased IN-list of the
--- IDs the user pasted (SKU, Listing ID, ASIN, FNSKU, Master ID, MPN, UPC, EAN).
-WITH q1 AS (
+-- Placeholders replaced at runtime:
+--   {id_values}  Snowflake VALUES rows: ('SKU1'), ('L0ABC'), ...
+--   {upper_list} quoted IN-list (kept for the final filter)
+--
+-- Prefer looking up SKU / Listing ID. Master ID matches every marketplace listing
+-- for that product and makes this query slow.
+WITH search_ids AS (
+    SELECT column1 AS id FROM VALUES {id_values}
+),
+q1 AS (
     SELECT c.name AS marketplace, par.name AS vendor, a.Listing_MP_Primary_ID AS sku,
         a.LISTING_FULFILLMENT_TYPE AS listing_fulfillment_type, a.LISTING_ID AS listing_id,
         b.MASTER_ID AS master_id, b.MPN AS mpn, a.LISTING_MP_PAGE_ID AS asin,
@@ -29,12 +35,12 @@ WITH q1 AS (
     LEFT JOIN ANALYTICS_DB.STG_CATALOG.STG_CATALOG__PARTNERS par ON par.ID = b.PARTNER_ID
     LEFT JOIN ANALYTICS_DB.STG_CATALOG.STG_CATALOG__DNO_SETTINGS dno ON dno.ID = a.DNO_SETTING_ID
     LEFT JOIN ANALYTICS_DB.STG_CATALOG.STG_CATALOG__DNO_REASON_CODES dno_rc ON dno_rc.ID = dno.DNO_REASON_CODE_ID
-    WHERE UPPER(a.Listing_MP_Primary_ID) IN ({upper_list})
-       OR UPPER(a.LISTING_ID) IN ({upper_list})
-       OR UPPER(a.LISTING_MP_PAGE_ID) IN ({upper_list})
-       OR UPPER(a.LISTING_MP_SECONDARY_ID) IN ({upper_list})
-       OR UPPER(b.MASTER_ID) IN ({upper_list})
-       OR UPPER(b.MPN) IN ({upper_list})
+    WHERE UPPER(a.Listing_MP_Primary_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(a.LISTING_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(a.LISTING_MP_PAGE_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(a.LISTING_MP_SECONDARY_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(b.MASTER_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(b.MPN) IN (SELECT id FROM search_ids)
 ),
 q2 AS (
     SELECT pc.MARKETPLACE_NAME AS marketplace, pc.VENDOR_NAME AS vendor, pc.MARKETPLACE_PRIMARY_ID AS sku,
@@ -48,21 +54,21 @@ q2 AS (
         pc.MSRP_W_CURRENCY AS msrp_price,
         pc.SELLER_NAME AS seller_name
     FROM PATTERN_DB.PUBLIC.PRODUCT_CATALOG_PRODUCTS_AND_LISTINGS_VIEW pc
-    WHERE UPPER(pc.MARKETPLACE_PRIMARY_ID) IN ({upper_list})
-       OR UPPER(pc.LISTING_ID) IN ({upper_list})
-       OR UPPER(pc.UPC) IN ({upper_list})
-       OR UPPER(pc.EAN) IN ({upper_list})
+    WHERE UPPER(pc.MARKETPLACE_PRIMARY_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(pc.LISTING_ID) IN (SELECT id FROM search_ids)
+       OR UPPER(pc.UPC) IN (SELECT id FROM search_ids)
+       OR UPPER(pc.EAN) IN (SELECT id FROM search_ids)
        OR pc.LISTING_ID IN (SELECT listing_id FROM q1 WHERE listing_id IS NOT NULL)
 ),
 q3 AS (
     SELECT h.LISTING_ID AS listing_id, h.IS_DNO AS is_dno
     FROM PATTERN_DB.PUBLIC.CATALOG_LISTING_STATUS_HISTORY h
-    WHERE h."DATE" = (SELECT MAX("DATE") FROM PATTERN_DB.PUBLIC.CATALOG_LISTING_STATUS_HISTORY)
-      AND h.LISTING_ID IN (
-          SELECT listing_id FROM q1 WHERE listing_id IS NOT NULL
-          UNION
-          SELECT listing_id FROM q2 WHERE listing_id IS NOT NULL
-      )
+    WHERE h.LISTING_ID IN (
+        SELECT listing_id FROM q1 WHERE listing_id IS NOT NULL
+        UNION
+        SELECT listing_id FROM q2 WHERE listing_id IS NOT NULL
+    )
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY h.LISTING_ID ORDER BY h."DATE" DESC) = 1
 ),
 base AS (
     SELECT COALESCE(q2.marketplace, q1.marketplace) AS MARKETPLACE,
@@ -87,7 +93,10 @@ base AS (
     LEFT JOIN q3 ON q3.listing_id = COALESCE(q1.listing_id, q2.listing_id)
 )
 SELECT * FROM base
-WHERE UPPER(SKU) IN ({upper_list}) OR UPPER(LISTING_ID) IN ({upper_list})
-   OR UPPER(ASIN) IN ({upper_list}) OR UPPER(MPN) IN ({upper_list})
-   OR UPPER(MASTER_ID) IN ({upper_list}) OR UPPER(FNSKU) IN ({upper_list})
+WHERE UPPER(SKU) IN (SELECT id FROM search_ids)
+   OR UPPER(LISTING_ID) IN (SELECT id FROM search_ids)
+   OR UPPER(ASIN) IN (SELECT id FROM search_ids)
+   OR UPPER(MPN) IN (SELECT id FROM search_ids)
+   OR UPPER(MASTER_ID) IN (SELECT id FROM search_ids)
+   OR UPPER(FNSKU) IN (SELECT id FROM search_ids)
 ORDER BY MARKETPLACE, VENDOR, SKU
