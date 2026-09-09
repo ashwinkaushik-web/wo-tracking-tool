@@ -16,6 +16,7 @@ Required env vars (set as GitHub repo secrets — see SLACK_AUTOPOST_SETUP.md):
 """
 
 import os
+import sys
 import json
 import datetime
 import urllib.request
@@ -24,6 +25,10 @@ import urllib.error
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+
+# Repo root (one level up) on the path so we can share the warehouse config.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from warehouses import apply_warehouse_scope, get_warehouses
 
 MAX_ROWS = 40  # cap the Slack table so the message isn't oversized
 
@@ -105,7 +110,7 @@ def fetch_rows():
     )
     try:
         cur = conn.cursor()
-        cur.execute(QUERY)
+        cur.execute(apply_warehouse_scope(QUERY))
         cols = [c[0].lower() for c in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     finally:
@@ -124,13 +129,14 @@ def _d(v):
 
 def build_message(rows):
     today = datetime.date.today().strftime("%a %d %b %Y")
+    wh_label = " + ".join(w["name"] for w in get_warehouses())
     n = len(rows)
     if n == 0:
         return (f":white_check_mark: *No-WO check — {today}*\n"
-                "Every 2026 PO at Northampton/Wroclaw has a linked work order. Nothing to raise. :tada:")
+                f"Every 2026 PO at {wh_label} has a linked work order. Nothing to raise. :tada:")
 
     header = (f":clipboard: *POs placed/arriving with NO work order — {today}*\n"
-              f"{n} PO(s) placed in 2026 with no linked WO (Northampton + Wroclaw). "
+              f"{n} PO(s) placed in 2026 with no linked WO ({wh_label}). "
               "Please review and raise WOs.\n")
 
     shown = rows[:MAX_ROWS]
