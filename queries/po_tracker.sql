@@ -43,6 +43,7 @@ SELECT
     , ROUND(DIV0(rpt.RECEIVED_UNITS, rpt.ORDERED_UNITS) * 100, 1) AS demand_fill_rate_pct
     , ROUND(DIV0(rpt.RECEIVED_UNITS, rpt.CURRENT_UNITS) * 100, 1) AS vendor_fill_rate_pct
 FROM ANALYTICS_DB.REPORTING.REPORT__BRAND_MANAGEMENT_V7__PURCHASE_ORDERS rpt
+-- Warehouse scope: app rewrites this name list at runtime from warehouses.py.
 WHERE rpt.WAREHOUSE_NAME IN ('Northampton', 'Wroclaw')
   AND rpt.ORDER_PLACED_DATE >= '2025-07-01'
 ORDER BY rpt.PO_NUMBER, rpt.ITEM_ID
