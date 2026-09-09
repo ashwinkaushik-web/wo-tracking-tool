@@ -122,9 +122,16 @@ def _active_warehouses():
     return get_warehouses(_warehouse_override())
 
 
-def _scope_sql(sql: str) -> str:
+def _scope_sql(sql: str, override=None) -> str:
     """Scope a query's warehouse IN(...) clauses to the configured warehouses."""
-    return apply_warehouse_scope(sql, _warehouse_override())
+    return apply_warehouse_scope(sql, override if override is not None else _warehouse_override())
+
+
+def _override_from_scope(wh_scope):
+    """Turn a cache-friendly ((id, name), ...) tuple into the override list."""
+    if not wh_scope:
+        return _warehouse_override()
+    return [{"id": int(i), "name": n} for i, n in wh_scope]
 
 FLAG_ORDER = [
     "🔴 Blocked / Issue", "🟠 Partially Processed",
@@ -355,8 +362,50 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_data():
-    sql = _scope_sql(QUERY_PATH.read_text())
+def fetch_warehouse_dim():
+    """Live warehouse id + name from Snowflake. Extra warehouses can be switched
+    on in the UI without a code change. Falls back to warehouses.py on error."""
+    sql = (
+        "SELECT id, warehouse_name "
+        "FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WAREHOUSES "
+        "WHERE warehouse_name IS NOT NULL "
+        "ORDER BY warehouse_name"
+    )
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+    out = []
+    for rid, name in rows:
+        name = str(name).strip() if name is not None else ""
+        if not name:
+            continue
+        try:
+            out.append({"id": int(rid), "name": name})
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _warehouse_picker_options():
+    """Configured defaults plus any extra names from the warehouse dim table."""
+    configured = get_warehouses(_warehouse_override())
+    try:
+        dim = fetch_warehouse_dim()
+    except Exception:
+        dim = []
+    by_name = {w["name"]: w for w in dim}
+    for w in configured:
+        by_name.setdefault(w["name"], w)
+    return sorted(by_name.values(), key=lambda w: (w["name"] or "").lower())
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_data(wh_scope=()):
+    sql = _scope_sql(QUERY_PATH.read_text(), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -767,11 +816,18 @@ def sidebar(last_refresh):
         st.sidebar.metric("Last refresh", last_refresh.strftime("%H:%M:%S"), f"{delta_min:.0f} min ago")
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
         fetch_data.clear()
+        fetch_po_data.clear()
+        fetch_po_item_wo_gap.clear()
         fetch_catalog_lookup.clear()
+        fetch_warehouse_dim.clear()
         _reset_selection()
         st.rerun()
     st.sidebar.markdown("---")
-    _wh_list = ", ".join(f"{w['name']} ({w['id']})" for w in _active_warehouses())
+    _scope = _wh_scope_arg()
+    if _scope:
+        _wh_list = ", ".join(f"{n} ({i})" for i, n in _scope)
+    else:
+        _wh_list = ", ".join(f"{w['name']} ({w['id']})" for w in _active_warehouses())
     st.sidebar.markdown(
         "**Coverage**\n\n"
         "- All WOs created since Jan 1 this year\n"
@@ -1289,8 +1345,8 @@ def po_item_view(p_items, p_wos):
 # Grain: one row per PO x line item. Fill rates are UNCAPPED (>100% = over-receipts).
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_po_data():
-    sql = _scope_sql(PO_QUERY_PATH.read_text())
+def fetch_po_data(wh_scope=()):
+    sql = _scope_sql(PO_QUERY_PATH.read_text(), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1344,11 +1400,11 @@ def fetch_po_wo_agg():
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_po_item_wo_gap():
+def fetch_po_item_wo_gap(wh_scope=()):
     """Item-level (PO x Master ID) WO coverage gaps — No WO / Partial WO lines
     only (queries/po_item_wo_gap.sql). Different grain from fetch_po_wo_agg,
     which rolls up to one row per whole PO."""
-    sql = _scope_sql(PO_ITEM_GAP_PATH.read_text())
+    sql = _scope_sql(PO_ITEM_GAP_PATH.read_text(), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1450,6 +1506,138 @@ def _catalog_bool(series):
     return series.astype(str).str.strip().str.lower().isin(("true", "1", "t", "yes"))
 
 
+def _wh_scope_arg():
+    return tuple(st.session_state.get("_wh_scope_tuple") or ())
+
+
+def _wh_is_all(wh=None):
+    if wh is None:
+        wh = st.session_state.get("global_wh", "All in scope")
+    return wh in ("Both", "All in scope", None, "")
+
+
+def _warn_missing_columns(df, expected, label):
+    """Trust check: app.py and queries/*.sql must ship the same columns."""
+    if df is None:
+        return
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        st.warning(
+            f"{label} is missing column(s) {missing}. "
+            "SQL and app.py are out of sync — redeploy the query file in the same commit."
+        )
+
+
+def _uniq_filter_vals(series, cap=80):
+    vals = []
+    seen = set()
+    for v in series.dropna():
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none"):
+            continue
+        if s not in seen:
+            seen.add(s)
+            vals.append(s)
+    vals.sort(key=str.lower)
+    return vals[:cap]
+
+
+def _catalog_is_raisable(df):
+    """Rows that are safe to attach to a raise-WO request."""
+    mask = pd.Series(True, index=df.index)
+    if "Status" in df.columns:
+        s = df["Status"].astype(str)
+        mask &= ~s.str.contains("DNO", na=False)
+        mask &= ~s.str.contains("Inactive", na=False)
+        mask &= ~s.str.contains("Discontinued", na=False)
+    if "Shippable" in df.columns:
+        ship = _catalog_bool(df["Shippable"])
+        if ship is not None:
+            # Unknown shippable (neither true nor false) stays in — only drop explicit No.
+            known = df["Shippable"].notna() & ~df["Shippable"].astype(str).str.strip().eq("")
+            mask &= ~(known & ~ship)
+    return mask
+
+
+def catalog_filter_panel(df, key):
+    """Filters for Catalogue Lookup: drop DNO / inactive / marketplace / seller / etc."""
+    out = df.copy()
+    with st.expander("🔎 Filters", expanded=True):
+        preset_key = f"{key}_hide_bad"
+        if st.session_state.get("cat_lookup_pack_mode") and preset_key not in st.session_state:
+            st.session_state[preset_key] = True
+        hide_bad = st.checkbox(
+            "Hide listings that shouldn't get a WO (DNO / inactive / discontinued / not shippable)",
+            key=preset_key,
+            help="Keeps Active + shippable rows. Uncheck to audit DNO or inactive listings.",
+        )
+        if hide_bad:
+            out = out[_catalog_is_raisable(out)]
+
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        if "Marketplace" in out.columns:
+            mkts = _uniq_filter_vals(df["Marketplace"])
+            pick = r1c1.multiselect("Marketplace", mkts, key=f"{key}_mkt", placeholder="All marketplaces")
+            if pick:
+                out = out[out["Marketplace"].astype(str).isin(pick)]
+        if "Vendor" in out.columns:
+            vends = _uniq_filter_vals(df["Vendor"])
+            pick = r1c2.multiselect("Vendor", vends, key=f"{key}_vendor", placeholder="All vendors")
+            if pick:
+                out = out[out["Vendor"].astype(str).isin(pick)]
+        if "Fulfillment" in out.columns:
+            fulf = _uniq_filter_vals(df["Fulfillment"])
+            pick = r1c3.multiselect("Fulfillment", fulf, key=f"{key}_fulf", placeholder="All types")
+            if pick:
+                out = out[out["Fulfillment"].astype(str).isin(pick)]
+        if "Status" in out.columns:
+            stats = _uniq_filter_vals(df["Status"])
+            pick = r1c4.multiselect("Status", stats, key=f"{key}_status", placeholder="All statuses")
+            if pick:
+                out = out[out["Status"].astype(str).isin(pick)]
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+        if "Seller" in out.columns:
+            sellers = _uniq_filter_vals(df["Seller"])
+            pick = r2c1.multiselect("Seller", sellers, key=f"{key}_seller", placeholder="All sellers")
+            if pick:
+                out = out[out["Seller"].astype(str).isin(pick)]
+        if "Commingled" in out.columns:
+            comm = _uniq_filter_vals(df["Commingled"])
+            pick = r2c2.multiselect("Commingled", comm, key=f"{key}_comm", placeholder="All")
+            if pick:
+                out = out[out["Commingled"].astype(str).isin(pick)]
+
+        def _yn(col, label, widget):
+            nonlocal out
+            if col not in df.columns:
+                return
+            choice = widget.selectbox(label, ["All", "Yes", "No"], key=f"{key}_{col}")
+            if choice == "All":
+                return
+            b = _catalog_bool(out[col])
+            if b is None:
+                return
+            out = out[b] if choice == "Yes" else out[~b]
+
+        _yn("DNO", "DNO", r2c3)
+        _yn("Active", "Active", r2c4)
+
+        r3c1, r3c2 = st.columns([1, 3])
+        _yn("Shippable", "Shippable", r3c1)
+        q = r3c2.text_input(
+            "Search", "", key=f"{key}_search",
+            placeholder="paste several — comma / new line = match any",
+        )
+        if q:
+            search_cols = [c for c in [
+                "SKU", "Listing ID", "Master ID", "ASIN", "FNSKU", "MPN",
+                "Product Name", "UPC", "EAN", "Marketplace", "Vendor", "Seller",
+            ] if c in out.columns]
+            out = out[_str_contains_any(out, search_cols, q)]
+    return out
+
+
 def _ids_from_frame(frame, cols):
     if frame is None or getattr(frame, "empty", True):
         return []
@@ -1460,7 +1648,7 @@ def _ids_from_frame(frame, cols):
     return out
 
 
-def _jump_to_catalog_lookup(ids, *, context=""):
+def _jump_to_catalog_lookup(ids, *, context="", pack=False):
     """Switch to Catalogue Lookup with these IDs already pasted, ready to search."""
     parsed = parse_catalog_ids("\n".join(str(i) for i in ids))
     if not parsed:
@@ -1470,21 +1658,42 @@ def _jump_to_catalog_lookup(ids, *, context=""):
     st.session_state["cat_lookup_q"] = text
     st.session_state["cat_lookup_submitted"] = text
     st.session_state["cat_lookup_context"] = context or ""
+    st.session_state["cat_lookup_pack_mode"] = bool(pack)
     st.session_state["pending_nav"] = NAV_CATALOG
     st.rerun()
 
 
-def _catalog_slack_note(display, context=""):
+def _po_pack_context(po, row):
+    """One-line PO context for a raise-WO Slack note."""
+    vendor = str(row.get("vendor_name") or row.get("Vendor") or "").strip()
+    wh = str(row.get("warehouse_name") or row.get("WH") or "").strip()
+    ship = row.get("ship_date") if row.get("ship_date") is not None else row.get("Ship Date")
+    placed = row.get("order_placed") if row.get("order_placed") is not None else row.get("Order Placed")
+    bits = [f"PO {po}"]
+    if vendor:
+        bits.append(vendor)
+    if wh:
+        bits.append(wh)
+    if ship is not None and str(ship) not in ("", "NaT", "nan", "None"):
+        bits.append(f"req ship {_safe_date_str(ship)}")
+    elif placed is not None and str(placed) not in ("", "NaT", "nan", "None"):
+        bits.append(f"placed {_safe_date_str(placed)}")
+    return " · ".join(bits)
+
+
+def _catalog_slack_note(display, context="", skipped=0):
     """Prefill for 'please raise a WO' — listing ids in the message body + CSV attached."""
     n = len(display)
     header = "Please raise a work order for the listing(s) below."
     if context:
         header = f"Please raise a work order — {context}."
     lines = [header, "", f"{n} listing row(s) attached as CSV from Catalogue Lookup."]
+    if skipped:
+        lines.append(f"{skipped} listing(s) excluded by filters (DNO / inactive / not shippable / other).")
     if "Status" in display.columns:
         n_dno = int(display["Status"].astype(str).str.contains("DNO", na=False).sum())
         if n_dno:
-            lines.append(f":warning: {n_dno} of these listing(s) are flagged DNO.")
+            lines.append(f":warning: {n_dno} of these listing(s) are still flagged DNO.")
     lines.append("")
     cap = 40
     for _, row in display.head(cap).iterrows():
@@ -1693,9 +1902,23 @@ def po_details_list(po_pos, po_df):
     )
     if sel is not None:
         po = _safe_int(sel)
-        if st.button(f"➡ Open PO {po}", type="primary", key="open_pod", use_container_width=True):
-            st.session_state.selected_po_detail = po
-            st.rerun()
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button(f"➡ Open PO {po}", type="primary", key="open_pod", use_container_width=True):
+                st.session_state.selected_po_detail = po
+                st.rerun()
+        lines = po_df[po_df["po_number"] == po] if po_df is not None else None
+        ids = _ids_from_frame(lines, ["sku", "asin", "master_id"])
+        ctx_row = filtered[filtered["po_number"] == po]
+        ctx = _po_pack_context(po, ctx_row.iloc[0]) if ctx_row is not None and not ctx_row.empty else f"PO {po}"
+        with b2:
+            if st.button("🔎 Look up listings", key="pod_list_cat", use_container_width=True,
+                         help="Open Catalogue Lookup with this PO's SKUs / Master IDs"):
+                _jump_to_catalog_lookup(ids, context=ctx)
+        with b3:
+            if st.button("📦 Raise-WO pack", key="pod_list_pack", use_container_width=True,
+                         help="Catalogue Lookup with DNO/inactive/not-shippable hidden, ready to Slack"):
+                _jump_to_catalog_lookup(ids, context=ctx, pack=True)
 
 
 def po_details_items(po_df):
@@ -1709,6 +1932,12 @@ def po_details_items(po_df):
     disp = disp[cols]
     table_toolbar(disp, key="tb_podi", file_stem="po_items",
                   id_cols=["PO #", "SKU", "ASIN", "Master ID"], count_label=f"{len(disp):,} line items")
+    if st.button("🔎 Look up listings for these items", key="podi_cat",
+                 help="Open Catalogue Lookup with the SKUs / Master IDs currently in this table"):
+        _jump_to_catalog_lookup(
+            _ids_from_frame(filtered, ["sku", "asin", "master_id"]),
+            context=f"{len(filtered):,} PO item(s) from PO Details",
+        )
     render_table(
         disp, key=_grid_key("grid_podi"),
         numpct_cols=["Demand Fill %", "Vendor Fill %"],
@@ -1725,6 +1954,17 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     top2.markdown(f"### PO {po} — {row['vendor_name']} · {row['warehouse_name']} · {row['status']}")
     st.caption(f"{row['country_name']} · state: {row['purchase_state']} · "
                f"{_safe_int(row['lines'])} line(s) · placed {_safe_date_str(row['order_placed'])}")
+    pack_l, pack_r = st.columns(2)
+    items_for_ids = po_df[po_df["po_number"] == po]
+    ids = _ids_from_frame(items_for_ids, ["sku", "asin", "master_id"])
+    ctx = _po_pack_context(po, row)
+    with pack_l:
+        if st.button("🔎 Look up listings", key=f"pod_dd_cat_{po}", use_container_width=True):
+            _jump_to_catalog_lookup(ids, context=ctx)
+    with pack_r:
+        if st.button("📦 Raise-WO pack", key=f"pod_dd_pack_{po}", use_container_width=True,
+                     help="Catalogue Lookup with unsellable listings hidden, PO details in the Slack note"):
+            _jump_to_catalog_lookup(ids, context=ctx, pack=True)
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Orig Ordered", f"{_safe_int(row['original_ordered']):,}")
@@ -1794,14 +2034,14 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
 def po_details_tab(wo_df):
     try:
         with st.spinner("Loading PO data from Snowflake..."):
-            po_df, po_pos, _ = fetch_po_data()
+            po_df, po_pos, _ = fetch_po_data(_wh_scope_arg())
     except Exception as e:
         st.error(f"Couldn't load PO Details: {e}")
         st.caption("Confirm the app can read ANALYTICS_DB.REPORTING and that queries/po_tracker.sql is deployed.")
         return
 
-    wh = st.session_state.get("global_wh", "Both")
-    if wh != "Both":
+    wh = st.session_state.get("global_wh", "All in scope")
+    if not _wh_is_all(wh):
         po_df = po_df[po_df["warehouse_name"] == wh].copy()
         po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
 
@@ -1883,14 +2123,14 @@ def _po_link_series(s):
 
 
 def overview_tab(df, wos):
-    kpi_strip(df, wos, st.session_state.get("global_wh", "Both"))
+    kpi_strip(df, wos, st.session_state.get("global_wh", "All in scope"))
     st.markdown("---")
     po_df = po_pos = None
     po_fetch_error = None
     try:
-        po_df, po_pos, _ = fetch_po_data()
-        wh = st.session_state.get("global_wh", "Both")
-        if wh != "Both":
+        po_df, po_pos, _ = fetch_po_data(_wh_scope_arg())
+        wh = st.session_state.get("global_wh", "All in scope")
+        if not _wh_is_all(wh):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
         # Attach WO count per PO so we can flag POs with no work order (best effort).
@@ -2254,8 +2494,13 @@ def overview_tab(df, wos):
         # G) PO items without full WO coverage — ITEM level (a PO can be
         # partly fine and partly a gap; different grain from panel F above).
         try:
-            item_gap = fetch_po_item_wo_gap()
-            if wh != "Both" and "warehouse_name" in item_gap.columns:
+            item_gap = fetch_po_item_wo_gap(_wh_scope_arg())
+            _warn_missing_columns(
+                item_gap,
+                ["coverage_state", "po_number", "sku", "warehouse_name", "reason"],
+                "PO item WO gap (queries/po_item_wo_gap.sql)",
+            )
+            if not _wh_is_all(wh) and "warehouse_name" in item_gap.columns:
                 item_gap = item_gap[item_gap["warehouse_name"] == wh].copy()
         except Exception:
             item_gap = None
@@ -2351,9 +2596,9 @@ def sku_journey_tab(df, wos):
     po_df = None
     po_fetch_error = None
     try:
-        po_df, _po_pos, _ = fetch_po_data()
-        wh = st.session_state.get("global_wh", "Both")
-        if wh != "Both":
+        po_df, _po_pos, _ = fetch_po_data(_wh_scope_arg())
+        wh = st.session_state.get("global_wh", "All in scope")
+        if not _wh_is_all(wh):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
     except Exception as exc:
         po_df = None
@@ -2529,7 +2774,7 @@ def catalog_lookup_tab():
         "Paste SKUs, Listing IDs, ASINs, FNSKUs, Master IDs, MPNs, UPCs or EANs. "
         "Looks up live catalog listings (not warehouse-scoped) so you can copy the "
         "listing ids into a **raise-WO** Slack message without leaving the tool. "
-        "From Overview, use **Look up listings** on a no-WO panel to pre-fill this box."
+        "From Overview or PO Details, use **Look up listings** / **Raise-WO pack** to pre-fill this box."
     )
 
     raw = st.text_area(
@@ -2548,6 +2793,7 @@ def catalog_lookup_tab():
         st.session_state["cat_lookup_q"] = ""
         st.session_state.pop("cat_lookup_submitted", None)
         st.session_state.pop("cat_lookup_context", None)
+        st.session_state.pop("cat_lookup_pack_mode", None)
         st.rerun()
     if search:
         prev = st.session_state.get("cat_lookup_submitted", "")
@@ -2580,6 +2826,12 @@ def catalog_lookup_tab():
     if cat is None or cat.empty:
         st.warning("No catalogue rows matched those IDs.")
         return
+
+    _warn_missing_columns(
+        cat,
+        ["listing_id", "sku", "master_id", "is_dno", "marketplace"],
+        "Catalogue Lookup (queries/catalog_lookup.sql)",
+    )
 
     unmatched = []
     hay = set()
@@ -2622,31 +2874,29 @@ def catalog_lookup_tab():
 
     ctx = st.session_state.get("cat_lookup_context") or ""
     if ctx:
-        st.caption(f"Context from no-WO jump: **{ctx}**")
+        st.caption(f"Context: **{ctx}**")
+
+    filtered = catalog_filter_panel(display, "fp_cat")
+    skipped = max(len(display) - len(filtered), 0)
+    if skipped:
+        st.caption(f"Showing **{len(filtered):,}** of {len(display):,} rows after filters ({skipped:,} hidden).")
 
     send_cols = st.columns([2, 3])
     with send_cols[0]:
         if slack_send_panel_button is not None:
             slack_send_panel_button(
                 "slack_catalog_wo",
-                df=display,
+                df=filtered,
                 filename=f"catalogue_listings_{datetime.now():%Y%m%d}.csv",
-                note=_catalog_slack_note(display, ctx),
+                note=_catalog_slack_note(filtered, ctx, skipped=skipped),
                 label="📤 Send listings with a WO request",
                 use_container_width=True,
             )
         else:
             st.caption("Slack send is not configured — download the CSV and paste into Slack.")
     with send_cols[1]:
-        st.caption("Opens Slack with the listing ids in the message and the full table attached as CSV.")
+        st.caption("Sends the **filtered** table — listing ids in the message, CSV attached.")
 
-    filtered = filter_panel(
-        display, "fp_cat",
-        brand_col="Vendor" if "Vendor" in display.columns else None,
-        search_cols=[c for c in ["SKU", "Listing ID", "Master ID", "ASIN", "FNSKU",
-                                 "MPN", "Product Name", "UPC", "EAN", "Marketplace"]
-                     if c in display.columns],
-    )
     default_cols = [c for c in CATALOG_DEFAULT_COLS if c in filtered.columns]
     cols = column_picker(list(filtered.columns), key="cols_cat",
                          default_labels=default_cols, required=["Listing ID"] if "Listing ID" in filtered.columns else ())
@@ -2675,12 +2925,19 @@ def main():
                                           "storage_view", "po_view", "po_details_view",
                                           "pod_only_nowo", "skuj_q", "skuj_pick",
                                           "cat_lookup_q", "cat_lookup_submitted",
-                                          "cat_lookup_context"):
+                                          "cat_lookup_context", "cat_lookup_pack_mode",
+                                          "wh_scope"):
             st.session_state[_k] = st.session_state[_k]
     # Honour a tab jump requested from a button on another view (must run
     # before the nav radio is instantiated).
     if "pending_nav" in st.session_state:
         st.session_state["main_nav"] = st.session_state.pop("pending_nav")
+
+    options = _warehouse_picker_options()
+    option_names = [w["name"] for w in options]
+    default_names = warehouse_names(_warehouse_override())
+    if "wh_scope" not in st.session_state:
+        st.session_state["wh_scope"] = [n for n in default_names if n in option_names] or list(option_names[:2])
 
     h1, h2, h3 = st.columns([3, 1.3, 0.9])
     with h1:
@@ -2688,25 +2945,57 @@ def main():
         st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
     with h2:
         st.markdown("##### 🏭 Warehouse")
-        _wh_names = warehouse_names(_warehouse_override())
-        _wh_options = (["Both"] + _wh_names) if len(_wh_names) > 1 else _wh_names
-        warehouse = st.radio(
-            "Warehouse", _wh_options,
-            horizontal=True, label_visibility="collapsed", key="global_wh",
-        )
+        picked = [n for n in (st.session_state.get("wh_scope") or default_names) if n in option_names]
+        if not picked:
+            picked = [n for n in default_names if n in option_names] or option_names[:1]
+        all_label = "All in scope"
+        if st.session_state.get("global_wh") == "Both":
+            st.session_state["global_wh"] = all_label
+        _wh_options = ([all_label] + picked) if len(picked) > 1 else picked
+        if st.session_state.get("global_wh") not in _wh_options:
+            st.session_state["global_wh"] = _wh_options[0] if _wh_options else all_label
+        if len(_wh_options) <= 4:
+            warehouse = st.radio(
+                "Warehouse", _wh_options,
+                horizontal=True, label_visibility="collapsed", key="global_wh",
+            )
+        else:
+            warehouse = st.selectbox(
+                "Warehouse", _wh_options,
+                label_visibility="collapsed", key="global_wh",
+            )
     with h3:
         if slack_messenger_button:
             slack_messenger_button()
 
+    with st.expander("➕ Add warehouses to this query"):
+        st.multiselect(
+            "Warehouses to load from Snowflake",
+            options=option_names,
+            key="wh_scope",
+            help="Default is Northampton + Wroclaw. Tick more names (from the warehouse table) "
+                 "to include them in WO / PO queries. No code change needed.",
+        )
+        st.caption("The header filter only slices what is already loaded. Tick extra warehouses here, "
+                   "then wait for the query to rerun.")
+
+    picked_names = [n for n in (st.session_state.get("wh_scope") or default_names) if n in option_names]
+    by_name = {w["name"]: w for w in options}
+    override_list = [by_name[n] for n in picked_names if n in by_name]
+    if not override_list:
+        override_list = get_warehouses(_warehouse_override())
+    wh_scope = tuple((int(w["id"]), w["name"]) for w in override_list)
+    st.session_state["_wh_scope_tuple"] = wh_scope
+
     try:
         with st.spinner("Loading WO data from Snowflake..."):
-            df, wos, last_refresh = fetch_data()
+            df, wos, last_refresh = fetch_data(wh_scope)
     except Exception as e:
         st.error(f"Failed to fetch data from Snowflake: {e}")
         st.info("Check `.streamlit/secrets.toml` — see README for setup.")
         st.stop()
 
-    if warehouse != "Both":
+    if warehouse not in ("All in scope", "Both"):
         df = df[df["warehouse"] == warehouse].copy()
         wos = wos[wos["warehouse"] == warehouse].copy()
 
