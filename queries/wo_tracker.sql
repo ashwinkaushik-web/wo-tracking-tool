@@ -184,5 +184,6 @@ WHERE woi.deleted_at IS NULL
   AND wo.deleted_at IS NULL
   AND woi.for_accepted_overage = FALSE
   AND woi.created_at >= DATE_TRUNC('year', CURRENT_DATE)
+  -- Warehouse scope: app rewrites this id list at runtime from warehouses.py.
   AND wh.id IN (138, 146)
 ORDER BY woi.work_order_id, woi.id;
