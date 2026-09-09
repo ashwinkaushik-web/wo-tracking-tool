@@ -27,6 +27,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime
 from pathlib import Path
+from warehouses import get_warehouses, warehouse_names, apply_warehouse_scope
 try:
     from slack_messaging import (slack_messenger_button, slack_send_panel_button,
                                  slack_table_sender)
@@ -36,51 +37,12 @@ except Exception:  # feature is optional — never break the app if it's absent
     slack_table_sender = None
 _FLAG_GUIDE_ERROR = None
 try:
-    from flag_guide import (render_flag_guide, render_flag_guide_inline, flag_action,
-                            flag_action_detailed)
+    from flag_guide import render_flag_guide, render_flag_guide_inline, flag_action
 except Exception as _flag_exc:  # keep the app up, but do not hide the failure
     render_flag_guide = None
     render_flag_guide_inline = None
     flag_action = None
-    flag_action_detailed = None
     _FLAG_GUIDE_ERROR = f"{type(_flag_exc).__name__}: {_flag_exc}"
-
-
-def _add_what_to_do(display, reason_col="Reason", woi_col="WOI ID"):
-    """Add a per-row 'What to do' column. Where possible this is made SPECIFIC to
-    the line — its marketplace, the exact stacked reason(s), and the resolvable
-    quantity a fix would unlock — by merging in fetch_wo_unpickable_detail() keyed
-    on WOI ID. Falls back to the generic flag_action(reason) when that deeper
-    detail isn't available (e.g. no WOI ID column, or the query is unreachable)."""
-    if reason_col not in display.columns:
-        return display
-    if flag_action_detailed is None:
-        if flag_action is not None:
-            display["What to do"] = display[reason_col].map(flag_action)
-        return display
-
-    has_mkt = {"marketplace", "marketplace_country"}.issubset(display.columns)
-    if woi_col in display.columns:
-        det = fetch_wo_unpickable_detail()
-        if det is not None and "woi_id" in det.columns:
-            det_keep = [c for c in ["woi_id", "active_reasons", "resolvable_qty"] if c in det.columns]
-            display = display.merge(det[det_keep], left_on=woi_col, right_on="woi_id",
-                                    how="left").drop(columns=["woi_id"], errors="ignore")
-
-    def _mkt(row):
-        if not has_mkt or pd.isna(row.get("marketplace")):
-            return None
-        country = row.get("marketplace_country")
-        suffix = f" ({country})" if pd.notna(country) and str(country).strip() else ""
-        return f"{row['marketplace']}{suffix}"
-
-    display["What to do"] = display.apply(
-        lambda r: flag_action_detailed(
-            r[reason_col], marketplace=_mkt(r),
-            resolvable_qty=r.get("resolvable_qty"), active_reasons=r.get("active_reasons"),
-        ), axis=1)
-    return display.drop(columns=["marketplace", "marketplace_country", "active_reasons",
-                                 "resolvable_qty"], errors="ignore")
 
 
 def _running_build_label() -> str:
@@ -137,7 +99,32 @@ PO_QUERY_PATH = Path(__file__).parent / "queries" / "po_tracker.sql"
 PO_WO_AGG_PATH = Path(__file__).parent / "queries" / "po_wo_agg.sql"
 PO_ITEM_GAP_PATH = Path(__file__).parent / "queries" / "po_item_wo_gap.sql"
 UNPICK_DETAIL_PATH = Path(__file__).parent / "queries" / "wo_unpickable_detail.sql"
+CATALOG_QUERY_PATH = Path(__file__).parent / "queries" / "catalog_lookup.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
+MAX_CATALOG_IDS = 500
+NAV_CATALOG = "🔎 Catalogue Lookup"
+
+
+def _warehouse_override():
+    """Optional [warehouses] override from Streamlit secrets (a list of
+    {id, name}). Lets someone add a warehouse via the Streamlit dashboard
+    without editing code. Falls back to warehouses.py / the env var."""
+    try:
+        raw = st.secrets.get("warehouses")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return [dict(w) for w in raw]
+
+
+def _active_warehouses():
+    return get_warehouses(_warehouse_override())
+
+
+def _scope_sql(sql: str) -> str:
+    """Scope a query's warehouse IN(...) clauses to the configured warehouses."""
+    return apply_warehouse_scope(sql, _warehouse_override())
 
 FLAG_ORDER = [
     "🔴 Blocked / Issue", "🟠 Partially Processed",
@@ -168,9 +155,9 @@ COLUMN_GLOSSARY = {
     "Item Name": "Product name (from the PFS table or the catalog).",
     "Source": "Where the WO came from: 'Storage', 'PO# <n>', or an IR number.",
     # --- context ---
-    "WH": "Warehouse — Northampton (UK, id 138) or Wroclaw (EU, id 146).",
+    "WH": "Warehouse the WO / PO belongs to (see the Warehouse filter for the tracked set).",
     "Brand": "WO level: most common brand in the WO. Item level: the item's brand.",
-    "Marketplace": "Marketplace the item is listed on.",
+    "Marketplace": "Marketplace the listing / item is on (Amazon UK, Amazon DE, …).",
     "Country": "Marketplace country.",
     "Pick Type": "Single or Bundle pick.",
     "Created By": "User who created the item ('amaczar_app' shows as Shelf).",
@@ -215,6 +202,30 @@ COLUMN_GLOSSARY = {
     "Age (d)": "Age in days since created (WO level: the oldest item).",
     "Days Overdue": "Days past the item's own ship-by date.",
     "Days Past": "Days past the PO reference ship-by (later of WO & PO ship-by).",
+    # --- catalogue lookup ---
+    "Listing ID": "Catalog listing id — the id used to raise a work order.",
+    "SKU": "Marketplace primary id (seller SKU).",
+    "FNSKU": "Amazon FNSKU (LISTING_MP_SECONDARY_ID). Blank on non-FBA.",
+    "MPN": "Manufacturer part number.",
+    "ASIN": "Amazon ASIN (LISTING_MP_PAGE_ID).",
+    "Commingled": "FBA commingled vs stickered status (Amazon vs Pattern flag).",
+    "Shippable": "Whether the listing is tagged shippable in the catalog.",
+    "Listing Type": "Catalog listing type.",
+    "DNO": "Do Not Order — latest catalog status-history flag.",
+    "Active": "Whether the listing is currently active.",
+    "Discontinued": "Whether the product is discontinued.",
+    "Product Name": "Catalog product name.",
+    "UPC": "UPC barcode.",
+    "EAN": "EAN barcode.",
+    "Can Expire": "Whether the product can expire (lot / expiry tracking).",
+    "Wholesale": "Finance-approved wholesale price (with currency).",
+    "MAP": "Minimum advertised price (with currency).",
+    "Retail": "Retail price (with currency).",
+    "MSRP": "Manufacturer suggested retail price (with currency).",
+    "DNO Note": "Do-Not-Order note from the catalog DNO setting.",
+    "DNO Reason": "Do-Not-Order reason code.",
+    "Seller": "Marketplace seller name.",
+    "Fulfillment": "Listing fulfillment type (FBA, FBM, …).",
 }
 
 
@@ -345,7 +356,7 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_data():
-    sql = QUERY_PATH.read_text()
+    sql = _scope_sql(QUERY_PATH.read_text())
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -756,13 +767,16 @@ def sidebar(last_refresh):
         st.sidebar.metric("Last refresh", last_refresh.strftime("%H:%M:%S"), f"{delta_min:.0f} min ago")
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
         fetch_data.clear()
+        fetch_catalog_lookup.clear()
         _reset_selection()
         st.rerun()
     st.sidebar.markdown("---")
+    _wh_list = ", ".join(f"{w['name']} ({w['id']})" for w in _active_warehouses())
     st.sidebar.markdown(
         "**Coverage**\n\n"
         "- All WOs created since Jan 1 this year\n"
-        "- Northampton (138) + Wroclaw (146)\n"
+        f"- {_wh_list}\n"
+        "- Catalogue Lookup is live catalog search (not warehouse-filtered)\n"
         "- Auto-refresh every 30 min\n"
     )
     st.sidebar.markdown("---")
@@ -1073,15 +1087,14 @@ def storage_item_view(s_items, s_wos):
     storage_kpi_strip(filtered, fwos)
     if render_flag_guide_inline is not None and "block_reason_pfs" in filtered.columns:
         render_flag_guide_inline(set(filtered["block_reason_pfs"].dropna()))
-    keep_cols = ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
-                 "master_id", "listing_id", "finished_good_name", "source_brand",
-                 "warehouse", "status_simple", "pick_type",
-                 "processing_status", "block_reason_pfs", "original_request", "current_request",
-                 "processed", "order_created", "shipped", "storage", "woi_processing_pct",
-                 "age_days_from_created", "days_overdue"]
-    if {"marketplace", "marketplace_country"}.issubset(filtered.columns):
-        keep_cols += ["marketplace", "marketplace_country"]
-    display = filtered[keep_cols].rename(columns={
+    display = filtered[
+        ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
+         "master_id", "listing_id", "finished_good_name", "source_brand",
+         "warehouse", "status_simple", "pick_type",
+         "processing_status", "block_reason_pfs", "original_request", "current_request",
+         "processed", "order_created", "shipped", "storage", "woi_processing_pct",
+         "age_days_from_created", "days_overdue"]
+    ].rename(columns={
         "work_order_item_id": "WOI ID", "ship_by": "Ship By", "created_at": "Created At",
         "last_edit_at": "Last Edit At", "work_order_number": "WO",
         "master_id": "Master ID", "listing_id": "Listing", "finished_good_name": "Item Name",
@@ -1091,7 +1104,8 @@ def storage_item_view(s_items, s_wos):
         "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
         "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
     })
-    display = _add_what_to_do(display)
+    if flag_action is not None and "Reason" in display.columns:
+        display["What to do"] = display["Reason"].map(flag_action)
     cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
     display = display[cols]
 
@@ -1276,7 +1290,7 @@ def po_item_view(p_items, p_wos):
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_po_data():
-    sql = PO_QUERY_PATH.read_text()
+    sql = _scope_sql(PO_QUERY_PATH.read_text())
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1334,7 +1348,7 @@ def fetch_po_item_wo_gap():
     """Item-level (PO x Master ID) WO coverage gaps — No WO / Partial WO lines
     only (queries/po_item_wo_gap.sql). Different grain from fetch_po_wo_agg,
     which rolls up to one row per whole PO."""
-    sql = PO_ITEM_GAP_PATH.read_text()
+    sql = _scope_sql(PO_ITEM_GAP_PATH.read_text())
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1377,6 +1391,115 @@ def fetch_wo_unpickable_detail():
         return df
     except Exception:
         return None
+
+
+# ============================================================
+# CATALOGUE LOOKUP — Search by ID (listings / SKU / ASIN / Master ID / …)
+# ============================================================
+def parse_catalog_ids(raw):
+    """Split a pasted blob into unique IDs (comma / newline / semicolon / space)."""
+    seen = set()
+    out = []
+    for term in re.split(r"[\s,;]+", str(raw or "")):
+        token = term.strip().upper()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= MAX_CATALOG_IDS:
+            break
+    return out
+
+
+def build_catalog_query(ids):
+    """Catalogue Lookup Search-by-ID. Pushes the ID list into q1/q2 so Snowflake
+    does not scan the whole catalog. ``ids`` must already be uppercased."""
+    if not ids:
+        raise ValueError("No IDs to look up.")
+    quoted = ", ".join("'" + i.replace("'", "''") + "'" for i in ids)
+    return CATALOG_QUERY_PATH.read_text().replace("{upper_list}", quoted)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_catalog_lookup(ids):
+    """Run the Search-by-ID catalog query. ``ids`` is a tuple so Streamlit can cache it."""
+    sql = build_catalog_query(list(ids))
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+    for col in ("sku", "listing_id", "master_id", "mpn", "asin", "fnsku", "upc", "ean",
+                "marketplace", "vendor", "product_name", "dno_note", "dno_reason_code",
+                "marketplace_seller", "listing_fulfillment_type", "commingled_status",
+                "listing_type"):
+        if col in df.columns:
+            df[col] = df[col].map(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+    return df
+
+
+def _catalog_bool(series):
+    if series is None:
+        return None
+    if str(series.dtype) == "bool":
+        return series.fillna(False)
+    return series.astype(str).str.strip().str.lower().isin(("true", "1", "t", "yes"))
+
+
+def _ids_from_frame(frame, cols):
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    out = []
+    for c in cols:
+        if c in frame.columns:
+            out.extend(frame[c].dropna().astype(str).tolist())
+    return out
+
+
+def _jump_to_catalog_lookup(ids, *, context=""):
+    """Switch to Catalogue Lookup with these IDs already pasted, ready to search."""
+    parsed = parse_catalog_ids("\n".join(str(i) for i in ids))
+    if not parsed:
+        st.warning("No SKU / ASIN / Master ID found on those rows to look up.")
+        return
+    text = "\n".join(parsed)
+    st.session_state["cat_lookup_q"] = text
+    st.session_state["cat_lookup_submitted"] = text
+    st.session_state["cat_lookup_context"] = context or ""
+    st.session_state["pending_nav"] = NAV_CATALOG
+    st.rerun()
+
+
+def _catalog_slack_note(display, context=""):
+    """Prefill for 'please raise a WO' — listing ids in the message body + CSV attached."""
+    n = len(display)
+    header = "Please raise a work order for the listing(s) below."
+    if context:
+        header = f"Please raise a work order — {context}."
+    lines = [header, "", f"{n} listing row(s) attached as CSV from Catalogue Lookup."]
+    if "Status" in display.columns:
+        n_dno = int(display["Status"].astype(str).str.contains("DNO", na=False).sum())
+        if n_dno:
+            lines.append(f":warning: {n_dno} of these listing(s) are flagged DNO.")
+    lines.append("")
+    cap = 40
+    for _, row in display.head(cap).iterrows():
+        lid = str(row.get("Listing ID", "") or "").strip()
+        sku = str(row.get("SKU", "") or "").strip()
+        mid = str(row.get("Master ID", "") or "").strip()
+        name = str(row.get("Product Name", "") or "").strip()
+        mkt = str(row.get("Marketplace", "") or "").strip()
+        bits = [b for b in (lid, sku, mid) if b and b.lower() != "nan"]
+        label = " / ".join(bits) if bits else "(no id)"
+        extra = " — ".join(x for x in (name, mkt) if x and x.lower() != "nan")
+        lines.append(f"• {label}" + (f" — {extra}" if extra else ""))
+    if n > cap:
+        lines.append(f"• … and {n - cap} more in the attached CSV")
+    return "\n".join(lines)
 
 
 def _po_item_status(df):
@@ -1967,15 +2090,15 @@ def overview_tab(df, wos):
         if blocked.empty:
             st.caption("None blocked in PFS right now.")
         else:
-            _blk_cols = ["work_order_item_id", "work_order_number", "source_brand", "block_reason_pfs",
-                        "warehouse", "ship_by", "days_overdue"]
-            if {"marketplace", "marketplace_country"}.issubset(blocked.columns):
-                _blk_cols += ["marketplace", "marketplace_country"]
-            d = blocked.sort_values("days_overdue", ascending=False)[_blk_cols].rename(columns={
+            d = blocked.sort_values("days_overdue", ascending=False)[
+                ["work_order_item_id", "work_order_number", "source_brand", "block_reason_pfs",
+                 "warehouse", "ship_by", "days_overdue"]
+            ].rename(columns={
                 "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_brand": "Brand",
                 "block_reason_pfs": "Reason", "warehouse": "WH", "ship_by": "Ship By",
                 "days_overdue": "Days Overdue"})
-            d = _add_what_to_do(d)
+            if flag_action is not None:
+                d["What to do"] = d["Reason"].map(flag_action)
             if render_flag_guide_inline is not None:
                 render_flag_guide_inline(set(d["Reason"].dropna()))
             _panel(d, "ov_blocked", date_cols=["Ship By"], pin_cols=["WOI ID"])
@@ -2094,7 +2217,7 @@ def overview_tab(df, wos):
                     "ship_date": "Ship Date", "first_arrival": "First Arrival",
                     "_age": "Days Since Placed", "original_ordered": "Ordered", "received": "Received"})
                 d["PO #"] = _ov_po_str(d["PO #"])
-                _dlc, _slc = st.columns(2)
+                _dlc, _slc, _lkc = st.columns(3)
                 with _dlc:
                     st.download_button(
                         "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
@@ -2108,6 +2231,20 @@ def overview_tab(df, wos):
                             note=f"PO-level no-WO list — {len(d):,} POs placed/arriving with no linked "
                                  "work order (attached from WO Tracker). Please review / raise WOs.",
                             use_container_width=True)
+                with _lkc:
+                    if st.button("🔎 Look up listings", key="jump_nowo_cat",
+                                 use_container_width=True,
+                                 help="Open Catalogue Lookup with the SKUs / Master IDs from these POs"):
+                        pos = set(nowo["po_number"].astype(str))
+                        subset = po_df[po_df["po_number"].astype(str).isin(pos)] if po_df is not None else None
+                        ids = _ids_from_frame(subset, ["sku", "asin", "master_id"])
+                        po_nums = [x for x in _ov_po_str(nowo["po_number"]).tolist() if x]
+                        shown = ", ".join(po_nums[:12])
+                        extra = f" (+{len(po_nums) - 12} more)" if len(po_nums) > 12 else ""
+                        _jump_to_catalog_lookup(
+                            ids,
+                            context=f"POs with no work order: {shown}{extra}",
+                        )
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
                        pin_cols=["PO #"], color_rows=True,
@@ -2161,7 +2298,7 @@ def overview_tab(df, wos):
                     _src = d["Reason"].astype(str)
                     _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
                     d["What to do"] = _src.map(flag_action)
-                _dlc2, _slc2 = st.columns(2)
+                _dlc2, _slc2, _lkc2 = st.columns(3)
                 with _dlc2:
                     st.download_button(
                         "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
@@ -2175,6 +2312,22 @@ def overview_tab(df, wos):
                             note=f"Item-level WO coverage gaps — {len(d):,} item-lines without full "
                                  "work-order coverage (attached from WO Tracker).",
                             use_container_width=True)
+                with _lkc2:
+                    if st.button("🔎 Look up listings", key="jump_item_gap_cat",
+                                 use_container_width=True,
+                                 help="Open Catalogue Lookup with these SKUs / Master IDs"):
+                        ids = _ids_from_frame(item_gap, ["sku", "asin", "master_id"])
+                        po_nums = []
+                        if "po_number" in item_gap.columns:
+                            po_nums = [x for x in _ov_po_str(item_gap["po_number"]).tolist() if x]
+                        uniq_pos = list(dict.fromkeys(po_nums))
+                        shown = ", ".join(uniq_pos[:12])
+                        extra = f" (+{len(uniq_pos) - 12} more)" if len(uniq_pos) > 12 else ""
+                        _jump_to_catalog_lookup(
+                            ids,
+                            context=f"{len(item_gap):,} PO item(s) without full WO coverage"
+                                    + (f" (POs {shown}{extra})" if shown else ""),
+                        )
                 if render_flag_guide_inline is not None:
                     _gap_reasons = set(item_gap["reason"].dropna())
                     if (item_gap["coverage_state"] == "Partial WO").any():
@@ -2331,6 +2484,185 @@ def _sku_journey_render(mid, df, po_df):
 
 
 # ============================================================
+# CATALOGUE LOOKUP TAB — paste IDs, look up listings, send with a WO request
+# ============================================================
+CATALOG_COL_LABELS = {
+    "status": "Status",
+    "marketplace": "Marketplace",
+    "vendor": "Vendor",
+    "sku": "SKU",
+    "listing_fulfillment_type": "Fulfillment",
+    "listing_id": "Listing ID",
+    "master_id": "Master ID",
+    "mpn": "MPN",
+    "asin": "ASIN",
+    "fnsku": "FNSKU",
+    "commingled_status": "Commingled",
+    "shippable_tag": "Shippable",
+    "listing_type": "Listing Type",
+    "is_dno": "DNO",
+    "is_active": "Active",
+    "is_discontinued": "Discontinued",
+    "product_name": "Product Name",
+    "upc": "UPC",
+    "ean": "EAN",
+    "can_expire": "Can Expire",
+    "wholesale_price": "Wholesale",
+    "map_price": "MAP",
+    "retail_price": "Retail",
+    "msrp_price": "MSRP",
+    "dno_note": "DNO Note",
+    "dno_reason_code": "DNO Reason",
+    "marketplace_seller": "Seller",
+}
+
+CATALOG_DEFAULT_COLS = [
+    "Status", "SKU", "Listing ID", "Master ID", "Product Name", "Marketplace",
+    "Vendor", "Fulfillment", "ASIN", "FNSKU", "Commingled", "Shippable",
+    "DNO", "Active", "Seller",
+]
+
+
+def catalog_lookup_tab():
+    st.markdown("#### 🔎 Catalogue Lookup — search by ID")
+    st.caption(
+        "Paste SKUs, Listing IDs, ASINs, FNSKUs, Master IDs, MPNs, UPCs or EANs. "
+        "Looks up live catalog listings (not warehouse-scoped) so you can copy the "
+        "listing ids into a **raise-WO** Slack message without leaving the tool. "
+        "From Overview, use **Look up listings** on a no-WO panel to pre-fill this box."
+    )
+
+    raw = st.text_area(
+        "Paste IDs",
+        key="cat_lookup_q",
+        height=120,
+        placeholder="One per line, or comma-separated — e.g.\nB0ABC123DE\nP0EAVTZV\n1234567890",
+        help="Split on commas, new lines, semicolons or spaces. Max "
+             f"{MAX_CATALOG_IDS} IDs per search.",
+    )
+    b1, b2, _ = st.columns([1.2, 1, 4])
+    search = b1.button("Search catalogue", type="primary", use_container_width=True)
+    clear = b2.button("Clear", use_container_width=True)
+
+    if clear:
+        st.session_state["cat_lookup_q"] = ""
+        st.session_state.pop("cat_lookup_submitted", None)
+        st.session_state.pop("cat_lookup_context", None)
+        st.rerun()
+    if search:
+        prev = st.session_state.get("cat_lookup_submitted", "")
+        st.session_state["cat_lookup_submitted"] = raw
+        if parse_catalog_ids(raw) != parse_catalog_ids(prev):
+            st.session_state["cat_lookup_context"] = ""
+
+    submitted = st.session_state.get("cat_lookup_submitted", "")
+    if not submitted or not str(submitted).strip():
+        st.info("Paste one or more IDs above and press **Search catalogue**.")
+        return
+
+    ids = parse_catalog_ids(submitted)
+    if not ids:
+        st.warning("No IDs found in what you pasted.")
+        return
+    n_raw = len([t for t in re.split(r"[\s,;]+", str(submitted).strip()) if t.strip()])
+    if n_raw > MAX_CATALOG_IDS:
+        st.caption(f"Using the first {MAX_CATALOG_IDS:,} of {n_raw:,} pasted IDs.")
+
+    try:
+        with st.spinner(f"Looking up {len(ids):,} ID(s) in the catalogue…"):
+            cat = fetch_catalog_lookup(tuple(ids))
+    except Exception as exc:
+        st.error(f"Catalogue lookup failed: {type(exc).__name__}: {exc}")
+        st.caption("Needs read access to ANALYTICS_DB.STG_CATALOG and "
+                   "PATTERN_DB.PUBLIC product-catalog views. Check the Snowflake role.")
+        return
+
+    if cat is None or cat.empty:
+        st.warning("No catalogue rows matched those IDs.")
+        return
+
+    unmatched = []
+    hay = set()
+    for c in ("sku", "listing_id", "asin", "mpn", "master_id", "fnsku", "upc", "ean"):
+        if c in cat.columns:
+            hay |= {str(v).strip().upper() for v in cat[c].dropna() if str(v).strip()}
+    unmatched = [i for i in ids if i not in hay]
+
+    dno = _catalog_bool(cat["is_dno"]) if "is_dno" in cat.columns else None
+    disc = _catalog_bool(cat["is_discontinued"]) if "is_discontinued" in cat.columns else None
+    active = _catalog_bool(cat["is_active"]) if "is_active" in cat.columns else None
+    status = pd.Series("🟢 Active", index=cat.index)
+    if active is not None:
+        status = status.mask(~active.fillna(True), "🟡 Inactive")
+    if disc is not None:
+        status = status.mask(disc.fillna(False), "🟠 Discontinued")
+    if dno is not None:
+        status = status.mask(dno.fillna(False), "🔴 DNO")
+    cat = cat.copy()
+    cat.insert(0, "status", status)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows", f"{len(cat):,}")
+    m2.metric("Listings", f"{cat['listing_id'].replace('', pd.NA).nunique():,}"
+              if "listing_id" in cat.columns else "—")
+    n_dno = int(dno.fillna(False).sum()) if dno is not None else 0
+    m3.metric("DNO", f"{n_dno:,}")
+    m4.metric("IDs unmatched", f"{len(unmatched):,}")
+    if unmatched:
+        with st.expander(f"{len(unmatched):,} pasted ID(s) did not match a catalogue row"):
+            st.code("\n".join(unmatched), language="text")
+
+    display = cat.rename(columns=CATALOG_COL_LABELS)
+    ordered, seen = [], set()
+    for lab in CATALOG_COL_LABELS.values():
+        if lab in display.columns and lab not in seen:
+            ordered.append(lab)
+            seen.add(lab)
+    display = display[ordered]
+
+    ctx = st.session_state.get("cat_lookup_context") or ""
+    if ctx:
+        st.caption(f"Context from no-WO jump: **{ctx}**")
+
+    send_cols = st.columns([2, 3])
+    with send_cols[0]:
+        if slack_send_panel_button is not None:
+            slack_send_panel_button(
+                "slack_catalog_wo",
+                df=display,
+                filename=f"catalogue_listings_{datetime.now():%Y%m%d}.csv",
+                note=_catalog_slack_note(display, ctx),
+                label="📤 Send listings with a WO request",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Slack send is not configured — download the CSV and paste into Slack.")
+    with send_cols[1]:
+        st.caption("Opens Slack with the listing ids in the message and the full table attached as CSV.")
+
+    filtered = filter_panel(
+        display, "fp_cat",
+        brand_col="Vendor" if "Vendor" in display.columns else None,
+        search_cols=[c for c in ["SKU", "Listing ID", "Master ID", "ASIN", "FNSKU",
+                                 "MPN", "Product Name", "UPC", "EAN", "Marketplace"]
+                     if c in display.columns],
+    )
+    default_cols = [c for c in CATALOG_DEFAULT_COLS if c in filtered.columns]
+    cols = column_picker(list(filtered.columns), key="cols_cat",
+                         default_labels=default_cols, required=["Listing ID"] if "Listing ID" in filtered.columns else ())
+    filtered = filtered[cols]
+    table_toolbar(filtered, key="tb_cat", file_stem="catalogue_listings",
+                  id_cols=["Listing ID", "SKU", "Master ID", "ASIN", "FNSKU"],
+                  count_label=f"{len(filtered):,} listing row(s)")
+    render_table(
+        filtered, key=_grid_key("cat_lookup"), pin_cols=["Listing ID", "SKU"],
+        color_rows=True, height=480,
+        slack_label_cols=["Listing ID", "SKU", "Product Name"],
+        slack_filename="catalogue_listings.csv",
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -2341,8 +2673,14 @@ def main():
     for _k in list(st.session_state.keys()):
         if _k.startswith("fp_") or _k in ("global_wh", "main_nav", "po_subnav",
                                           "storage_view", "po_view", "po_details_view",
-                                          "pod_only_nowo", "skuj_q", "skuj_pick"):
+                                          "pod_only_nowo", "skuj_q", "skuj_pick",
+                                          "cat_lookup_q", "cat_lookup_submitted",
+                                          "cat_lookup_context"):
             st.session_state[_k] = st.session_state[_k]
+    # Honour a tab jump requested from a button on another view (must run
+    # before the nav radio is instantiated).
+    if "pending_nav" in st.session_state:
+        st.session_state["main_nav"] = st.session_state.pop("pending_nav")
 
     h1, h2, h3 = st.columns([3, 1.3, 0.9])
     with h1:
@@ -2350,8 +2688,10 @@ def main():
         st.caption("Storage and PO Work Order tracking · live Snowflake snapshot · auto-refresh every 30 min")
     with h2:
         st.markdown("##### 🏭 Warehouse")
+        _wh_names = warehouse_names(_warehouse_override())
+        _wh_options = (["Both"] + _wh_names) if len(_wh_names) > 1 else _wh_names
         warehouse = st.radio(
-            "Warehouse", ["Both", "Northampton", "Wroclaw"],
+            "Warehouse", _wh_options,
             horizontal=True, label_visibility="collapsed", key="global_wh",
         )
     with h3:
@@ -2383,7 +2723,7 @@ def main():
     nav_pos = "🚚 POs"
     nav_storage = f"📦 Manual/Storage WOs ({n_storage})"
     choice = st.radio(
-        "View", [nav_overview, nav_sku, nav_pos, nav_storage],
+        "View", [nav_overview, nav_sku, nav_pos, nav_storage, NAV_CATALOG],
         horizontal=True, label_visibility="collapsed", key="main_nav",
     )
     st.markdown("---")
@@ -2402,6 +2742,8 @@ def main():
             po_tab(df, wos)
     elif choice == nav_storage:
         storage_tab(df, wos)
+    elif choice == NAV_CATALOG:
+        catalog_lookup_tab()
 
     st.caption(
         f"Build `{_running_build_label()}` · if a merged change is missing, "
