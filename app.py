@@ -221,7 +221,8 @@ COLUMN_GLOSSARY = {
     # --- identifiers ---
     "WO": "Work Order number — the WO id.",
     "WOI ID": "Work Order Item id — the unique key for a single line of a WO.",
-    "PO #": "Purchase Order number (PO-raised WOs only).",
+    "PO #": "Purchase Order number. Copy this cell for the number only; use Shelf to open it.",
+    "Shelf": "Opens this PO in Shelf. Does not copy — copy the PO # column for the number.",
     "Master ID": "Master / catalog identifier for the product.",
     "Listing": "Listing ID for the product on the marketplace.",
     "Item Name": "Product name (from the PFS table or the catalog).",
@@ -627,6 +628,19 @@ def copy_table_button(display, key):
     components.html(html_out, height=46)
 
 
+def _plain_copy_value(col, value):
+    """Value to put on the clipboard. PO # must be the number, never the Shelf URL."""
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "<na>"):
+        return ""
+    if col in ("PO #", "Shelf") or col in PO_LINK_COLUMNS:
+        m = re.search(r"/details/(\d+)", s)
+        if m:
+            return m.group(1)
+        s = s.split(".")[0] if s.endswith(".0") and s[:-2].isdigit() else s
+    return s
+
+
 def copy_popover(display, id_cols, key):
     """Copy values from a column — all of them, or tick just a few. Or
     drag-select cells in the table and Ctrl+C to copy a row/column straight."""
@@ -636,10 +650,12 @@ def copy_popover(display, id_cols, key):
     with st.popover("📋 Copy items", use_container_width=True):
         st.caption(
             "Pick a column, optionally tick just the values you want, then use the copy "
-            "icon on the block. Or drag-select cells in the table and press Ctrl+C."
+            "icon on the block. PO # copies the number only (not the Shelf URL). "
+            "Or drag-select PO # cells in the table and press Ctrl+C."
         )
         c = st.selectbox("Column", present, key=f"{key}_col")
-        vals = [v for v in display[c].astype(str).tolist() if v and v.strip() and v.lower() != "nan"]
+        vals = [_plain_copy_value(c, v) for v in display[c].tolist()]
+        vals = [v for v in vals if v]
         seen = set()
         uniq = [x for x in vals if not (x in seen or seen.add(x))]
         picked = st.multiselect(
@@ -812,7 +828,10 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
     going to a column header tells you what it actually means.
 
     link_cols: {column_name: display_text} — render that column (which holds URLs)
-    as a clickable link showing display_text (e.g. "↗ Shelf")."""
+    as a clickable link showing display_text (e.g. "↗ Shelf").
+
+    PO # stays a plain number so Ctrl+C copies 135378, not the Shelf URL. A
+    separate Shelf column holds the link."""
     link_cols = link_cols or {}
     colcfg = {}
     pin_set = set(pin_cols)
@@ -820,8 +839,14 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
     for c in display.columns:
         help_txt = COLUMN_GLOSSARY.get(c)  # None = no tooltip, which is fine
         if c in po_cols:
-            # PO number itself becomes a clickable Shelf link (number stays visible).
-            colcfg[c] = st.column_config.LinkColumn(c, help=help_txt, display_text=r"details/(\d+)")
+            # Plain number — Ctrl+C / Copy items copy 135378, not the URL.
+            kwargs = {"help": help_txt}
+            if c in pin_set:
+                kwargs["pinned"] = "left"
+            try:
+                colcfg[c] = st.column_config.TextColumn(c, **kwargs)
+            except TypeError:
+                colcfg[c] = st.column_config.TextColumn(c, help=help_txt)
         elif c in link_cols:
             colcfg[c] = st.column_config.LinkColumn(c, help=help_txt, display_text=link_cols[c])
         elif c in pct_cols:
@@ -848,14 +873,19 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
             slack_table_sender(key, df, label_cols=slack_label_cols,
                                filename=slack_filename, allow_whole=slack_whole)
 
-    # For rendering only, swap PO-number columns for their Shelf URLs so LinkColumn
-    # can make them clickable. The original `display` (plain numbers) is what the
-    # Slack sender attaches and what Ctrl+C copies — exports/copy stay clean.
+    # PO # stays the number (copyable). Add a Shelf link column for click-through.
     render_df = display
     if po_cols:
         render_df = display.copy()
-        for c in po_cols:
-            render_df[c] = _po_link_series(render_df[c])
+        first = po_cols[0]
+        if SHELF_COL not in render_df.columns:
+            loc = list(render_df.columns).index(first) + 1
+            render_df.insert(loc, SHELF_COL, _po_link_series(render_df[first]))
+            colcfg[SHELF_COL] = st.column_config.LinkColumn(
+                SHELF_COL,
+                help=COLUMN_GLOSSARY.get(SHELF_COL),
+                display_text="Open",
+            )
 
     if selectable:
         event = st.dataframe(
@@ -926,6 +956,7 @@ def sidebar(last_refresh):
     st.sidebar.markdown(
         "**Table tips**\n\n"
         "- Drag-select cells / a row / a column, then Ctrl+C to copy\n"
+        "- PO # copies the number; click **Shelf → Open** to open it in Shelf\n"
         "- Click a column header to sort\n"
         "- 👁 Columns to show/hide · 📋 to copy lists\n"
         "- Paste several values in Search to match any\n"
@@ -1554,13 +1585,46 @@ def parse_catalog_ids(raw):
     return out
 
 
+def _sql_quote_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_in_list(ids):
+    """Quoted IN-list: 'SKU1', 'SKU2' — never a Python list repr."""
+    return ", ".join(_sql_quote_literal(i) for i in ids)
+
+
+def _sql_values_rows(ids):
+    """Snowflake VALUES rows: ('SKU1'), ('SKU2')."""
+    return ", ".join("(" + _sql_quote_literal(i) + ")" for i in ids)
+
+
 def build_catalog_query(ids):
     """Catalogue Lookup Search-by-ID. Pushes the ID list into q1/q2 so Snowflake
-    does not scan the whole catalog. ``ids`` must already be uppercased."""
+    does not scan the whole catalog. ``ids`` must already be uppercased.
+
+    Fills both placeholders used in the wild:
+      {id_values}  — GitHub SQL ``FROM VALUES {id_values}``
+      {upper_list} — older SQL ``IN ({upper_list})``
+    """
     if not ids:
         raise ValueError("No IDs to look up.")
-    quoted = ", ".join("'" + i.replace("'", "''") + "'" for i in ids)
-    return CATALOG_QUERY_PATH.read_text().replace("{upper_list}", quoted)
+    sql = CATALOG_QUERY_PATH.read_text()
+    sql = sql.replace("{id_values}", _sql_values_rows(ids))
+    sql = sql.replace("{upper_list}", _sql_in_list(ids))
+    leftover = [p for p in ("{id_values}", "{upper_list}") if p in sql]
+    if leftover:
+        raise ValueError(
+            "queries/catalog_lookup.sql still has unreplaced placeholders "
+            f"{leftover}. Copy wo-tracking-tool/queries/catalog_lookup.sql "
+            "and the matching app.py together."
+        )
+    if "VALUES [" in sql or "IN ([" in sql:
+        raise ValueError(
+            "Catalogue SQL id list was built as a Python list. "
+            "IDs must be quoted SQL literals."
+        )
+    return sql
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -2456,9 +2520,10 @@ def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_row
 
 
 # Shelf (order-management) deep link for a PO, keyed on the plain PO number.
-# render_table() turns any of these display columns into clickable Shelf links.
+# render_table() keeps PO # as the number (copyable) and adds a Shelf link column.
 SHELF_PO_URL = "https://www.useshelf.com/order-management/po/preview/details/{}"
 PO_LINK_COLUMNS = {"PO #"}
+SHELF_COL = "Shelf"
 
 
 def _po_link_series(s):
@@ -2477,9 +2542,9 @@ def overview_tab(df, wos):
     st.markdown("---")
     po_df = po_pos = None
     po_fetch_error = None
+    wh = st.session_state.get("global_wh", "All in scope")
     try:
         po_df, po_pos, _ = fetch_po_data(_wh_scope_arg())
-        wh = st.session_state.get("global_wh", "All in scope")
         if not _wh_is_all(wh):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
@@ -2833,6 +2898,7 @@ def overview_tab(df, wos):
                             context=f"POs with no work order: {shown}{extra}",
                             qty_frame=subset,
                         )
+                st.caption("**PO #** is the number (copy that). **Shelf → Open** opens the PO in Shelf.")
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
                        pin_cols=["PO #"], color_rows=True,
@@ -2955,6 +3021,7 @@ def overview_tab(df, wos):
                         _gap_reasons.add("Partial WO")
                     if _gap_reasons:
                         render_flag_guide_inline(_gap_reasons)
+                st.caption("**PO #** is the number (copy that). **Shelf → Open** opens the PO in Shelf.")
                 _panel(d, "ov_item_gap", date_cols=["Order Placed"], pin_cols=["PO #"],
                        color_rows=True,
                        slack_whole=False, slack_label_cols=["PO #", "SKU", "Title"],
