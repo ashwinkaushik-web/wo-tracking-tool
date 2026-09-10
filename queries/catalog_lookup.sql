@@ -4,9 +4,9 @@
 --   q2  catalog view (PATTERN_DB product/listings)
 --   q3  latest DNO history flag (per matched listing only — not a full-table MAX scan)
 --
--- Placeholders replaced at runtime:
---   {id_values}  Snowflake VALUES rows: ('SKU1'), ('L0ABC'), ...
---   {upper_list} quoted IN-list (kept for the final filter)
+-- Placeholders replaced at runtime by app.py (quoted SQL literals, never a Python list):
+--   id_values  — VALUES rows: ('SKU1'), ('L0ABC'), ...
+--   upper_list — quoted IN-list, if this file still uses IN (upper_list)
 --
 -- Prefer looking up SKU / Listing ID. Master ID matches every marketplace listing
 -- for that product and makes this query slow.
