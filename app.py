@@ -910,6 +910,7 @@ def sidebar(last_refresh):
     cat_s = st.session_state.get("_cat_fetch_s")
     if cat_s is not None:
         st.sidebar.caption(f"Last catalogue query {cat_s:.1f}s")
+    _scope = _wh_scope_arg()
     if _scope:
         _wh_list = ", ".join(f"{n} ({i})" for i, n in _scope)
     else:
