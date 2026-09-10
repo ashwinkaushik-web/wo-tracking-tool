@@ -25,7 +25,8 @@ import plotly.express as px
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
-from datetime import datetime
+from datetime import datetime, date, timedelta
+import time
 from pathlib import Path
 from warehouses import get_warehouses, warehouse_names, apply_warehouse_scope
 try:
@@ -156,6 +157,17 @@ CATALOG_QUERY_PATH = Path(__file__).parent / "queries" / "catalog_lookup.sql"
 CACHE_TTL_SECONDS = 1800  # 30 min
 MAX_CATALOG_IDS = 500
 NAV_CATALOG = "🔎 Catalogue Lookup"
+SUGGESTED_SHIP_LEAD_DAYS = 7  # if the PO has no future ship date, suggest today + this
+
+SHELF_WO_UPLOAD_COLS = [
+    "Work Order Item Type",
+    "Product (Listing ID or Master ID)",
+    "Request Amount",
+    "Ship By Date (MM/DD/YYYY)",
+    "Prioritized (T/F)",
+    "Receivable ID (Inventory Request ID or Purchase Order ID)",
+    "Receivable type (InventoryRequest or Purchase)",
+]
 
 
 def _warehouse_override():
@@ -886,12 +898,18 @@ def sidebar(last_refresh):
         fetch_data.clear()
         fetch_po_data.clear()
         fetch_po_item_wo_gap.clear()
+        fetch_po_wo_agg.clear()
+        fetch_wo_unpickable_detail.clear()
         fetch_catalog_lookup.clear()
         fetch_warehouse_dim.clear()
         _reset_selection()
         st.rerun()
-    st.sidebar.markdown("---")
-    _scope = _wh_scope_arg()
+    wo_s = st.session_state.get("_wo_fetch_s")
+    if wo_s is not None:
+        st.sidebar.caption(f"Last WO query {wo_s:.1f}s" + (" (cached)" if wo_s < 0.4 else ""))
+    cat_s = st.session_state.get("_cat_fetch_s")
+    if cat_s is not None:
+        st.sidebar.caption(f"Last catalogue query {cat_s:.1f}s")
     if _scope:
         _wh_list = ", ".join(f"{n} ({i})" for i, n in _scope)
     else:
@@ -1536,17 +1554,12 @@ def parse_catalog_ids(raw):
 
 
 def build_catalog_query(ids):
-    """Catalogue Lookup Search-by-ID. Pushes the ID list into a VALUES CTE so
-    Snowflake does not scan the whole catalog. ``ids`` must already be uppercased."""
+    """Catalogue Lookup Search-by-ID. Pushes the ID list into q1/q2 so Snowflake
+    does not scan the whole catalog. ``ids`` must already be uppercased."""
     if not ids:
         raise ValueError("No IDs to look up.")
     quoted = ", ".join("'" + i.replace("'", "''") + "'" for i in ids)
-    values = ", ".join("('" + i.replace("'", "''") + "')" for i in ids)
-    return (
-        CATALOG_QUERY_PATH.read_text()
-        .replace("{id_values}", values)
-        .replace("{upper_list}", quoted)
-    )
+    return CATALOG_QUERY_PATH.read_text().replace("{upper_list}", quoted)
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -1567,7 +1580,7 @@ def fetch_catalog_lookup(ids):
                 "marketplace_seller", "listing_fulfillment_type", "commingled_status",
                 "listing_type"):
         if col in df.columns:
-            df[col] = df[col].map(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+            df[col] = df[col].astype("string").fillna("")
     return df
 
 
@@ -1765,7 +1778,186 @@ def _catalog_ids_for_lookup(frame):
     return _ids_from_frame(frame, ["listing_id", "asin", "master_id"])
 
 
-def _jump_to_catalog_lookup(ids, *, context="", pack=False):
+def _po_qty_lookup(frame):
+    """Map MASTER_ID / SKU → outstanding PO units for a raise-WO request.
+
+    Outstanding = ordered − received, or ``outstanding_units`` when the gap
+    query already computed it. Keys are uppercased so catalog rows match.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return {}
+    df = frame.copy()
+    if "outstanding_units" in df.columns:
+        qty = pd.to_numeric(df["outstanding_units"], errors="coerce")
+    else:
+        ordered = pd.to_numeric(df["ordered_units"], errors="coerce") if "ordered_units" in df.columns else None
+        if ordered is None and "current_units" in df.columns:
+            ordered = pd.to_numeric(df["current_units"], errors="coerce")
+        received = pd.to_numeric(df["received_units"], errors="coerce") if "received_units" in df.columns else None
+        if ordered is None:
+            return {}
+        qty = ordered if received is None else ordered.fillna(0) - received.fillna(0)
+    df = df.assign(_wo_qty=pd.to_numeric(qty, errors="coerce").fillna(0).clip(lower=0))
+    out = {}
+    for col in ("master_id", "sku"):
+        if col not in df.columns:
+            continue
+        keys = df[col].astype(str).str.strip().str.upper()
+        ok = keys.ne("") & ~keys.isin(("NAN", "NONE", "<NA>"))
+        summed = df.loc[ok].groupby(keys[ok], sort=False)["_wo_qty"].sum()
+        for k, v in summed.items():
+            out[str(k)] = int(round(float(v)))
+    return out
+
+
+def _clean_po_id(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "<na>"):
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.split(".")[0] if s.replace(".", "", 1).isdigit() else s
+
+
+def _suggested_ship_by(raw):
+    """Shelf upload date as MM/DD/YYYY. Use the PO ship date when it's in the
+    future; otherwise suggest today + SUGGESTED_SHIP_LEAD_DAYS."""
+    today = date.today()
+    d = None
+    ts = pd.to_datetime(raw, errors="coerce") if raw is not None else pd.NaT
+    if pd.notna(ts):
+        d = ts.date()
+    if d is None or d < today:
+        d = today + timedelta(days=SUGGESTED_SHIP_LEAD_DAYS)
+    return d.strftime("%m/%d/%Y")
+
+
+def _po_line_meta(frame):
+    """Per Master ID / SKU: qty, PO number, ship date — for the Shelf WO CSV."""
+    qty_map = _po_qty_lookup(frame)
+    meta = {}
+    if not qty_map or frame is None or getattr(frame, "empty", True):
+        return qty_map, meta
+    df = frame.copy()
+    ship = None
+    for c in ("ship_date", "Ship Date", "order_placed_date", "order_placed"):
+        if c in df.columns:
+            ship = pd.to_datetime(df[c], errors="coerce")
+            break
+    po_col = next((c for c in ("po_number", "PO #") if c in df.columns), None)
+    key_cols = [c for c in ("master_id", "sku") if c in df.columns]
+    if not key_cols:
+        return qty_map, meta
+    for col in key_cols:
+        keys = df[col].astype(str).str.strip().str.upper()
+        ok = keys.ne("") & ~keys.isin(("NAN", "NONE", "<NA>"))
+        for k, g in df.loc[ok].groupby(keys[ok], sort=False):
+            rec = dict(meta.get(str(k), {}))
+            rec["qty"] = qty_map.get(str(k), rec.get("qty", 0))
+            if po_col and not rec.get("po_number"):
+                rec["po_number"] = (
+                    _clean_po_id(g[po_col].dropna().iloc[0]) if g[po_col].notna().any() else ""
+                )
+            if ship is not None and rec.get("ship_date") is None:
+                sd = ship.loc[g.index].dropna()
+                rec["ship_date"] = sd.min() if len(sd) else None
+            meta[str(k)] = rec
+    return qty_map, meta
+
+
+def _wo_item_type(fulfillment):
+    s = str(fulfillment or "").strip().upper()
+    if "FBA" in s:
+        return "FBA"
+    if "FBM" in s:
+        return "FBM"
+    return "FBA"
+
+
+def _shelf_wo_upload_df(display):
+    """Shelf bulk-create WO CSV: one row per Master ID (FBA listing preferred)."""
+    empty = pd.DataFrame(columns=SHELF_WO_UPLOAD_COLS)
+    if display is None or getattr(display, "empty", True):
+        return empty
+    meta = st.session_state.get("cat_lookup_meta") or {}
+    qty_map = st.session_state.get("cat_lookup_qty") or {}
+    ctx_po = ""
+    m = re.search(r"PO\s+(\d+)", str(st.session_state.get("cat_lookup_context") or ""), re.I)
+    if m:
+        ctx_po = m.group(1)
+
+    df = display.copy()
+    fulf = df["Fulfillment"].astype(str) if "Fulfillment" in df.columns else pd.Series("", index=df.index)
+    df["_fba"] = fulf.str.upper().str.contains("FBA", na=False)
+    mid_col = "Master ID" if "Master ID" in df.columns else None
+
+    picked = []
+    if mid_col:
+        for mid, g in df.groupby(df[mid_col].astype(str).str.strip(), sort=False):
+            if not mid or mid.lower() in ("nan", "none"):
+                picked.extend(g.index.tolist())
+                continue
+            g2 = g.sort_values("_fba", ascending=False)
+            picked.append(g2.index[0])
+        rows_src = df.loc[picked]
+    else:
+        rows_src = df
+
+    out_rows = []
+    for _, r in rows_src.iterrows():
+        lid = str(r.get("Listing ID") or "").strip()
+        mid = str(r.get("Master ID") or "").strip()
+        sku = str(r.get("SKU") or "").strip().upper()
+        product = lid if lid and lid.lower() not in ("nan", "none") else mid
+        if not product or product.lower() in ("nan", "none"):
+            continue
+        info = meta.get(mid.upper(), {}) or meta.get(sku, {})
+        qty = info.get("qty")
+        if qty is None:
+            qty = qty_map.get(mid.upper()) or qty_map.get(sku) or r.get("PO Qty")
+        qty = int(pd.to_numeric(qty, errors="coerce") or 0)
+        if qty <= 0:
+            continue
+        po = info.get("po_number") or ctx_po
+        out_rows.append({
+            "Work Order Item Type": _wo_item_type(r.get("Fulfillment")),
+            "Product (Listing ID or Master ID)": product,
+            "Request Amount": qty,
+            "Ship By Date (MM/DD/YYYY)": _suggested_ship_by(info.get("ship_date")),
+            "Prioritized (T/F)": "F",
+            "Receivable ID (Inventory Request ID or Purchase Order ID)": po,
+            "Receivable type (InventoryRequest or Purchase)": "Purchase" if po else "",
+        })
+    return pd.DataFrame(out_rows, columns=SHELF_WO_UPLOAD_COLS) if out_rows else empty
+
+
+def _attach_po_qty(display):
+    """Put PO outstanding qty on every listing that shares a SKU or Master ID."""
+    qty_map = st.session_state.get("cat_lookup_qty") or {}
+    if not qty_map or display is None or display.empty:
+        return display
+    out = display.copy()
+    sku_q = None
+    mid_q = None
+    if "SKU" in out.columns:
+        sku_q = out["SKU"].astype(str).str.strip().str.upper().map(qty_map)
+    if "Master ID" in out.columns:
+        mid_q = out["Master ID"].astype(str).str.strip().str.upper().map(qty_map)
+    if sku_q is None and mid_q is None:
+        return display
+    if sku_q is None:
+        combined = mid_q
+    elif mid_q is None:
+        combined = sku_q
+    else:
+        combined = sku_q.fillna(mid_q)
+    out["PO Qty"] = pd.to_numeric(combined, errors="coerce")
+    return out
+
+
+def _jump_to_catalog_lookup(ids, *, context="", pack=False, qty_frame=None):
     """Switch to Catalogue Lookup with these IDs already pasted, ready to search."""
     parsed = parse_catalog_ids("\n".join(str(i) for i in ids))
     if not parsed:
@@ -1776,6 +1968,15 @@ def _jump_to_catalog_lookup(ids, *, context="", pack=False):
     st.session_state["cat_lookup_submitted"] = text
     st.session_state["cat_lookup_context"] = context or ""
     st.session_state["cat_lookup_pack_mode"] = bool(pack)
+    qty_map, meta = _po_line_meta(qty_frame) if qty_frame is not None else ({}, {})
+    if qty_map:
+        st.session_state["cat_lookup_qty"] = qty_map
+    else:
+        st.session_state.pop("cat_lookup_qty", None)
+    if meta:
+        st.session_state["cat_lookup_meta"] = meta
+    else:
+        st.session_state.pop("cat_lookup_meta", None)
     st.session_state["pending_nav"] = NAV_CATALOG
     st.rerun()
 
@@ -1799,27 +2000,62 @@ def _po_pack_context(po, row):
 
 
 def _catalog_slack_note(display, context="", skipped=0):
-    """Short raise-WO prefill — listing IDs + CSV, not a product catalogue dump."""
+    """Short raise-WO prefill — listing IDs, master IDs, and PO qty + CSV."""
     n = len(display)
     head = "Please raise a WO"
     if context:
         head = f"Please raise a WO — {context}"
-    lids = []
-    if "Listing ID" in display.columns:
-        seen = set()
-        for v in display["Listing ID"].astype(str):
-            s = v.strip()
-            if not s or s.lower() in ("nan", "none") or s in seen:
+    lines = [f"{head}."]
+    qty_map = st.session_state.get("cat_lookup_qty") or {}
+    has_mid = "Master ID" in display.columns
+    has_lid = "Listing ID" in display.columns
+    has_qty = "PO Qty" in display.columns or bool(qty_map)
+
+    groups = []
+    if has_mid:
+        for mid, g in display.groupby(display["Master ID"].astype(str).str.strip(), sort=False):
+            if not mid or mid.lower() in ("nan", "none"):
                 continue
-            seen.add(s)
-            lids.append(s)
-    lines = [f"{head}.", f"{n} listing ID(s) in the attached CSV."]
+            qty = qty_map.get(mid.upper())
+            if qty is None and has_qty and "PO Qty" in g.columns:
+                q = pd.to_numeric(g["PO Qty"], errors="coerce").max()
+                qty = 0 if pd.isna(q) else int(q)
+            if qty is None:
+                qty = 0
+            lids = []
+            if has_lid:
+                seen = set()
+                for v in g["Listing ID"].astype(str):
+                    s = v.strip()
+                    if not s or s.lower() in ("nan", "none") or s in seen:
+                        continue
+                    seen.add(s)
+                    lids.append(s)
+            groups.append((int(qty), mid, lids))
+        qty_total = sum(q for q, _, _ in groups)
+        extra_qty = f" · {qty_total:,} units outstanding" if has_qty else ""
+        lines.append(
+            f"{n} listing(s) · {len(groups)} master ID(s){extra_qty}. "
+            "CSV has listing ID, master ID, and qty."
+        )
+    else:
+        lines.append(f"{n} listing ID(s) in the attached CSV.")
     if skipped:
         lines.append(f"{skipped} hidden by filters.")
-    if lids:
-        show, rest = lids[:8], max(n - 8, 0)
-        extra = f" +{rest} more" if rest else ""
-        lines.append("IDs: " + ", ".join(show) + extra)
+    if groups:
+        lines.append("")
+        lines.append("Qty by master ID (same qty on every listing of that master):")
+        groups.sort(key=lambda row: -row[0])
+        cap = 12
+        for qty, mid, lids in groups[:cap]:
+            lid_bit = ", ".join(lids[:4]) + (f" +{len(lids) - 4}" if len(lids) > 4 else "")
+            if has_qty:
+                lines.append(f"{mid} ×{qty}" + (f" — {lid_bit}" if lid_bit else ""))
+            else:
+                lines.append(f"{mid} — {lid_bit}" if lid_bit else str(mid))
+        rest = len(groups) - cap
+        if rest > 0:
+            lines.append(f"+{rest} more master IDs in the CSV")
     return "\n".join(lines)
 
 
@@ -2026,11 +2262,11 @@ def po_details_list(po_pos, po_df):
         with b2:
             if st.button("🔎 Look up listings", key="pod_list_cat", use_container_width=True,
                          help="Open Catalogue Lookup with this PO's SKUs / Master IDs"):
-                _jump_to_catalog_lookup(ids, context=ctx)
+                _jump_to_catalog_lookup(ids, context=ctx, qty_frame=lines)
         with b3:
             if st.button("📦 Raise-WO pack", key="pod_list_pack", use_container_width=True,
                          help="Catalogue Lookup with DNO/inactive/not-shippable hidden, ready to Slack"):
-                _jump_to_catalog_lookup(ids, context=ctx, pack=True)
+                _jump_to_catalog_lookup(ids, context=ctx, pack=True, qty_frame=lines)
 
 
 def po_details_items(po_df):
@@ -2049,6 +2285,7 @@ def po_details_items(po_df):
         _jump_to_catalog_lookup(
             _catalog_ids_for_lookup(filtered),
             context=f"{len(filtered):,} PO item(s) from PO Details",
+            qty_frame=filtered,
         )
     render_table(
         disp, key=_grid_key("grid_podi"),
@@ -2072,11 +2309,11 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     ctx = _po_pack_context(po, row)
     with pack_l:
         if st.button("🔎 Look up listings", key=f"pod_dd_cat_{po}", use_container_width=True):
-            _jump_to_catalog_lookup(ids, context=ctx)
+            _jump_to_catalog_lookup(ids, context=ctx, qty_frame=items_for_ids)
     with pack_r:
         if st.button("📦 Raise-WO pack", key=f"pod_dd_pack_{po}", use_container_width=True,
                      help="Catalogue Lookup with unsellable listings hidden, PO details in the Slack note"):
-            _jump_to_catalog_lookup(ids, context=ctx, pack=True)
+            _jump_to_catalog_lookup(ids, context=ctx, pack=True, qty_frame=items_for_ids)
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Orig Ordered", f"{_safe_int(row['original_ordered']):,}")
@@ -2301,126 +2538,123 @@ def overview_tab(df, wos):
     c[3].metric("Open", f"{open_woi:,}")
     c[4].metric("Blocked", f"{blocked_woi:,}")
 
-    # ================= Charts (Plotly) =================
+    # ================= Charts (Plotly) — off by default; 6 charts on every rerun is slow.
     st.markdown("---")
-    st.markdown("#### 📊 At a glance")
-    with st.expander("ℹ️ What each chart shows"):
-        st.markdown(
-            "- **PO status mix** — share of POs by lifecycle state (placed / receiving / arrived / "
-            "reconciled). Source: PO report, one row per PO (UK/EU, placed since 2025-07-01).\n"
-            "- **WO items: open / blocked / done** — warehouse processing split. Blocked = PFS "
-            "'Unpickable'; Open = open & not blocked; Done = closed. Source: WO data (year-to-date).\n"
-            "- **Top vendors — units outstanding** — vendors with the most units still to receive "
-            "(ordered − received), top 10. Source: PO report rolled up per vendor.\n"
-            "- **Blocked WO items by reason** — why WO items are blocked (Listing Failed, Replen "
-            "Needed, No Inventory…). Source: WO data, blocked items.\n"
-            "- **Units ordered vs received by month** — inbound flow: units ordered vs received by "
-            "PO placed month. Source: PO report.\n"
-            "- **PO vendor-fill distribution** — POs bucketed by fill level (received ÷ current "
-            "order): <80% under-fill · 80–99% · 100% on-target · >100% over-receipt. Source: PO report."
-        )
+    show_charts = st.checkbox("Show Overview charts", key="ov_show_charts",
+                              help="Six Plotly charts. Leave off for a faster Overview.")
+    if show_charts:
+        st.markdown("#### 📊 At a glance")
+        with st.expander("ℹ️ What each chart shows"):
+            st.markdown(
+                "- **PO status mix** — share of POs by lifecycle state (placed / receiving / arrived / "
+                "reconciled). Source: PO report, one row per PO (UK/EU, placed since 2025-07-01).\n"
+                "- **WO items: open / blocked / done** — warehouse processing split. Blocked = PFS "
+                "'Unpickable'; Open = open & not blocked; Done = closed. Source: WO data (year-to-date).\n"
+                "- **Top vendors — units outstanding** — vendors with the most units still to receive "
+                "(ordered − received), top 10. Source: PO report rolled up per vendor.\n"
+                "- **Blocked WO items by reason** — why WO items are blocked (Listing Failed, Replen "
+                "Needed, No Inventory…). Source: WO data, blocked items.\n"
+                "- **Units ordered vs received by month** — inbound flow: units ordered vs received by "
+                "PO placed month. Source: PO report.\n"
+                "- **PO vendor-fill distribution** — POs bucketed by fill level (received ÷ current "
+                "order): <80% under-fill · 80–99% · 100% on-target · >100% over-receipt. Source: PO report."
+            )
 
-    def _fig(fig, title, show_legend=False):
-        fig.update_layout(
-            title=dict(text=title, font=dict(size=15)),
-            margin=dict(l=8, r=8, t=44, b=8), height=300,
-            showlegend=show_legend, legend_title_text="",
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
-        return fig
+        def _fig(fig, title, show_legend=False):
+            fig.update_layout(
+                title=dict(text=title, font=dict(size=15)),
+                margin=dict(l=8, r=8, t=44, b=8), height=300,
+                showlegend=show_legend, legend_title_text="",
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            fig.update_xaxes(showgrid=False)
+            fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+            return fig
 
-    def _donut(fig, title):
-        fig.update_traces(hole=0.55, textinfo="label+value", textposition="inside", sort=False)
-        fig.update_layout(
-            title=dict(text=title, font=dict(size=15)),
-            margin=dict(l=8, r=8, t=44, b=8), height=300, showlegend=True,
-            legend=dict(orientation="h", y=-0.08), legend_title_text="",
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        return fig
+        def _donut(fig, title):
+            fig.update_traces(hole=0.55, textinfo="label+value", textposition="inside", sort=False)
+            fig.update_layout(
+                title=dict(text=title, font=dict(size=15)),
+                margin=dict(l=8, r=8, t=44, b=8), height=300, showlegend=True,
+                legend=dict(orientation="h", y=-0.08), legend_title_text="",
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            return fig
 
-    r1 = st.columns(2)
-    # 1) PO status mix (donut handles the skew better than bars)
-    with r1[0]:
-        if po_pos is not None and not po_pos.empty:
-            s = po_pos["purchase_state"].astype(str).str.lower().value_counts()
-            fig = px.pie(names=s.index, values=s.values,
-                         color_discrete_sequence=px.colors.qualitative.Set2)
-            st.plotly_chart(_donut(fig, "PO status mix"), use_container_width=True)
-        else:
-            st.caption("PO data unavailable.")
-    # 2) WO items: open / blocked / done (donut)
-    with r1[1]:
-        blk = df["is_blocked_pfs"].fillna(False)
-        wo_mix = pd.Series({
-            "Open": int(((df["status_simple"] == "Open") & (~blk)).sum()),
-            "Blocked": int(blk.sum()),
-            "Done": int((df["status_simple"] == "Closed").sum()),
-        })
-        fig = px.pie(names=wo_mix.index, values=wo_mix.values, color=wo_mix.index,
-                     color_discrete_map={"Open": "#f4a259", "Blocked": "#d1495b", "Done": "#4c9f70"})
-        st.plotly_chart(_donut(fig, "WO items: open / blocked / done"), use_container_width=True)
+        r1 = st.columns(2)
+        with r1[0]:
+            if po_pos is not None and not po_pos.empty:
+                s = po_pos["purchase_state"].astype(str).str.lower().value_counts()
+                fig = px.pie(names=s.index, values=s.values,
+                             color_discrete_sequence=px.colors.qualitative.Set2)
+                st.plotly_chart(_donut(fig, "PO status mix"), use_container_width=True)
+            else:
+                st.caption("PO data unavailable.")
+        with r1[1]:
+            blk = df["is_blocked_pfs"].fillna(False)
+            wo_mix = pd.Series({
+                "Open": int(((df["status_simple"] == "Open") & (~blk)).sum()),
+                "Blocked": int(blk.sum()),
+                "Done": int((df["status_simple"] == "Closed").sum()),
+            })
+            fig = px.pie(names=wo_mix.index, values=wo_mix.values, color=wo_mix.index,
+                         color_discrete_map={"Open": "#f4a259", "Blocked": "#d1495b", "Done": "#4c9f70"})
+            st.plotly_chart(_donut(fig, "WO items: open / blocked / done"), use_container_width=True)
 
-    r2 = st.columns(2)
-    # 3) Top 10 vendors by outstanding units (ranked horizontal bar)
-    with r2[0]:
-        if po_pos is not None and not po_pos.empty and "left" in po_pos.columns:
-            tv = (po_pos.groupby("vendor_name")["left"].sum()
-                  .sort_values(ascending=False).head(10).sort_values())
-            fig = px.bar(x=tv.values, y=tv.index, orientation="h", text=tv.values,
-                         color_discrete_sequence=["#3b7dd8"])
-            fig.update_traces(textposition="outside")
-            fig.update_layout(xaxis_title="Units outstanding", yaxis_title=None)
-            st.plotly_chart(_fig(fig, "Top vendors — units outstanding"), use_container_width=True)
-        else:
-            st.caption("PO data unavailable.")
-    # 4) Blocked WO items by reason (horizontal bar)
-    with r2[1]:
-        br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts().sort_values()
-        if not br.empty:
-            fig = px.bar(x=br.values, y=br.index, orientation="h", text=br.values,
-                         color_discrete_sequence=["#d1495b"])
-            fig.update_traces(textposition="outside")
-            fig.update_layout(xaxis_title="Blocked items", yaxis_title=None)
-            st.plotly_chart(_fig(fig, "Blocked WO items by reason"), use_container_width=True)
-        else:
-            st.caption("None blocked.")
+        r2 = st.columns(2)
+        with r2[0]:
+            if po_pos is not None and not po_pos.empty and "left" in po_pos.columns:
+                tv = (po_pos.groupby("vendor_name")["left"].sum()
+                      .sort_values(ascending=False).head(10).sort_values())
+                fig = px.bar(x=tv.values, y=tv.index, orientation="h", text=tv.values,
+                             color_discrete_sequence=["#3b7dd8"])
+                fig.update_traces(textposition="outside")
+                fig.update_layout(xaxis_title="Units outstanding", yaxis_title=None)
+                st.plotly_chart(_fig(fig, "Top vendors — units outstanding"), use_container_width=True)
+            else:
+                st.caption("PO data unavailable.")
+        with r2[1]:
+            br = df[df["is_blocked_pfs"].fillna(False)]["block_reason_pfs"].dropna().value_counts().sort_values()
+            if not br.empty:
+                fig = px.bar(x=br.values, y=br.index, orientation="h", text=br.values,
+                             color_discrete_sequence=["#d1495b"])
+                fig.update_traces(textposition="outside")
+                fig.update_layout(xaxis_title="Blocked items", yaxis_title=None)
+                st.plotly_chart(_fig(fig, "Blocked WO items by reason"), use_container_width=True)
+            else:
+                st.caption("None blocked.")
 
-    r3 = st.columns(2)
-    # 5) Inbound trend: units ordered vs received by month (two-series line)
-    with r3[0]:
-        if po_pos is not None and not po_pos.empty:
-            tmp = po_pos.copy()
-            tmp["_m"] = pd.to_datetime(tmp["order_placed"], errors="coerce").dt.to_period("M").astype(str)
-            tmp = tmp[tmp["_m"] != "NaT"]
-            g = (tmp.groupby("_m").agg(Ordered=("original_ordered", "sum"),
-                                       Received=("received", "sum")).reset_index().sort_values("_m"))
-            gm = g.melt(id_vars="_m", value_vars=["Ordered", "Received"],
-                        var_name="Metric", value_name="Units")
-            fig = px.line(gm, x="_m", y="Units", color="Metric", markers=True,
-                          color_discrete_map={"Ordered": "#3b7dd8", "Received": "#4c9f70"})
-            fig.update_layout(xaxis_title=None, yaxis_title="Units")
-            st.plotly_chart(_fig(fig, "Units ordered vs received by month", show_legend=True), use_container_width=True)
-        else:
-            st.caption("PO data unavailable.")
-    # 6) PO vendor-fill distribution (how many POs under / on / over target)
-    with r3[1]:
-        if po_pos is not None and not po_pos.empty and "vendor_fill_pct" in po_pos.columns:
-            vf = pd.to_numeric(po_pos["vendor_fill_pct"], errors="coerce").fillna(0)
-            order = ["<80%", "80–99%", "100%", ">100%"]
-            dist = (pd.cut(vf, bins=[-0.1, 79.999, 99.999, 100.001, float("inf")], labels=order)
-                    .value_counts().reindex(order).fillna(0).astype(int))
-            fig = px.bar(x=list(dist.index), y=list(dist.values), text=list(dist.values),
-                         color=list(dist.index),
-                         color_discrete_map={"<80%": "#d1495b", "80–99%": "#f4a259",
-                                             "100%": "#4c9f70", ">100%": "#3b7dd8"})
-            fig.update_traces(textposition="outside")
-            fig.update_layout(xaxis_title=None, yaxis_title="POs")
-            st.plotly_chart(_fig(fig, "PO vendor-fill distribution"), use_container_width=True)
-        else:
-            st.caption("PO data unavailable.")
+        r3 = st.columns(2)
+        with r3[0]:
+            if po_pos is not None and not po_pos.empty:
+                tmp = po_pos.copy()
+                tmp["_m"] = pd.to_datetime(tmp["order_placed"], errors="coerce").dt.to_period("M").astype(str)
+                tmp = tmp[tmp["_m"] != "NaT"]
+                g = (tmp.groupby("_m").agg(Ordered=("original_ordered", "sum"),
+                                           Received=("received", "sum")).reset_index().sort_values("_m"))
+                gm = g.melt(id_vars="_m", value_vars=["Ordered", "Received"],
+                            var_name="Metric", value_name="Units")
+                fig = px.line(gm, x="_m", y="Units", color="Metric", markers=True,
+                              color_discrete_map={"Ordered": "#3b7dd8", "Received": "#4c9f70"})
+                fig.update_layout(xaxis_title=None, yaxis_title="Units")
+                st.plotly_chart(_fig(fig, "Units ordered vs received by month", show_legend=True), use_container_width=True)
+            else:
+                st.caption("PO data unavailable.")
+        with r3[1]:
+            if po_pos is not None and not po_pos.empty and "vendor_fill_pct" in po_pos.columns:
+                vf = pd.to_numeric(po_pos["vendor_fill_pct"], errors="coerce").fillna(0)
+                order = ["<80%", "80–99%", "100%", ">100%"]
+                dist = (pd.cut(vf, bins=[-0.1, 79.999, 99.999, 100.001, float("inf")], labels=order)
+                        .value_counts().reindex(order).fillna(0).astype(int))
+                fig = px.bar(x=list(dist.index), y=list(dist.values), text=list(dist.values),
+                             color=list(dist.index),
+                             color_discrete_map={"<80%": "#d1495b", "80–99%": "#f4a259",
+                                                 "100%": "#4c9f70", ">100%": "#3b7dd8"})
+                fig.update_traces(textposition="outside")
+                fig.update_layout(xaxis_title=None, yaxis_title="POs")
+                st.plotly_chart(_fig(fig, "PO vendor-fill distribution"), use_container_width=True)
+            else:
+                st.caption("PO data unavailable.")
 
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
@@ -2596,6 +2830,7 @@ def overview_tab(df, wos):
                         _jump_to_catalog_lookup(
                             ids,
                             context=f"POs with no work order: {shown}{extra}",
+                            qty_frame=subset,
                         )
                 _panel(d, "ov_nowo",
                        date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
@@ -2707,6 +2942,7 @@ def overview_tab(df, wos):
                             ids,
                             context=f"{len(item_gap):,} PO item(s) without full WO coverage"
                                     + (f" (POs {shown}{extra})" if shown else ""),
+                            qty_frame=item_gap,
                         )
                 if render_flag_guide_inline is not None:
                     _gap_reasons = set()
@@ -2902,7 +3138,7 @@ CATALOG_COL_LABELS = {
 }
 
 CATALOG_DEFAULT_COLS = [
-    "Status", "SKU", "Listing ID", "Master ID", "Product Name", "Marketplace",
+    "Status", "SKU", "Listing ID", "Master ID", "PO Qty", "Product Name", "Marketplace",
     "Vendor", "Fulfillment", "ASIN", "FNSKU", "Commingled", "Shippable",
     "DNO", "Active", "Seller",
 ]
@@ -2934,12 +3170,16 @@ def catalog_lookup_tab():
         st.session_state.pop("cat_lookup_submitted", None)
         st.session_state.pop("cat_lookup_context", None)
         st.session_state.pop("cat_lookup_pack_mode", None)
+        st.session_state.pop("cat_lookup_qty", None)
+        st.session_state.pop("cat_lookup_meta", None)
         st.rerun()
     if search:
         prev = st.session_state.get("cat_lookup_submitted", "")
         st.session_state["cat_lookup_submitted"] = raw
         if parse_catalog_ids(raw) != parse_catalog_ids(prev):
             st.session_state["cat_lookup_context"] = ""
+            st.session_state.pop("cat_lookup_qty", None)
+            st.session_state.pop("cat_lookup_meta", None)
 
     submitted = st.session_state.get("cat_lookup_submitted", "")
     if not submitted or not str(submitted).strip():
@@ -2955,8 +3195,10 @@ def catalog_lookup_tab():
         st.caption(f"Using the first {MAX_CATALOG_IDS:,} of {n_raw:,} pasted IDs.")
 
     try:
+        t0 = time.perf_counter()
         with st.spinner(f"Looking up {len(ids):,} ID(s) in the catalogue…"):
             cat = fetch_catalog_lookup(tuple(ids))
+        st.session_state["_cat_fetch_s"] = time.perf_counter() - t0
     except Exception as exc:
         st.error(f"Catalogue lookup failed: {type(exc).__name__}: {exc}")
         st.caption("Needs read access to ANALYTICS_DB.STG_CATALOG and "
@@ -3011,6 +3253,16 @@ def catalog_lookup_tab():
             ordered.append(lab)
             seen.add(lab)
     display = display[ordered]
+    display = _attach_po_qty(display)
+    if "PO Qty" in display.columns and "Master ID" in display.columns:
+        cols = [c for c in display.columns if c != "PO Qty"]
+        cols.insert(cols.index("Master ID") + 1, "PO Qty")
+        display = display[cols]
+        n_qty = int(pd.to_numeric(display["PO Qty"], errors="coerce").fillna(0).gt(0).sum())
+        st.caption(
+            f"**PO Qty** is outstanding PO units (ordered − received) for that Master ID / SKU — "
+            f"the same qty is shown on every listing of the master. {n_qty:,} row(s) have a qty."
+        )
 
     ctx = st.session_state.get("cat_lookup_context") or ""
     if ctx:
@@ -3021,13 +3273,23 @@ def catalog_lookup_tab():
     if skipped:
         st.caption(f"Showing **{len(filtered):,}** of {len(display):,} rows after filters ({skipped:,} hidden).")
 
-    send_cols = st.columns([2, 3])
+    wo_csv = _shelf_wo_upload_df(filtered)
+    po_ids = []
+    if not wo_csv.empty:
+        po_col = "Receivable ID (Inventory Request ID or Purchase Order ID)"
+        po_ids = sorted({str(x).strip() for x in wo_csv[po_col] if str(x).strip()})
+    stem = f"wo_request_PO{po_ids[0]}" if len(po_ids) == 1 else f"wo_request_{datetime.now():%Y%m%d}"
+    wo_name = f"{stem}.csv"
+    attach_df = wo_csv if not wo_csv.empty else filtered
+    attach_name = wo_name if not wo_csv.empty else f"catalogue_listings_{datetime.now():%Y%m%d}.csv"
+
+    send_cols = st.columns([1.4, 1.4, 2.2])
     with send_cols[0]:
         if slack_send_panel_button is not None:
             slack_send_panel_button(
                 "slack_catalog_wo",
-                df=filtered,
-                filename=f"catalogue_listings_{datetime.now():%Y%m%d}.csv",
+                df=attach_df,
+                filename=attach_name,
                 note=_catalog_slack_note(filtered, ctx, skipped=skipped),
                 label="📤 Send listings with a WO request",
                 use_container_width=True,
@@ -3035,7 +3297,24 @@ def catalog_lookup_tab():
         else:
             st.caption("Slack send is not configured — download the CSV and paste into Slack.")
     with send_cols[1]:
-        st.caption("Sends a short raise-WO note plus listing IDs. Full rows are in the CSV.")
+        if not wo_csv.empty:
+            st.download_button(
+                "⬇ Shelf WO CSV",
+                wo_csv.to_csv(index=False).encode("utf-8-sig"),
+                file_name=wo_name,
+                mime="text/csv",
+                key="dl_shelf_wo",
+                use_container_width=True,
+                help="Same columns as the Shelf bulk WO upload.",
+            )
+        else:
+            st.caption("No Shelf rows yet — look up from a PO so qty / PO # are attached.")
+    with send_cols[2]:
+        st.caption(
+            "Slack CSV is the **Shelf WO upload** layout: one FBA listing per Master ID, "
+            "request qty, suggested ship-by (PO ship date if it’s in the future, otherwise "
+            f"today + {SUGGESTED_SHIP_LEAD_DAYS} days), PO # as Purchase receivable."
+        )
 
     default_cols = [c for c in CATALOG_DEFAULT_COLS if c in filtered.columns]
     cols = column_picker(list(filtered.columns), key="cols_cat",
@@ -3047,7 +3326,7 @@ def catalog_lookup_tab():
     render_table(
         filtered, key=_grid_key("cat_lookup"), pin_cols=["Listing ID", "SKU"],
         color_rows=True, height=480,
-        slack_label_cols=["Listing ID", "SKU", "Product Name"],
+        slack_label_cols=["Listing ID", "SKU", "Master ID", "PO Qty", "Product Name"],
         slack_filename="catalogue_listings.csv",
     )
 
@@ -3066,6 +3345,7 @@ def main():
                                           "pod_only_nowo", "skuj_q", "skuj_pick",
                                           "cat_lookup_q", "cat_lookup_submitted",
                                           "cat_lookup_context", "cat_lookup_pack_mode",
+                                          "cat_lookup_qty", "cat_lookup_meta",
                                           "wh_scope"):
             st.session_state[_k] = st.session_state[_k]
     # Honour a tab jump requested from a button on another view (must run
@@ -3129,17 +3409,29 @@ def main():
     wh_scope = tuple((int(w["id"]), w["name"]) for w in override_list)
     st.session_state["_wh_scope_tuple"] = wh_scope
 
-    try:
-        with st.spinner("Loading WO data from Snowflake..."):
-            df, wos, last_refresh = fetch_data(wh_scope)
-    except Exception as e:
-        st.error(f"Failed to fetch data from Snowflake: {e}")
-        st.info("Check `.streamlit/secrets.toml` — see README for setup.")
-        st.stop()
+    skip_wo = st.session_state.get("main_nav") == NAV_CATALOG
+    last_refresh = st.session_state.get("_wo_last_refresh")
+    if skip_wo:
+        df = pd.DataFrame()
+        wos = pd.DataFrame(columns=["source_category", "warehouse"])
+    else:
+        try:
+            t0 = time.perf_counter()
+            with st.spinner("Loading WO data from Snowflake..."):
+                df, wos, last_refresh = fetch_data(wh_scope)
+            st.session_state["_wo_fetch_s"] = time.perf_counter() - t0
+            st.session_state["_wo_last_refresh"] = last_refresh
+            if "source_category" in wos.columns:
+                st.session_state["_n_po"] = int((wos["source_category"] == "PO").sum())
+                st.session_state["_n_storage"] = int((wos["source_category"] == "Storage").sum())
+        except Exception as e:
+            st.error(f"Failed to fetch data from Snowflake: {e}")
+            st.info("Check `.streamlit/secrets.toml` — see README for setup.")
+            st.stop()
 
-    if warehouse not in ("All in scope", "Both"):
-        df = df[df["warehouse"] == warehouse].copy()
-        wos = wos[wos["warehouse"] == warehouse].copy()
+        if warehouse not in ("All in scope", "Both") and "warehouse" in df.columns:
+            df = df[df["warehouse"] == warehouse].copy()
+            wos = wos[wos["warehouse"] == warehouse].copy()
 
     sidebar(last_refresh)
     st.markdown("---")
@@ -3147,8 +3439,12 @@ def main():
     # Single-page nav (only the selected view runs — st.tabs renders every tab body
     # on each rerun, which blew past Streamlit Cloud's memory). POs are one section
     # with a PO Details / PO WOs sub-toggle; SKU Journey sits up front as a lookup.
-    n_po = len(wos[wos["source_category"] == "PO"])
-    n_storage = len(wos[wos["source_category"] == "Storage"])
+    n_po = int(st.session_state.get("_n_po") or 0) if skip_wo else (
+        len(wos[wos["source_category"] == "PO"]) if "source_category" in wos.columns else 0
+    )
+    n_storage = int(st.session_state.get("_n_storage") or 0) if skip_wo else (
+        len(wos[wos["source_category"] == "Storage"]) if "source_category" in wos.columns else 0
+    )
     nav_overview = "📊 Overview"
     nav_sku = "🧭 SKU Journey"
     nav_pos = "🚚 POs"
