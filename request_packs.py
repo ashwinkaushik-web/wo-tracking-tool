@@ -7,7 +7,7 @@ clears them on reboot or a new browser session.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -210,8 +210,47 @@ def chase_rows_from_pos(frame, *, kind="PO no-WO"):
     return rows
 
 
+def _qty_from_row(r):
+    qty = pd.to_numeric(r.get("outstanding_units", r.get("Outstanding")), errors="coerce")
+    if pd.isna(qty):
+        qty = pd.to_numeric(r.get("left", r.get("Left")), errors="coerce")
+    if pd.isna(qty):
+        ordered = pd.to_numeric(
+            r.get("ordered_units", r.get("current_units", r.get("Current Ordered", r.get("Ordered")))),
+            errors="coerce",
+        )
+        received = pd.to_numeric(r.get("received_units", r.get("Received")), errors="coerce")
+        qty = (0 if pd.isna(ordered) else ordered) - (0 if pd.isna(received) else received)
+    return 0 if pd.isna(qty) else max(int(qty), 0)
+
+
+def _ship_by_from_row(r):
+    today = date.today()
+    raw = None
+    for key in ("ship_date", "Ship Date", "order_placed_date", "order_placed", "Order Placed"):
+        if key in getattr(r, "index", []) or (hasattr(r, "get") and r.get(key) is not None):
+            raw = r.get(key) if hasattr(r, "get") else r[key]
+            if raw is not None and str(raw) not in ("", "nan", "NaT", "None"):
+                break
+            raw = None
+    d = None
+    ts = pd.to_datetime(raw, errors="coerce") if raw is not None else pd.NaT
+    if pd.notna(ts):
+        d = ts.date()
+    if d is None or d < today:
+        d = today + timedelta(days=7)
+    return d.strftime("%m/%d/%Y")
+
+
+def _wo_type_from_row(r):
+    ful = str(
+        r.get("fulfillment_method", r.get("fulfillment", r.get("Fulfillment", ""))) or ""
+    ).upper()
+    return "FBM" if "FBM" in ful else "FBA"
+
+
 def raise_rows_from_gap(frame):
-    """PO-item gap lines → Shelf-shaped raise rows (qty = outstanding)."""
+    """PO-item / PO-line rows → Shelf-shaped raise rows (qty = outstanding)."""
     if frame is None or getattr(frame, "empty", True):
         return []
     rows = []
@@ -221,20 +260,13 @@ def raise_rows_from_gap(frame):
         product = sku or mid
         if not product:
             continue
-        qty = pd.to_numeric(r.get("outstanding_units", r.get("Outstanding")), errors="coerce")
-        if pd.isna(qty):
-            qty = pd.to_numeric(r.get("left", r.get("Left")), errors="coerce")
-        if pd.isna(qty):
-            ordered = pd.to_numeric(r.get("ordered_units", r.get("Ordered")), errors="coerce")
-            received = pd.to_numeric(r.get("received_units", r.get("Received")), errors="coerce")
-            qty = (0 if pd.isna(ordered) else ordered) - (0 if pd.isna(received) else received)
-        qty = 0 if pd.isna(qty) else max(int(qty), 0)
+        qty = _qty_from_row(r)
         po = _clean_cell(r["po_number"] if "po_number" in frame.columns else r.get("PO #"))
         rows.append({
-            "Work Order Item Type": "FBA",
+            "Work Order Item Type": _wo_type_from_row(r),
             "Product (Listing ID or Master ID)": product,
             "Request Amount": qty,
-            "Ship By Date (MM/DD/YYYY)": "",
+            "Ship By Date (MM/DD/YYYY)": _ship_by_from_row(r),
             "Prioritized (T/F)": "F",
             "Receivable ID (Inventory Request ID or Purchase Order ID)": po,
             "Receivable type (InventoryRequest or Purchase)": "Purchase" if po else "",
