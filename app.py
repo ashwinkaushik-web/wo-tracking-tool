@@ -171,6 +171,11 @@ SUGGESTED_SHIP_LEAD_DAYS = 7  # if the PO has no future ship date, suggest today
 NO_WO_GRACE_DAYS = 0   # 0 = flag POs the moment they're placed (per Owen: get ahead early)
 OV_AGING_DAYS = 21
 OV_MAX_ROWS = 100
+PO_REPORT_LAG = (
+    "PO ordered / received figures are a **daily report**, not live Shelf. "
+    "Shelf can already show receipts or a different current qty. "
+    "Open the PO in Shelf before chasing."
+)
 
 
 def _warehouse_override():
@@ -956,13 +961,20 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
 # ============================================================
 def sidebar(last_refresh):
     st.sidebar.title("📊 WO Tracker")
-    st.sidebar.caption("Live Snowflake snapshot")
+    st.sidebar.caption("Snowflake snapshot · two clocks")
     if last_refresh:
         delta_min = (datetime.now() - last_refresh).total_seconds() / 60
-        st.sidebar.metric("Last refresh", last_refresh.strftime("%H:%M:%S"), f"{delta_min:.0f} min ago")
+        st.sidebar.metric("WO snapshot", last_refresh.strftime("%H:%M:%S"),
+                          f"{delta_min:.0f} min ago · ~30 min cache")
+    po_stamp = _po_extract_stamp()
+    if po_stamp:
+        st.sidebar.caption(f"PO report · {po_stamp} · daily extract, not live Shelf.")
+    else:
+        st.sidebar.caption("PO ordered/received is a daily report. Shelf can already be ahead.")
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
         fetch_data.clear()
         fetch_po_data.clear()
+        fetch_po_extract_asof.clear()
         fetch_po_item_wo_gap.clear()
         fetch_po_wo_agg.clear()
         fetch_wo_unpickable_detail.clear()
@@ -987,7 +999,7 @@ def sidebar(last_refresh):
         f"- {_wh_list}\n"
         "- Catalogue Lookup is live catalog search (not warehouse-filtered)\n"
         "- Requests (raise-WO pack / chase list) is session-only — it does not create or complete WOs in Shelf\n"
-        "- Auto-refresh every 30 min\n"
+        "- Work orders auto-refresh about every 30 min; PO ordered/received is a daily report\n"
     )
     st.sidebar.markdown("---")
     st.sidebar.markdown(
@@ -1534,6 +1546,55 @@ def fetch_po_data(wh_scope=()):
     df["po_status"] = _po_item_status(df)
     pos = _build_po_aggregates(df)
     return df, pos, datetime.now()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_po_extract_asof():
+    """When Snowflake last altered the daily PO Tableau extract, if readable."""
+    try:
+        conn = get_snowflake_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT LAST_ALTERED "
+                "FROM ANALYTICS_DB.INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA = 'REPORTING' "
+                "  AND TABLE_NAME = 'REPORT__BRAND_MANAGEMENT_V7__PURCHASE_ORDERS'"
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        if not row or row[0] is None:
+            return None
+        ts = pd.to_datetime(row[0], errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _po_extract_stamp():
+    """Short label for PO-report freshness (empty if the as-of query is unavailable)."""
+    try:
+        ts = fetch_po_extract_asof()
+    except Exception:
+        ts = None
+    if not ts:
+        return ""
+    if getattr(ts, "tzinfo", None) is not None:
+        ts = ts.replace(tzinfo=None)
+    return f"Extract {ts.strftime('%d %b %Y %H:%M')} UTC"
+
+
+def _po_lag_caption(*, extra=""):
+    stamp = _po_extract_stamp()
+    bits = [PO_REPORT_LAG]
+    if stamp:
+        bits.append(stamp + ".")
+    if extra:
+        bits.append(extra)
+    st.caption(" ".join(bits))
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -2732,7 +2793,17 @@ def _ov_narrow(dshow, key):
 
 
 def _ov_po_str(s):
-    return pd.to_numeric(s, errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+    """Format PO numbers as plain digit strings. Works on a Series or a scalar.
+
+    Do not use Series.map(this) — that passes scalars and blows up on .astype.
+    """
+    if isinstance(s, (pd.Series, pd.Index)):
+        out = pd.to_numeric(s, errors="coerce").astype("Int64").astype(str)
+        return out.replace({"<NA>": "", "nan": "", "None": ""})
+    n = pd.to_numeric(s, errors="coerce")
+    if pd.isna(n):
+        return ""
+    return str(int(n))
 
 
 def _issue_types(val):
@@ -2793,13 +2864,41 @@ def _po_lines_for_pos(po_df, pos):
     """Line items for a set of PO numbers, zeros already dropped."""
     if po_df is None or getattr(po_df, "empty", True) or not pos:
         return None
-    want = {str(p).strip() for p in pos if str(p).strip() and str(p).lower() != "nan"}
-    if not want:
+    want = {str(p).strip() for p in pos if str(p).strip() and str(p).lower() not in ("nan", "none", "<na>")}
+    if not want or "po_number" not in po_df.columns:
         return None
-    key = po_df["po_number"].map(_ov_po_str) if "po_number" in po_df.columns else None
-    if key is None:
-        return None
+    key = _ov_po_str(po_df["po_number"])
     return _drop_zero_ordered(po_df[key.isin(want)].copy())
+
+
+def _fetch_overview_item_gap(wh, pick, ov_q, po_pos):
+    """Item-level No WO / Partial WO coverage (queries/po_item_wo_gap.sql)."""
+    try:
+        item_gap = fetch_po_item_wo_gap(_wh_scope_arg())
+        _warn_missing_columns(
+            item_gap,
+            ["coverage_state", "po_number", "sku", "warehouse_name", "reason"],
+            "PO item WO gap (queries/po_item_wo_gap.sql)",
+        )
+        gap_ok = item_gap is not None and "coverage_state" in item_gap.columns
+        if gap_ok and not _wh_is_all(wh) and "warehouse_name" in item_gap.columns:
+            item_gap = item_gap[item_gap["warehouse_name"] == wh].copy()
+        if gap_ok:
+            item_gap = _scope_one(
+                item_gap, pick, ov_q,
+                brand_cols=["vendor_name"],
+                search_cols=["po_number", "sku", "asin", "master_id", "title",
+                             "vendor_name", "warehouse_name", "reason", "coverage_state"],
+            )
+            if (item_gap is not None and po_pos is not None and not po_pos.empty
+                    and "po_number" in item_gap.columns and "po_number" in po_pos.columns):
+                want = set(_ov_po_str(po_pos["po_number"]))
+                want.discard("")
+                item_gap = item_gap[_ov_po_str(item_gap["po_number"]).isin(want)].copy()
+            item_gap = _drop_zero_ordered(item_gap)
+        return item_gap, gap_ok
+    except Exception:
+        return None, False
 
 
 def _overview_send_wo_request(key, lines, *, filename):
@@ -2913,6 +3012,7 @@ def overview_tab(df, wos):
         c[2].metric("Units received", f"{po_received:,}")
         c[3].metric("Vendor fill", f"{po_fill:.0f}%")
         c[4].metric("Lines w/ issues", f"{po_iss:,}")
+        _po_lag_caption()
     else:
         st.caption("PO data unavailable — check queries/po_tracker.sql.")
 
@@ -2927,6 +3027,7 @@ def overview_tab(df, wos):
     c[2].metric("Manual/Storage WOs", f"{int((cat == 'Storage').sum()):,}")
     c[3].metric("Open", f"{open_woi:,}")
     c[4].metric("Blocked", f"{blocked_woi:,}")
+    st.caption("Work-order items refresh about every 30 minutes. Blocked / overdue lists use this snapshot.")
 
     # ================= Charts (Plotly) — off by default; 6 charts on every rerun is slow.
     st.markdown("---")
@@ -3050,6 +3151,8 @@ def overview_tab(df, wos):
     st.markdown("#### 🚨 Needs attention")
     st.caption(
         "POs without a work order first. Other exception lists stay collapsed. "
+        "PO received/ordered figures are a daily report — Shelf can already be ahead. "
+        "Work-order lists refresh about every 30 minutes. "
         f"Each table shows the top {OV_MAX_ROWS}. Use the small search inside a panel to narrow, then Slack."
     )
     if render_flag_guide is not None:
@@ -3098,7 +3201,11 @@ def overview_tab(df, wos):
             d["PO #"] = _ov_po_str(d["PO #"])
             d = _ov_narrow(d, "nowo")
             pos = [x for x in d["PO #"].astype(str).tolist() if x]
-            lines = _po_lines_for_pos(po_df, pos)
+            try:
+                lines = _po_lines_for_pos(po_df, pos)
+            except Exception as exc:
+                st.warning(f"Couldn't load PO lines for a WO request: {type(exc).__name__}: {exc}")
+                lines = None
             a1, a2, a3 = st.columns(3)
             with a1:
                 _overview_send_wo_request(
@@ -3143,7 +3250,7 @@ def overview_tab(df, wos):
                              help="Follow-up checklist only — does not complete a WO in Shelf."):
                     chase_src = nowo
                     if "po_number" in nowo.columns:
-                        chase_src = nowo[nowo["po_number"].map(_ov_po_str).isin(pos)]
+                        chase_src = nowo[_ov_po_str(nowo["po_number"]).isin(pos)]
                     add_chase_rows(chase_rows_from_pos(chase_src, kind="PO no-WO"))
                     _jump_to_requests("Chase list")
             st.caption("**PO #** copies the number. **Shelf → Open** opens the PO. "
@@ -3151,6 +3258,128 @@ def overview_tab(df, wos):
             _panel(d, "ov_nowo",
                    date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
                    numpct_cols=[c for c in ["Demand Fill %", "Vendor Fill %"] if c in d.columns],
+                   pin_cols=["PO #"], color_rows=True, slack=False)
+
+    item_gap, gap_ok = _fetch_overview_item_gap(wh, pick, ov_q, po_pos)
+    if not gap_ok or item_gap is None:
+        _n_gap = _n_nowo_items = _n_partial_items = 0
+    else:
+        _n_gap = int(len(item_gap))
+        _cs = item_gap["coverage_state"].astype(str)
+        _n_nowo_items = int((_cs == "No WO").sum())
+        _n_partial_items = int((_cs == "Partial WO").sum())
+    with st.expander(
+        f"🧩 Item-level: no WO / incomplete coverage ({_n_gap:,})",
+        expanded=_n_nowo_items > 0,
+    ):
+        st.caption(
+            "One row per PO × SKU — a PO can have some items fully covered and others not. "
+            "**No WO** = nothing raised for this item yet. **Partial WO** = a WO exists but "
+            "for fewer units than are still outstanding. Zero-ordered lines are hidden. "
+            "**Send WO request** attaches outstanding qty (qty > 0) as a Shelf file. "
+            "Does not create a WO in Shelf."
+        )
+        if item_gap is None:
+            st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
+        elif not gap_ok:
+            st.error(
+                "GitHub `queries/po_item_wo_gap.sql` is not the production gap query. "
+                "It must return **coverage_state** (No WO / Partial WO), **sku**, "
+                "**warehouse_name**, and **reason** — one row per PO × Master ID. "
+                "Overwrite it with `wo-tracking-tool/queries/po_item_wo_gap.sql` "
+                "(do not use the diagnostic `SELECT * FROM po_woi` dump), then reboot."
+            )
+        elif item_gap.empty:
+            st.caption("None — every PO item has full work-order coverage.")
+        else:
+            mcol = st.columns(3)
+            mcol[0].metric("Item-lines flagged", f"{_n_gap:,}")
+            mcol[1].metric("No WO", f"{_n_nowo_items:,}")
+            mcol[2].metric("Partial WO", f"{_n_partial_items:,}")
+            if "reason" in item_gap.columns:
+                genuine = int((item_gap["reason"] == "Genuine gap — needs WO raised").sum())
+                if genuine:
+                    st.caption(
+                        f"Of the No-WO lines, **{genuine:,}** are a genuine gap needing a WO "
+                        "raised — the rest are already received, on a closed PO, or covered "
+                        "via a Storage WO."
+                    )
+            keep = ["po_number", "sku", "title", "vendor_name", "warehouse_name",
+                    "original_ordered_units", "ordered_units", "received_units",
+                    "outstanding_units", "wo_qty", "coverage_state", "reason",
+                    "order_placed_date", "purchase_state"]
+            keep = [c for c in keep if c in item_gap.columns]
+            sort_cols = [c for c in ["coverage_state", "outstanding_units"] if c in item_gap.columns]
+            sorted_gap = (
+                item_gap.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)])
+                if sort_cols else item_gap
+            )
+            d = sorted_gap[keep].rename(columns={
+                "po_number": "PO #", "sku": "SKU", "title": "Title", "vendor_name": "Vendor",
+                "warehouse_name": "WH",
+                "original_ordered_units": "Orig Ordered", "ordered_units": "Current Ordered",
+                "received_units": "Received", "outstanding_units": "Outstanding",
+                "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason",
+                "order_placed_date": "Order Placed", "purchase_state": "State"})
+            if "PO #" in d.columns:
+                d["PO #"] = _ov_po_str(d["PO #"])
+            if flag_action is not None and "Coverage" in d.columns:
+                _src = (
+                    d["Reason"].astype(str) if "Reason" in d.columns
+                    else pd.Series("", index=d.index)
+                )
+                _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
+                d["What to do"] = _src.map(flag_action)
+            d = _ov_narrow(d, "item_gap")
+            gap_lines = item_gap
+            if "PO #" in d.columns and "po_number" in item_gap.columns:
+                vis = set(d["PO #"].astype(str))
+                gap_lines = item_gap[_ov_po_str(item_gap["po_number"]).isin(vis)]
+            _g0, _g1, _g2 = st.columns(3)
+            with _g0:
+                _overview_send_wo_request(
+                    "slack_item_gap_wo", gap_lines,
+                    filename=f"wo_request_item_gap_{datetime.now():%Y%m%d}.csv",
+                )
+            with _g1:
+                if st.button("🔎 Look up listings", key="jump_item_gap_cat",
+                             use_container_width=True,
+                             help="Open Catalogue Lookup with these SKUs / Master IDs"):
+                    ids = _catalog_ids_for_lookup(gap_lines)
+                    po_nums = []
+                    if "po_number" in gap_lines.columns:
+                        po_nums = [x for x in _ov_po_str(gap_lines["po_number"]).tolist() if x]
+                    uniq_pos = list(dict.fromkeys(po_nums))
+                    shown = ", ".join(uniq_pos[:12])
+                    extra = f" (+{len(uniq_pos) - 12} more)" if len(uniq_pos) > 12 else ""
+                    _jump_to_catalog_lookup(
+                        ids,
+                        context=f"{len(gap_lines):,} PO item(s) without full WO coverage"
+                                + (f" (POs {shown}{extra})" if shown else ""),
+                        pack=True, qty_frame=gap_lines,
+                    )
+            with _g2:
+                if st.button("📦 Add gap lines to raise-WO pack", key="ov_gap_raise",
+                             use_container_width=True,
+                             help="Adds outstanding qty as Shelf rows. Does not create a WO in Shelf."):
+                    add_raise_rows(raise_rows_from_gap(gap_lines))
+                    _jump_to_requests("Raise-WO pack")
+            _h1, _h2 = st.columns(2)
+            with _h1:
+                st.download_button(
+                    "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                    file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv", key="dl_item_gap", use_container_width=True)
+            with _h2:
+                if st.button("📌 Add to chase list", key="ov_gap_chase",
+                             use_container_width=True,
+                             help="Follow-up checklist only — does not complete a WO in Shelf."):
+                    add_chase_rows(chase_rows_from_pos(gap_lines, kind="Item gap"))
+                    _jump_to_requests("Chase list")
+            st.caption("**Send WO request** attaches outstanding lines as a Shelf file. "
+                       "**PO #** copies the number. **Shelf → Open** opens the PO.")
+            _panel(d, "ov_item_gap",
+                   date_cols=[c for c in ["Order Placed"] if c in d.columns],
                    pin_cols=["PO #"], color_rows=True, slack=False)
 
     # A) Blocked WOIs (PFS)
@@ -3176,7 +3405,7 @@ def overview_tab(df, wos):
     # B) Overdue, still-open WOIs
     od = df[(pd.to_numeric(df["days_overdue"], errors="coerce").fillna(0) > 0)
             & (df["status_simple"] == "Open")].copy()
-    with st.expander(f"⏰ Overdue open WO items ({len(od):,})"):
+    with st.expander(f"⏰ Overdue open WO items ({len(od):,})", expanded=False):
         if od.empty:
             st.caption("Nothing overdue and open.")
         else:
@@ -3198,9 +3427,8 @@ def overview_tab(df, wos):
         iss = _drop_zero_ordered(
             po_df[pd.to_numeric(po_df["total_issues"], errors="coerce").fillna(0) > 0].copy()
         )
-        with st.expander(f"⚠️ PO lines with receiving issues ({len(iss):,})"):
-            st.caption('"Issue Type" = the problem(s) logged in the PO report (e.g. Concealed Damage); '
-                       '"Issues" = the count from that log.')
+        with st.expander(f"⚠️ PO lines with receiving issues ({len(iss):,})", expanded=False):
+            _po_lag_caption(extra='"Issue Type" = problems logged on the PO report (e.g. Concealed Damage).')
             if iss.empty:
                 st.caption("No receiving issues logged.")
             else:
@@ -3229,7 +3457,13 @@ def overview_tab(df, wos):
         aging["_age"] = (pd.Timestamp(datetime.now().date())
                          - pd.to_datetime(aging["order_placed_date"], errors="coerce")).dt.days
         aging = _drop_zero_ordered(aging[aging["_age"] >= OV_AGING_DAYS])
-        with st.expander(f"🐢 Placed {OV_AGING_DAYS}d+ ago, nothing received ({len(aging):,})"):
+        with st.expander(
+            f"🐢 Placed {OV_AGING_DAYS}d+ ago, nothing received ({len(aging):,})",
+            expanded=False,
+        ):
+            _po_lag_caption(
+                extra="This list is received = 0 on the daily report. Confirm in Shelf before chasing."
+            )
             if aging.empty:
                 st.caption("None — inbound is keeping up.")
             else:
@@ -3253,7 +3487,10 @@ def overview_tab(df, wos):
 
         # E) Over-receipts (received > ordered)
         over = po_df[(recv > cur) & (cur > 0)].copy()
-        with st.expander(f"📈 Over-receipts — received > ordered ({len(over):,})"):
+        with st.expander(f"📈 Over-receipts — received > ordered ({len(over):,})", expanded=False):
+            _po_lag_caption(
+                extra="Vendor fill > 100% on the daily report. Confirm current ordered vs received in Shelf."
+            )
             if over.empty:
                 st.caption("No over-receipts.")
             else:
@@ -3271,146 +3508,6 @@ def overview_tab(df, wos):
                 d["PO #"] = _ov_po_str(d["PO #"])
                 d = _ov_narrow(d, "over")
                 _panel(d, "ov_over", numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"])
-
-        # G) PO items without full WO coverage — ITEM level (a PO can be
-        # partly fine and partly a gap; different grain from panel F above).
-        gap_ok = False
-        try:
-            item_gap = fetch_po_item_wo_gap(_wh_scope_arg())
-            _warn_missing_columns(
-                item_gap,
-                ["coverage_state", "po_number", "sku", "warehouse_name", "reason"],
-                "PO item WO gap (queries/po_item_wo_gap.sql)",
-            )
-            gap_ok = item_gap is not None and "coverage_state" in item_gap.columns
-            if gap_ok and not _wh_is_all(wh) and "warehouse_name" in item_gap.columns:
-                item_gap = item_gap[item_gap["warehouse_name"] == wh].copy()
-            if gap_ok:
-                item_gap = _scope_one(
-                    item_gap, pick, ov_q,
-                    brand_cols=["vendor_name"],
-                    search_cols=["po_number", "sku", "asin", "master_id", "title",
-                                 "vendor_name", "warehouse_name", "reason", "coverage_state"],
-                )
-                if (item_gap is not None and po_pos is not None and not po_pos.empty
-                        and "po_number" in item_gap.columns):
-                    item_gap = item_gap[item_gap["po_number"].isin(po_pos["po_number"])].copy()
-                item_gap = _drop_zero_ordered(item_gap)
-        except Exception:
-            item_gap = None
-            gap_ok = False
-        if not gap_ok:
-            _n_gap = _n_nowo_items = _n_partial_items = 0
-        else:
-            _n_gap = len(item_gap)
-            _n_nowo_items = int((item_gap["coverage_state"] == "No WO").sum())
-            _n_partial_items = int((item_gap["coverage_state"] == "Partial WO").sum())
-        with st.expander(f"🧩 PO items without full work-order coverage ({_n_gap:,})"):
-            st.caption("Item-level — a PO can have some items fully covered and others not. **No WO** = "
-                       "nothing raised for this item yet. **Partial WO** = a WO exists but for fewer units "
-                       "than are still outstanding. \"Reason\" explains a No-WO line that may not be a live "
-                       "gap (e.g. already fully received); items handled via a Manual/Storage WO instead of "
-                       "a PO-linked one are flagged here too, not hidden.")
-            if item_gap is None:
-                st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
-            elif not gap_ok:
-                st.error(
-                    "GitHub `queries/po_item_wo_gap.sql` is not the production gap query. "
-                    "It must return **coverage_state** (No WO / Partial WO), **sku**, "
-                    "**warehouse_name**, and **reason** — one row per PO × Master ID. "
-                    "Overwrite it with `wo-tracking-tool/queries/po_item_wo_gap.sql` "
-                    "(do not use the diagnostic `SELECT * FROM po_woi` dump), then reboot."
-                )
-            elif item_gap.empty:
-                st.caption("None — every PO item has full work-order coverage.")
-            else:
-                mcol = st.columns(3)
-                mcol[0].metric("Item-lines flagged", f"{_n_gap:,}")
-                mcol[1].metric("No WO", f"{_n_nowo_items:,}")
-                mcol[2].metric("Partial WO", f"{_n_partial_items:,}")
-                if "reason" in item_gap.columns:
-                    genuine = int((item_gap["reason"] == "Genuine gap — needs WO raised").sum())
-                    if genuine:
-                        st.caption(f"Of the No-WO lines, **{genuine:,}** are a genuine gap needing a WO "
-                                   "raised — the rest are already received, on a closed PO, or covered "
-                                   "via a Storage WO.")
-                keep = ["po_number", "sku", "title", "vendor_name", "warehouse_name",
-                        "original_ordered_units", "ordered_units", "received_units",
-                        "outstanding_units", "wo_qty", "coverage_state", "reason",
-                        "order_placed_date", "purchase_state"]
-                keep = [c for c in keep if c in item_gap.columns]
-                sort_cols = [c for c in ["coverage_state", "outstanding_units"] if c in item_gap.columns]
-                sorted_gap = (
-                    item_gap.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)])
-                    if sort_cols else item_gap
-                )
-                d = sorted_gap[keep].rename(columns={
-                    "po_number": "PO #", "sku": "SKU", "title": "Title", "vendor_name": "Vendor",
-                    "warehouse_name": "WH",
-                    "original_ordered_units": "Orig Ordered", "ordered_units": "Current Ordered",
-                    "received_units": "Received", "outstanding_units": "Outstanding",
-                    "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason",
-                    "order_placed_date": "Order Placed", "purchase_state": "State"})
-                if "PO #" in d.columns:
-                    d["PO #"] = _ov_po_str(d["PO #"])
-                if flag_action is not None and "Coverage" in d.columns:
-                    _src = (
-                        d["Reason"].astype(str) if "Reason" in d.columns
-                        else pd.Series("", index=d.index)
-                    )
-                    _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
-                    d["What to do"] = _src.map(flag_action)
-                d = _ov_narrow(d, "item_gap")
-                gap_lines = item_gap
-                if "PO #" in d.columns and "po_number" in item_gap.columns:
-                    vis = set(d["PO #"].astype(str))
-                    gap_lines = item_gap[item_gap["po_number"].map(_ov_po_str).isin(vis)]
-                _g0, _g1, _g2 = st.columns(3)
-                with _g0:
-                    _overview_send_wo_request(
-                        "slack_item_gap_wo", gap_lines,
-                        filename=f"wo_request_item_gap_{datetime.now():%Y%m%d}.csv",
-                    )
-                with _g1:
-                    if st.button("🔎 Look up listings", key="jump_item_gap_cat",
-                                 use_container_width=True,
-                                 help="Open Catalogue Lookup with these SKUs / Master IDs"):
-                        ids = _catalog_ids_for_lookup(gap_lines)
-                        po_nums = []
-                        if "po_number" in gap_lines.columns:
-                            po_nums = [x for x in _ov_po_str(gap_lines["po_number"]).tolist() if x]
-                        uniq_pos = list(dict.fromkeys(po_nums))
-                        shown = ", ".join(uniq_pos[:12])
-                        extra = f" (+{len(uniq_pos) - 12} more)" if len(uniq_pos) > 12 else ""
-                        _jump_to_catalog_lookup(
-                            ids,
-                            context=f"{len(gap_lines):,} PO item(s) without full WO coverage"
-                                    + (f" (POs {shown}{extra})" if shown else ""),
-                            pack=True, qty_frame=gap_lines,
-                        )
-                with _g2:
-                    if st.button("📦 Add gap lines to raise-WO pack", key="ov_gap_raise",
-                                 use_container_width=True,
-                                 help="Adds outstanding qty as Shelf rows. Does not create a WO in Shelf."):
-                        add_raise_rows(raise_rows_from_gap(gap_lines))
-                        _jump_to_requests("Raise-WO pack")
-                _h1, _h2 = st.columns(2)
-                with _h1:
-                    st.download_button(
-                        "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
-                        file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
-                        mime="text/csv", key="dl_item_gap", use_container_width=True)
-                with _h2:
-                    if st.button("📌 Add to chase list", key="ov_gap_chase",
-                                 use_container_width=True,
-                                 help="Follow-up checklist only — does not complete a WO in Shelf."):
-                        add_chase_rows(chase_rows_from_pos(gap_lines, kind="Item gap"))
-                        _jump_to_requests("Chase list")
-                st.caption("**Send WO request** attaches outstanding lines as a Shelf file. "
-                           "**PO #** copies the number. **Shelf → Open** opens the PO.")
-                _panel(d, "ov_item_gap",
-                       date_cols=[c for c in ["Order Placed"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True, slack=False)
     else:
         if po_fetch_error:
             st.caption(f"PO-based exceptions unavailable: {po_fetch_error}")
@@ -3749,10 +3846,12 @@ def catalog_lookup_tab():
         elif n_zero:
             st.caption(f"{n_zero:,} row(s) have qty 0 — they stay here to edit but will not be sent.")
         sig_lids = layout["Product (Listing ID or Master ID)"].astype(str)
-        sig = f"{len(layout)}_{sig_lids.iloc[0]}_{sig_lids.iloc[-1]}_" \
-              f"{int(pd.to_numeric(layout['Request Amount'], errors='coerce').fillna(0).sum())}"
+        sig = f"{len(layout)}_{sig_lids.iloc[0]}_{sig_lids.iloc[-1]}"
+        seed_key = f"cat_wo_seed_{sig}"
+        if seed_key not in st.session_state:
+            st.session_state[seed_key] = layout
         edited_layout = st.data_editor(
-            layout,
+            st.session_state[seed_key],
             key=f"cat_wo_ed_{sig}",
             num_rows="dynamic",
             use_container_width=True,
@@ -3760,13 +3859,15 @@ def catalog_lookup_tab():
             column_config={
                 "Request Amount": st.column_config.NumberColumn("Request Amount", min_value=0, step=1),
                 "Work Order Item Type": st.column_config.SelectboxColumn(
-                    "Work Order Item Type", options=["FBA", "FBM"],
+                    "Work Order Item Type", options=["FBA", "FBM"], required=True,
                 ),
                 "Prioritized (T/F)": st.column_config.SelectboxColumn(
-                    "Prioritized (T/F)", options=["F", "T"],
+                    "Prioritized (T/F)", options=["F", "T"], required=True,
                 ),
             },
         )
+        if edited_layout is not None:
+            st.session_state[seed_key] = edited_layout
         send_df = shelf_send_df(edited_layout)
 
     po_ids = []
@@ -3993,4 +4094,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
