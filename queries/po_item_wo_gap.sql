@@ -119,4 +119,3 @@ LEFT JOIN storage_master_ids sm ON sm.master_id = po_items.master_id
 WHERE po_woi.wo_qty IS NULL
    OR po_woi.wo_qty < (po_items.ordered_units - po_items.received_units)
 ORDER BY po_items.po_number, po_items.master_id
-
