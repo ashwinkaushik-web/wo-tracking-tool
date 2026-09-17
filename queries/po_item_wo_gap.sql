@@ -32,6 +32,9 @@ WITH po_items AS (
         MAX(rpt.WAREHOUSE_NAME)          AS warehouse_name,
         MAX(rpt.PURCHASE_STATE)          AS purchase_state,
         MIN(rpt.ORDER_PLACED_DATE)       AS order_placed_date,
+        MIN(rpt.SHIPPED_DATE)            AS ship_date,
+        MAX(rpt.FULFILLMENT_METHOD)      AS fulfillment_method,
+        SUM(rpt.ORDERED_UNITS)           AS original_ordered_units,
         SUM(rpt.CURRENT_UNITS)           AS ordered_units,
         SUM(rpt.RECEIVED_UNITS)          AS received_units
     FROM ANALYTICS_DB.REPORTING.REPORT__BRAND_MANAGEMENT_V7__PURCHASE_ORDERS rpt
@@ -41,6 +44,7 @@ WITH po_items AS (
       AND rpt.MASTER_ID IS NOT NULL
       AND LOWER(rpt.PURCHASE_STATE) <> 'ready_to_reconcile'
     GROUP BY CAST(rpt.PO_NUMBER AS VARCHAR), rpt.MASTER_ID
+    HAVING SUM(rpt.ORDERED_UNITS) > 0 OR SUM(rpt.CURRENT_UNITS) > 0
 ),
 po_woi AS (
     -- Quantity actually raised on PO-linked work orders (receivable_type='Purchase'),
@@ -89,6 +93,9 @@ SELECT
     po_items.warehouse_name,
     po_items.purchase_state,
     po_items.order_placed_date,
+    po_items.ship_date,
+    po_items.fulfillment_method,
+    po_items.original_ordered_units,
     po_items.ordered_units,
     po_items.received_units,
     (po_items.ordered_units - po_items.received_units) AS outstanding_units,
