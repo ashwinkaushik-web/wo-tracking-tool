@@ -1345,6 +1345,10 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     c7.metric("Max Age", f"{_safe_int(wo_row['max_age'])}d")
 
     items = s_items[s_items["work_order_number"] == wo_id].copy()
+    render_po_destination_split(
+        wo_items=items,
+        ordered=_safe_int(wo_row.get("orig")),
+    )
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id}")
     filtered = filter_panel(
@@ -1354,16 +1358,17 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     )
     filtered = hide_unlisted(filtered, f"hl_swo_items_{wo_id}")
     render_root_cause_detail(filtered, f"rc_swo_{wo_id}")
-    display = filtered[
-        ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "master_id",
-         "listing_id", "finished_good_name", "source_brand",
-         "status_simple", "pick_type", "processing_status", "block_reason_pfs", "original_request",
-         "current_request", "processed", "order_created", "shipped", "storage", "woi_processing_pct",
-         "age_days_from_created", "days_overdue"]
-    ].rename(columns={
+    swo_cols = [
+        "work_order_item_id", "ship_by", "created_at", "last_edit_at", "master_id",
+        "listing_id", "woi_type", "finished_good_name", "source_brand",
+        "status_simple", "pick_type", "processing_status", "block_reason_pfs", "original_request",
+        "current_request", "processed", "order_created", "shipped", "storage", "woi_processing_pct",
+        "age_days_from_created", "days_overdue",
+    ]
+    display = filtered[[c for c in swo_cols if c in filtered.columns]].rename(columns={
         "work_order_item_id": "WOI ID", "ship_by": "Ship By", "created_at": "Created At",
         "last_edit_at": "Last Edit At", "master_id": "Master ID",
-        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "listing_id": "Listing", "woi_type": "WO Type", "finished_good_name": "Item Name", "source_brand": "Brand",
         "status_simple": "Status", "pick_type": "Pick Type", "processing_status": "Block Status",
         "block_reason_pfs": "Reason", "original_request": "Orig", "current_request": "Current",
         "processed": "Processed", "order_created": "Ship Created", "shipped": "Shipped",
@@ -1497,6 +1502,10 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     c6.metric("Ref Ship-by", _safe_date_str(wo_row["earliest_ref_ship"]))
 
     items = p_items[p_items["work_order_number"] == wo_id].copy()
+    render_po_destination_split(
+        wo_items=items,
+        ordered=_safe_int(wo_row.get("orig")),
+    )
     flag_counts = items["po_block_flag"].value_counts().to_dict()
     if flag_counts:
         breakdown = " · ".join([f"{k}: **{v}**" for k, v in flag_counts.items()])
@@ -1882,12 +1891,12 @@ def _finalize_po_destination(po_pos):
     out = po_pos
     for src, dst in _DEST_MAP:
         if src in out.columns:
-            out[dst] = pd.to_numeric(out[src], errors="coerce").fillna(0).astype(int)
+            out[dst] = _int_qty(out[src])
         elif dst not in out.columns:
             out[dst] = 0
-    ordered = pd.to_numeric(out["ordered"], errors="coerce").fillna(0) if "ordered" in out.columns else 0
-    raised = sum(pd.to_numeric(out[c], errors="coerce").fillna(0) for c in _DEST_UNIT_COLS)
-    out["stow_units"] = (ordered - raised).clip(lower=0).astype(int)
+    ordered = _int_qty(out["ordered"]) if "ordered" in out.columns else 0
+    raised = sum(_int_qty(out[c]) for c in _DEST_UNIT_COLS if c in out.columns)
+    out["stow_units"] = _int_qty((ordered - raised).clip(lower=0))
     return out
 
 
@@ -2595,12 +2604,16 @@ def _destination_from_wo_items(wo_items, ordered):
     return totals, ordered
 
 
+def _int_qty(s):
+    """Numeric qty column → int, never NaN (avoids IntCastingNaNError)."""
+    return pd.to_numeric(s, errors="coerce").fillna(0).astype("int64")
+
+
 def _attach_item_wo_destination(items, wo_df):
     """Per PO line: dest qty from WO items on the same PO × Master ID."""
     if items is None or getattr(items, "empty", True):
         return items
     out = items.copy()
-    ordered = pd.to_numeric(out["ordered_units"], errors="coerce").fillna(0) if "ordered_units" in out.columns else 0
     unit_cols = _DEST_UNIT_COLS
     for c in unit_cols:
         out[c] = 0
@@ -2641,9 +2654,10 @@ def _attach_item_wo_destination(items, wo_df):
                     out[c] = pd.to_numeric(out.get(c), errors="coerce").fillna(0)
             out = out.drop(columns=["_po", "_mid"])
     for c in unit_cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+        out[c] = _int_qty(out[c])
+    ordered = _int_qty(out["ordered_units"]) if "ordered_units" in out.columns else 0
     raised = sum(out[c] for c in unit_cols)
-    out["stow_units"] = (ordered - raised).clip(lower=0).astype(int)
+    out["stow_units"] = _int_qty((ordered - raised).clip(lower=0))
     return out
 
 
@@ -3537,7 +3551,6 @@ def overview_tab(df, wos):
         c[2].metric("Units received", f"{po_received:,}")
         c[3].metric("Vendor fill", f"{po_fill:.0f}%")
         c[4].metric("Lines w/ issues", f"{po_iss:,}")
-        render_po_destination_split(po_pos)
         _po_lag_caption()
     else:
         st.caption("PO data unavailable — check queries/po_tracker.sql.")
@@ -3682,8 +3695,6 @@ def overview_tab(df, wos):
         "That does **not** create a WO in Shelf. "
         f"Each table shows the top {OV_MAX_ROWS}. Use **Advanced filters** to narrow."
     )
-    if po_pos is not None and not getattr(po_pos, "empty", True):
-        render_po_destination_split(po_pos)
     if render_flag_guide is not None:
         render_flag_guide()
     elif _FLAG_GUIDE_ERROR:
@@ -3743,7 +3754,6 @@ def overview_tab(df, wos):
                 keep = [
                     "po_number", "vendor_name", "warehouse_name",
                     "original_ordered", "ordered", "received", "left",
-                    "fba_units", "fbb_units", "fbm_units", "zfs_units", "oct_units", "stow_units",
                     "demand_fill_pct", "vendor_fill_pct",
                     "_age", "order_placed", "ship_date", "first_arrival",
                     "country_name", "purchase_state", "po_type", "fulfillment",
@@ -3753,9 +3763,6 @@ def overview_tab(df, wos):
                     "po_number": "PO #", "vendor_name": "Vendor", "warehouse_name": "WH",
                     "original_ordered": "Orig Ordered", "ordered": "Current Ordered",
                     "received": "Received", "left": "Left",
-                    "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
-                    "zfs_units": "ZFS", "oct_units": "OCT",
-                    "stow_units": "To Stow",
                     "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
                     "_age": "Days Since Placed", "order_placed": "Order Placed",
                     "ship_date": "Ship Date", "first_arrival": "First Arrival",
