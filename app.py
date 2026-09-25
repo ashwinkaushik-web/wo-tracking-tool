@@ -339,6 +339,14 @@ COLUMN_GLOSSARY = {
     "ZFS": "Units raised on ZFS work-order items (WO current qty).",
     "OCT": "Units raised on OCT work-order items (WO current qty).",
     "To Stow": "Current ordered minus FBA/FBB/FBM/ZFS/OCT and any other WO qty — leftover with no marketplace WO.",
+    "Split": "Share of current ordered by WO type, e.g. 20% FBA · 20% FBM · 60% stow.",
+    "FBA %": "FBA WO current qty as % of current ordered.",
+    "FBB %": "FBB WO current qty as % of current ordered.",
+    "FBM %": "FBM WO current qty as % of current ordered.",
+    "ZFS %": "ZFS WO current qty as % of current ordered.",
+    "OCT %": "OCT WO current qty as % of current ordered.",
+    "Stow %": "Leftover (no marketplace WO) as % of current ordered.",
+    "All stow": "This PO / part has no FBA/FBM (or other marketplace) WO — 100% of current ordered is leftover to stow.",
     "WO Type": "Work-order item type from Shelf (FBA, FBB, FBM, ZFS, OCT, …) — where those units are going.",
     "PO Qty": "Outstanding PO units (ordered − received) for that Master ID / SKU. "
               "Shown on every listing of the master in Catalogue Lookup.",
@@ -653,7 +661,9 @@ def _row_style(row):
     """Background colour by status for the coloured (non-clickable) tables."""
     flag = str(row.get("Flag", row.get("Worst Flag", row.get("Status", ""))))
     color = ""
-    if "🔴" in flag:
+    if str(row.get("All stow", "")).startswith("⚠️") or str(row.get("Split", "")).endswith("100% stow"):
+        color = "rgba(245,158,11,0.32)"
+    elif "🔴" in flag:
         color = "rgba(239,68,68,0.13)"
     elif "🟠" in flag:
         color = "rgba(245,158,11,0.13)"
@@ -908,6 +918,7 @@ def hide_unlisted(df, key):
 COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler is slow)
 _STREAMLIT_QTY_COLS = {
     "FBA", "FBB", "FBM", "ZFS", "OCT", "To Stow", "To stow",
+    "FBA %", "FBB %", "FBM %", "ZFS %", "OCT %", "Stow %",
     "Orig Ordered", "Current Ordered", "Ordered", "Received", "Left",
     "On Order", "Outstanding", "WO Qty", "WOs", "Lines",
 }
@@ -1910,6 +1921,45 @@ def _finalize_po_destination(po_pos):
     ordered = _int_qty(out["ordered"]) if "ordered" in out.columns else 0
     raised = sum(_int_qty(out[c]) for c in _DEST_UNIT_COLS if c in out.columns)
     out["stow_units"] = _int_qty((ordered - raised).clip(lower=0))
+    return _attach_dest_pct(out, "ordered")
+
+
+_DEST_PCT_SPECS = (
+    ("fba_units", "fba_pct", "FBA"),
+    ("fbb_units", "fbb_pct", "FBB"),
+    ("fbm_units", "fbm_pct", "FBM"),
+    ("zfs_units", "zfs_pct", "ZFS"),
+    ("oct_units", "oct_pct", "OCT"),
+    ("stow_units", "stow_pct", "stow"),
+)
+
+
+def _attach_dest_pct(df, ordered_col):
+    """% of current ordered by dest + a readable Split string + all-stow flag."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df
+    if ordered_col in out.columns:
+        ordered = pd.to_numeric(out[ordered_col], errors="coerce").fillna(0)
+    else:
+        ordered = pd.Series(0, index=out.index)
+    denom = ordered.replace(0, np.nan)
+    bits = []
+    for units_c, pct_c, label in _DEST_PCT_SPECS:
+        qty = pd.to_numeric(out[units_c], errors="coerce").fillna(0) if units_c in out.columns else 0
+        pct = (qty * 100.0 / denom).round(0).fillna(0).astype(int)
+        out[pct_c] = pct
+        bits.append(np.where(pct > 0, pct.astype(str) + "% " + label, ""))
+    split = bits[0].astype(object)
+    for bit in bits[1:]:
+        split = np.where(
+            (split != "") & (bit != ""),
+            split.astype(str) + " · " + bit,
+            np.where(split != "", split, bit),
+        )
+    out["dest_split"] = split
+    out["all_stow"] = (out["stow_pct"] >= 100) & (ordered > 0)
+    out["all_stow_label"] = np.where(out["all_stow"], "⚠️ All stow", "")
     return out
 
 
@@ -2671,7 +2721,7 @@ def _attach_item_wo_destination(items, wo_df):
     ordered = _int_qty(out["ordered_units"]) if "ordered_units" in out.columns else 0
     raised = sum(out[c] for c in unit_cols)
     out["stow_units"] = _int_qty((ordered - raised).clip(lower=0))
-    return out
+    return _attach_dest_pct(out, "ordered_units")
 
 
 def render_po_destination_split(df=None, *, wo_items=None, ordered=None):
@@ -2694,8 +2744,9 @@ def render_po_destination_split(df=None, *, wo_items=None, ordered=None):
     c[5].metric("To stow", f"{totals['Stow']:,}", "leftover after WO types", delta_color="off")
     st.caption(
         "FBA / FBB / FBM / ZFS / OCT are **work-order item types** (WO current qty). "
-        "**To stow** is current ordered minus all WO qty — leftover with no marketplace WO. "
-        "The PO report fulfillment method is often blank, so it is not used here."
+        "**To stow** is current ordered minus all WO qty. "
+        "Tables show a **Split** like `20% FBA · 20% FBM · 60% stow`. "
+        "**100% stow** parts/POs (no marketplace WO) are highlighted amber."
     )
 
 
@@ -2811,6 +2862,13 @@ def po_filter_panel(df, key, *, date_col=None, status_col=None, search_cols=None
                 cols = [c for c in search_cols if c in out.columns]
                 if cols:
                     out = out[_str_contains_any(out, cols, q)]
+        if "all_stow" in out.columns:
+            if st.checkbox(
+                "Only 100% stow (no marketplace WO)",
+                key=f"{key}_allstow",
+                help="POs / parts where current ordered has no FBA/FBM (or other) WO leftover is all stow.",
+            ):
+                out = out[out["all_stow"].fillna(False)]
     if "_line_search" in out.columns:
         out = out.drop(columns="_line_search")
     return out
@@ -2831,7 +2889,11 @@ _PO_ITEM_COLS = [
     ("received_units", "Received"),
     ("fba_units", "FBA"), ("fbb_units", "FBB"), ("fbm_units", "FBM"),
     ("zfs_units", "ZFS"), ("oct_units", "OCT"),
-    ("stow_units", "To Stow"), ("remained_blanket_order_quantity", "Remained Blanket"),
+    ("stow_units", "To Stow"),
+    ("dest_split", "Split"),
+    ("fba_pct", "FBA %"), ("fbb_pct", "FBB %"), ("fbm_pct", "FBM %"),
+    ("zfs_pct", "ZFS %"), ("oct_pct", "OCT %"), ("stow_pct", "Stow %"),
+    ("all_stow_label", "All stow"), ("remained_blanket_order_quantity", "Remained Blanket"),
     ("wholesale_price", "Wholesale £"), ("retail_price", "Retail £"),
     ("wholesale_ordered", "WS Ordered £"), ("wholesale_received", "WS Received £"),
     ("demand_fill_rate_pct", "Demand Fill %"), ("vendor_fill_rate_pct", "Vendor Fill %"),
@@ -2840,6 +2902,7 @@ _PO_ITEM_COLS = [
 _PO_ITEM_DEFAULT = ["PO #", "Status", "Order Placed", "Ship Date", "PO Last Recv", "SKU", "ASIN",
                     "Master ID", "Title", "Vendor", "WH", "Fulfillment",
                     "Orig Ordered", "Current Ordered", "Received",
+                    "Split", "FBA %", "FBM %", "Stow %", "All stow",
                     "FBA", "FBB", "FBM", "ZFS", "OCT", "To Stow", "On Order",
                     "Demand Fill %", "Vendor Fill %", "Issues", "PO WOs"]
 _PO_ITEM_DATE_COLS = ["Order Placed", "Ship Date", "Arrived", "PO Last Recv", "Item Last Recv",
@@ -2925,6 +2988,7 @@ def po_details_list(po_pos, po_df):
                  "po_type", "fulfillment",
                  "order_placed", "ship_date", "first_arrival", "last_received", "lines",
                  "original_ordered", "ordered", "received",
+                 "dest_split", "fba_pct", "fbm_pct", "stow_pct", "all_stow_label",
                  "fba_units", "fbb_units", "fbm_units", "zfs_units", "oct_units", "stow_units",
                  "left", "on_order", "demand_fill_pct", "vendor_fill_pct"]
     base_cols = [c for c in base_cols if c in filtered.columns]
@@ -2937,6 +3001,8 @@ def po_details_list(po_pos, po_df):
         "ship_date": "Ship Date", "first_arrival": "First Arrival",
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Current Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
+        "dest_split": "Split", "fba_pct": "FBA %", "fbm_pct": "FBM %", "stow_pct": "Stow %",
+        "all_stow_label": "All stow",
         "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
         "zfs_units": "ZFS", "oct_units": "OCT",
         "stow_units": "To Stow",
@@ -2945,14 +3011,17 @@ def po_details_list(po_pos, po_df):
         "wo_ship_created": "WO Ship Created", "wo_shipped": "WO Shipped", "wo_stowed": "WO Stowed",
     })
     display["PO #"] = pd.to_numeric(display["PO #"], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
-    cols = column_picker(list(display.columns), key="cols_pod_dest", required=["PO #"])
+    cols = column_picker(list(display.columns), key="cols_pod_split", required=["PO #"])
     display = display[cols]
 
     table_toolbar(display, key="tb_pod", file_stem="po_details",
                   id_cols=["PO #", "Vendor"], count_label=f"{len(display)} of {len(po_pos)} POs")
+    n_all_stow = int(filtered["all_stow"].sum()) if "all_stow" in filtered.columns else 0
+    if n_all_stow:
+        st.caption(f"⚠️ **{n_all_stow:,}** PO(s) are **100% stow** (no FBA/FBM WO). Highlighted amber.")
     sel = render_table(
         display, key=_grid_key("grid_pod"), selectable=True, select_col="PO #",
-        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        numpct_cols=["Demand Fill %", "Vendor Fill %", "FBA %", "FBB %", "FBM %", "ZFS %", "OCT %", "Stow %"],
         date_cols=["Order Placed", "Ship Date", "First Arrival", "Last Received"], pin_cols=["PO #"],
         color_rows=True, height=740,
     )
@@ -3017,13 +3086,16 @@ def po_details_items(po_df, po_pos=None, wo_df=None):
             add_raise_rows(raise_rows_from_gap(filtered))
             _jump_to_requests("Raise-WO pack")
     disp, default = _po_item_display(filtered, include_po=True)
-    cols = column_picker(list(disp.columns), key="cols_podi_dest", default_labels=default, required=["PO #"])
+    cols = column_picker(list(disp.columns), key="cols_podi_split", default_labels=default, required=["PO #"])
     disp = disp[cols]
     table_toolbar(disp, key="tb_podi", file_stem="po_items",
                   id_cols=["PO #", "SKU", "ASIN", "Master ID"], count_label=f"{len(disp):,} line items")
+    n_all_stow = int(filtered["all_stow"].sum()) if "all_stow" in filtered.columns else 0
+    if n_all_stow:
+        st.caption(f"⚠️ **{n_all_stow:,}** part(s) are **100% stow** (no FBA/FBM WO). Highlighted amber.")
     render_table(
         disp, key=_grid_key("grid_podi"),
-        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        numpct_cols=["Demand Fill %", "Vendor Fill %", "FBA %", "FBB %", "FBM %", "ZFS %", "OCT %", "Stow %"],
         date_cols=_PO_ITEM_DATE_COLS, pin_cols=["PO #"], color_rows=True, height=720,
     )
 
@@ -3081,13 +3153,16 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
         ],
     )
     disp, default = _po_item_display(filtered, include_po=False)
-    cols = column_picker(list(disp.columns), key=f"cols_pod_items_dest_{po}", default_labels=default, required=["SKU"])
+    cols = column_picker(list(disp.columns), key=f"cols_pod_items_split_{po}", default_labels=default, required=["SKU"])
     disp = disp[cols]
     table_toolbar(disp, key=f"tb_pod_items_{po}", file_stem=f"po_{po}_items",
                   id_cols=["SKU", "ASIN", "Master ID"], count_label=f"{len(disp)} line items")
+    n_all_stow = int(filtered["all_stow"].sum()) if "all_stow" in filtered.columns else 0
+    if n_all_stow:
+        st.caption(f"⚠️ **{n_all_stow:,}** part(s) on this PO are **100% stow** (no FBA/FBM WO). Highlighted amber.")
     render_table(
         disp, key=_grid_key(f"grid_pod_items_{po}"),
-        numpct_cols=["Demand Fill %", "Vendor Fill %"],
+        numpct_cols=["Demand Fill %", "Vendor Fill %", "FBA %", "FBB %", "FBM %", "ZFS %", "OCT %", "Stow %"],
         date_cols=_PO_ITEM_DATE_COLS, pin_cols=["SKU"], color_rows=True, height=560,
     )
 
@@ -3262,6 +3337,13 @@ def _ov_adv_filters(df, key, *, fields, qty_col=None, qty_label="Min qty",
                         if lab in dpick and col in out.columns:
                             mask = mask | (pd.to_numeric(out[col], errors="coerce").fillna(0) > 0)
                     out = out[mask]
+        if "all_stow" in out.columns:
+            if st.checkbox(
+                "Only 100% stow (no marketplace WO)",
+                key=f"ovadv_{key}_allstow",
+                help="Parts where none of current ordered is on an FBA/FBM (or other) WO.",
+            ):
+                out = out[out["all_stow"].fillna(False)]
         q1, q2 = st.columns([2, 1])
         q = q1.text_input(
             "Find in this table", "", key=f"ovq_{key}",
