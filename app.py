@@ -411,6 +411,19 @@ def get_snowflake_connection():
     )
 
 
+def _sf_query(sql):
+    """Run one read-only Snowflake statement; return a DataFrame."""
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [c[0].lower() for c in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+
+
 def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("work_order_number", as_index=False).agg(
         source_category=("source_category", "first"),
@@ -566,6 +579,15 @@ def fetch_data(wh_scope=()):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "woi_type" not in df.columns and "work_order_item_id" in df.columns:
+        try:
+            types = fetch_woi_types(wh_scope)
+        except Exception:
+            types = None
+        if types is not None and not types.empty:
+            df["work_order_item_id"] = pd.to_numeric(df["work_order_item_id"], errors="coerce")
+            df = df.merge(types, on="work_order_item_id", how="left")
 
     wos = _build_wo_aggregates(df)
     return df, wos, datetime.now()
@@ -1613,10 +1635,14 @@ def _po_lag_caption(*, extra=""):
     st.caption(" ".join(bits))
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_po_wo_agg():
     """Per-PO rollup of the work orders linked to each PO (queries/po_wo_agg.sql)."""
-    sql = PO_WO_AGG_PATH.read_text()
+    return _cached_po_wo_agg(PO_WO_AGG_PATH.read_text())
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_po_wo_agg(sql):
+    """SQL text is the cache key so editing po_wo_agg.sql actually refetches."""
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1629,6 +1655,65 @@ def fetch_po_wo_agg():
     for c in agg.columns:
         agg[c] = pd.to_numeric(agg[c], errors="coerce")
     return agg
+
+
+# Dest + WO type live in app.py so they still work if only app.py is pasted
+# and queries/po_wo_agg.sql / wo_tracker.sql on Cloud are the older files.
+_PO_DEST_SQL = """
+SELECT
+    p.PO_NUMBER AS po_number,
+    SUM(CASE WHEN UPPER(wt.NAME) LIKE 'FBA%' THEN woi.QUANTITY ELSE 0 END) AS wo_fba,
+    SUM(CASE WHEN UPPER(wt.NAME) LIKE 'FBB%' THEN woi.QUANTITY ELSE 0 END) AS wo_fbb,
+    SUM(CASE WHEN UPPER(wt.NAME) LIKE 'FBM%' THEN woi.QUANTITY ELSE 0 END) AS wo_fbm,
+    SUM(CASE WHEN UPPER(wt.NAME) = 'ZFS' THEN woi.QUANTITY ELSE 0 END) AS wo_zfs,
+    SUM(CASE WHEN UPPER(wt.NAME) = 'OCT' THEN woi.QUANTITY ELSE 0 END) AS wo_oct,
+    SUM(CASE WHEN UPPER(wt.NAME) NOT LIKE 'FBA%'
+              AND UPPER(wt.NAME) NOT LIKE 'FBB%'
+              AND UPPER(wt.NAME) NOT LIKE 'FBM%'
+              AND UPPER(wt.NAME) NOT IN ('ZFS', 'OCT')
+             THEN woi.QUANTITY ELSE 0 END) AS wo_other
+FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__PURCHASES p
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS wo
+  ON wo.RECEIVABLE_ID = p.ID AND wo.RECEIVABLE_TYPE = 'Purchase' AND wo.DELETED_AT IS NULL
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
+  ON woi.WORK_ORDER_ID = wo.ID AND woi.DELETED_AT IS NULL AND woi.FOR_ACCEPTED_OVERAGE = FALSE
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEM_TYPES wt
+  ON wt.ID = woi.WORK_ORDER_ITEM_TYPE_ID
+WHERE wo.CREATED_AT >= '2025-07-01'
+GROUP BY p.PO_NUMBER
+"""
+_WOI_TYPE_SQL = """
+SELECT woi.id AS work_order_item_id, wt.name AS woi_type
+FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS wo
+  ON wo.id = woi.work_order_id AND wo.deleted_at IS NULL
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEM_TYPES wt
+  ON wt.id = woi.work_order_item_type_id
+JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WAREHOUSES wh
+  ON wh.id = wo.warehouse_id
+WHERE woi.deleted_at IS NULL
+  AND woi.for_accepted_overage = FALSE
+  AND woi.created_at >= DATE_TRUNC('year', CURRENT_DATE)
+  AND wh.id IN (138, 146)
+"""
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_po_dest_agg():
+    """Per-PO dest qty from WO item types. Independent of po_wo_agg.sql shape."""
+    dest = _sf_query(_PO_DEST_SQL)
+    for c in dest.columns:
+        dest[c] = pd.to_numeric(dest[c], errors="coerce")
+    return dest
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_woi_types(wh_scope=()):
+    """WO item type names when wo_tracker.sql does not SELECT woi_type."""
+    sql = _scope_sql(_WOI_TYPE_SQL, _override_from_scope(wh_scope))
+    types = _sf_query(sql)
+    types["work_order_item_id"] = pd.to_numeric(types["work_order_item_id"], errors="coerce")
+    return types[["work_order_item_id", "woi_type"]]
 
 
 _WO_AGG_COLS = [
@@ -1652,7 +1737,48 @@ _DEST_SHOW_COLS = {
 }
 
 
-def _enrich_po_pos_with_wo(po_pos):
+def _wo_dest_bucket_series(s):
+    """Map Shelf WO item type to FBA / FBB / FBM / ZFS / OCT / Other."""
+    raw = s.astype(str).str.strip().str.upper()
+    out = pd.Series("Other", index=s.index)
+    out = out.mask(raw.str.startswith("FBA", na=False), "FBA")
+    out = out.mask(raw.str.startswith("FBB", na=False), "FBB")
+    out = out.mask(raw.str.startswith("FBM", na=False), "FBM")
+    out = out.mask(raw.eq("ZFS"), "ZFS")
+    out = out.mask(raw.eq("OCT"), "OCT")
+    return out
+
+
+def _dest_from_wo_items(wo_df):
+    """Per-PO dest qty from already-loaded WO items when po_wo_agg dest cols are absent."""
+    if wo_df is None or getattr(wo_df, "empty", True) or "woi_type" not in wo_df.columns:
+        return None
+    po_col = next((c for c in ("po_number_raw", "po_number") if c in wo_df.columns), None)
+    qty_col = next((c for c in ("current_request", "original_request") if c in wo_df.columns), None)
+    if po_col is None or qty_col is None:
+        return None
+    w = wo_df[[po_col, "woi_type", qty_col]].copy()
+    w["po_number"] = pd.to_numeric(w[po_col], errors="coerce")
+    w = w.dropna(subset=["po_number"])
+    if w.empty:
+        return None
+    w["_bucket"] = _wo_dest_bucket_series(w["woi_type"])
+    w["_qty"] = pd.to_numeric(w[qty_col], errors="coerce").fillna(0)
+    g = w.groupby(["po_number", "_bucket"], as_index=False)["_qty"].sum()
+    rename = {
+        "FBA": "wo_fba", "FBB": "wo_fbb", "FBM": "wo_fbm",
+        "ZFS": "wo_zfs", "OCT": "wo_oct", "Other": "wo_other",
+    }
+    return (
+        g.pivot_table(index="po_number", columns="_bucket", values="_qty",
+                      aggfunc="sum", fill_value=0)
+        .reindex(columns=list(rename), fill_value=0)
+        .rename(columns=rename)
+        .reset_index()
+    )
+
+
+def _enrich_po_pos_with_wo(po_pos, wo_df=None):
     """Attach WO counts and destination qty; stow = leftover current ordered."""
     if po_pos is None or getattr(po_pos, "empty", True):
         return po_pos
@@ -1669,9 +1795,27 @@ def _enrich_po_pos_with_wo(po_pos):
         out = out.merge(wo_agg[keep], on="po_number", how="left")
         _warn_missing_columns(
             wo_agg,
-            ["po_number", "wo_count", "wo_fba", "wo_fbb", "wo_fbm", "wo_zfs", "wo_oct"],
+            ["po_number", "wo_count"],
             "PO→WO rollup (queries/po_wo_agg.sql)",
         )
+    dest_needed = [src for src, _ in _DEST_MAP]
+    if any(c not in out.columns for c in dest_needed):
+        extra = None
+        try:
+            extra = fetch_po_dest_agg()
+        except Exception:
+            extra = None
+        if extra is None or extra.empty:
+            extra = _dest_from_wo_items(wo_df)
+        if extra is not None and not extra.empty:
+            add = ["po_number"] + [c for c in dest_needed if c in extra.columns]
+            extra = extra[add].copy()
+            extra["po_number"] = pd.to_numeric(extra["po_number"], errors="coerce")
+            out["po_number"] = pd.to_numeric(out["po_number"], errors="coerce")
+            drop_existing = [c for c in add if c != "po_number" and c in out.columns]
+            if drop_existing:
+                out = out.drop(columns=drop_existing)
+            out = out.merge(extra, on="po_number", how="left")
     for cc in _WO_AGG_COLS:
         if cc in out.columns:
             out[cc] = pd.to_numeric(out[cc], errors="coerce").fillna(0).astype(int)
@@ -2364,18 +2508,6 @@ def _po_item_status(df):
     return status
 
 
-def _wo_dest_bucket_series(s):
-    """Map Shelf WO item type to FBA / FBB / FBM / ZFS / OCT / Other."""
-    raw = s.astype(str).str.strip().str.upper()
-    out = pd.Series("Other", index=s.index)
-    out = out.mask(raw.str.startswith("FBA", na=False), "FBA")
-    out = out.mask(raw.str.startswith("FBB", na=False), "FBB")
-    out = out.mask(raw.str.startswith("FBM", na=False), "FBM")
-    out = out.mask(raw.eq("ZFS"), "ZFS")
-    out = out.mask(raw.eq("OCT"), "OCT")
-    return out
-
-
 def _destination_totals_from_pos(po_pos):
     """Sum destination columns already on the PO rollup."""
     totals = {k: 0 for k in (*_DEST_SHOW_KEYS, "Stow", "Other")}
@@ -2923,8 +3055,8 @@ def po_details_tab(wo_df):
         po_df = po_df[po_df["warehouse_name"] == wh].copy()
         po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
 
-    # Enrich the PO rollup with WO-side quantities and FBA/FBB/FBM destination.
-    po_pos = _enrich_po_pos_with_wo(po_pos)
+    # Enrich the PO rollup with WO counts and dest qty (FBA/FBB/FBM/ZFS/OCT).
+    po_pos = _enrich_po_pos_with_wo(po_pos, wo_df)
 
     sel = st.session_state.get("selected_po_detail")
     if sel is not None and sel in po_pos["po_number"].values:
@@ -3271,7 +3403,7 @@ def overview_tab(df, wos):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
         # Attach WO count + dest qty per PO (FBA/FBB/FBM/ZFS/OCT; leftover = To stow).
-        po_pos = _enrich_po_pos_with_wo(po_pos)
+        po_pos = _enrich_po_pos_with_wo(po_pos, df)
     except Exception as exc:
         po_df = po_pos = None
         po_fetch_error = f"{type(exc).__name__}: {exc}"
