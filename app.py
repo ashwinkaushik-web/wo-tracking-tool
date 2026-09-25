@@ -172,6 +172,26 @@ NO_WO_GRACE_DAYS = 0   # 0 = flag POs the moment they're placed (per Owen: get a
 OV_AGING_DAYS = 21
 OV_MAX_ROWS = 100
 GENUINE_GAP_REASON = "Genuine gap — needs WO raised"
+
+
+def _read_sql(path):
+    """Load a .sql file. Reject Python accidentally pasted into queries/*.sql."""
+    text = Path(path).read_text(encoding="utf-8-sig")
+    stripped = text.lstrip()
+    if stripped.startswith(('"""', "'''", "import ", "from ", "def ")):
+        raise ValueError(
+            f"{Path(path).name} looks like Python, not SQL. On GitHub, replace "
+            f"queries/{Path(path).name} with the real SQL file — it must start "
+            "with -- or WITH/SELECT, not a Python docstring."
+        )
+    if stripped[:1] in {'"', "'"}:
+        raise ValueError(
+            f"{Path(path).name} starts with a quote, so Snowflake cannot run it. "
+            "Paste the SQL without wrapping the whole file in quotes."
+        )
+    return text
+
+
 PO_REPORT_LAG = (
     "PO ordered / received figures are a **daily report**, not live Shelf. "
     "Shelf can already show receipts or a different current qty. "
@@ -548,7 +568,7 @@ def _warehouse_picker_options():
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_data(wh_scope=()):
-    sql = _scope_sql(QUERY_PATH.read_text(), _override_from_scope(wh_scope))
+    sql = _scope_sql(_read_sql(QUERY_PATH), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -886,6 +906,33 @@ def hide_unlisted(df, key):
 # NATIVE TABLE RENDERER
 # ============================================================
 COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler is slow)
+_STREAMLIT_QTY_COLS = {
+    "FBA", "FBB", "FBM", "ZFS", "OCT", "To Stow", "To stow",
+    "Orig Ordered", "Current Ordered", "Ordered", "Received", "Left",
+    "On Order", "Outstanding", "WO Qty", "WOs", "Lines",
+}
+
+
+def _frame_for_streamlit(df):
+    """PyArrow rejects mixed numeric/string columns (e.g. FBA qty + the label 'FBA')."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    if out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+    for c in list(out.columns):
+        if c in _STREAMLIT_QTY_COLS or str(c).endswith("_units") or str(c).startswith("wo_"):
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype("int64")
+            continue
+        s = out[c]
+        if getattr(s, "dtype", None) is not None and getattr(s.dtype, "kind", "") == "O":
+            as_num = pd.to_numeric(s, errors="coerce")
+            nonempty = s.notna() & ~s.astype(str).str.strip().str.lower().isin(
+                ("", "nan", "none", "<na>")
+            )
+            if bool((nonempty & as_num.isna()).any()):
+                out[c] = s.fillna("").astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+    return out
 
 
 def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=(), numpct_cols=(),
@@ -958,6 +1005,7 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
                 help=COLUMN_GLOSSARY.get(SHELF_COL),
                 display_text="Open",
             )
+    render_df = _frame_for_streamlit(render_df)
 
     if selectable or multi_select:
         mode = "multi-row" if multi_select else "single-row"
@@ -1551,7 +1599,7 @@ def po_item_view(p_items, p_wos):
 # ============================================================
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_po_data(wh_scope=()):
-    sql = _scope_sql(PO_QUERY_PATH.read_text(), _override_from_scope(wh_scope))
+    sql = _scope_sql(_read_sql(PO_QUERY_PATH), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1637,7 +1685,7 @@ def _po_lag_caption(*, extra=""):
 
 def fetch_po_wo_agg():
     """Per-PO rollup of the work orders linked to each PO (queries/po_wo_agg.sql)."""
-    return _cached_po_wo_agg(PO_WO_AGG_PATH.read_text())
+    return _cached_po_wo_agg(_read_sql(PO_WO_AGG_PATH))
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -1819,7 +1867,12 @@ def _enrich_po_pos_with_wo(po_pos, wo_df=None):
     for cc in _WO_AGG_COLS:
         if cc in out.columns:
             out[cc] = pd.to_numeric(out[cc], errors="coerce").fillna(0).astype(int)
-    return _finalize_po_destination(out)
+    out = _finalize_po_destination(out)
+    if "wo_count" not in out.columns:
+        raised = sum(pd.to_numeric(out[c], errors="coerce").fillna(0) for c in _DEST_UNIT_COLS
+                     if c in out.columns)
+        out["wo_count"] = (raised > 0).astype(int)
+    return out
 
 
 def _finalize_po_destination(po_pos):
@@ -1843,7 +1896,7 @@ def fetch_po_item_wo_gap(wh_scope=()):
     """Item-level (PO x Master ID) WO coverage gaps — No WO / Partial WO lines
     only (queries/po_item_wo_gap.sql). Different grain from fetch_po_wo_agg,
     which rolls up to one row per whole PO."""
-    sql = _scope_sql(PO_ITEM_GAP_PATH.read_text(), _override_from_scope(wh_scope))
+    sql = _scope_sql(_read_sql(PO_ITEM_GAP_PATH), _override_from_scope(wh_scope))
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
@@ -1874,7 +1927,7 @@ def fetch_wo_unpickable_detail():
     reason name(s) + resolvable quantity. Defensive — returns None if the query
     file or table is unavailable, so the drill-down degrades instead of crashing."""
     try:
-        sql = UNPICK_DETAIL_PATH.read_text()
+        sql = _read_sql(UNPICK_DETAIL_PATH)
         conn = get_snowflake_connection()
         cur = conn.cursor()
         try:
@@ -1934,7 +1987,7 @@ def build_catalog_query(ids):
     """
     if not ids:
         raise ValueError("No IDs to look up.")
-    sql = CATALOG_QUERY_PATH.read_text()
+    sql = _read_sql(CATALOG_QUERY_PATH)
     sql = sql.replace("{id_values}", _sql_values_rows(ids))
     sql = sql.replace("{upper_list}", _sql_in_list(ids))
     leftover = [p for p in ("{id_values}", "{upper_list}") if p in sql]
@@ -2874,7 +2927,7 @@ def po_details_list(po_pos, po_df):
         display, key=_grid_key("grid_pod"), selectable=True, select_col="PO #",
         numpct_cols=["Demand Fill %", "Vendor Fill %"],
         date_cols=["Order Placed", "Ship Date", "First Arrival", "Last Received"], pin_cols=["PO #"],
-        color_rows=True, height=500,
+        color_rows=True, height=740,
     )
     if sel is not None:
         po = _safe_int(sel)
@@ -2944,7 +2997,7 @@ def po_details_items(po_df, po_pos=None, wo_df=None):
     render_table(
         disp, key=_grid_key("grid_podi"),
         numpct_cols=["Demand Fill %", "Vendor Fill %"],
-        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["PO #"], color_rows=True, height=600,
+        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["PO #"], color_rows=True, height=720,
     )
 
 
@@ -3002,7 +3055,7 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     render_table(
         disp, key=_grid_key(f"grid_pod_items_{po}"),
         numpct_cols=["Demand Fill %", "Vendor Fill %"],
-        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["SKU"], color_rows=True, height=460,
+        date_cols=_PO_ITEM_DATE_COLS, pin_cols=["SKU"], color_rows=True, height=560,
     )
 
     st.markdown("---")
@@ -3197,7 +3250,7 @@ def _issue_types(val):
     return ", ".join(f"{k} ({v})" for k, v in d.items())
 
 
-def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260,
+def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=420,
                link_cols=None, slack=True, slack_whole=True, slack_label_cols=None,
                slack_filename="wo_tracker_table.csv", multi_select=False):
     return render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
@@ -3402,11 +3455,17 @@ def overview_tab(df, wos):
         if not _wh_is_all(wh):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
-        # Attach WO count + dest qty per PO (FBA/FBB/FBM/ZFS/OCT; leftover = To stow).
-        po_pos = _enrich_po_pos_with_wo(po_pos, df)
     except Exception as exc:
         po_df = po_pos = None
         po_fetch_error = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            po_pos = _enrich_po_pos_with_wo(po_pos, df)
+        except Exception:
+            try:
+                po_pos = _finalize_po_destination(po_pos)
+            except Exception:
+                pass
 
     pick, ov_q = _overview_quick_filters(df, wos, po_df, po_pos)
     wo_search = [
@@ -3440,14 +3499,14 @@ def overview_tab(df, wos):
 
     def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False,
                link_cols=None, slack=True, slack_whole=True, slack_label_cols=None,
-               slack_filename="wo_tracker_table.csv", multi_select=False):
+               slack_filename="wo_tracker_table.csv", multi_select=False, height=420):
         # Cap rendered rows for speed; the full total is already in the panel header.
         shown = dshow.head(OV_MAX_ROWS)
         sel = _ov_render(shown, key, date_cols=date_cols,
                          numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows,
                          link_cols=link_cols, slack=slack, slack_whole=slack_whole,
                          slack_label_cols=slack_label_cols, slack_filename=slack_filename,
-                         multi_select=multi_select)
+                         multi_select=multi_select, height=height)
         if len(dshow) > OV_MAX_ROWS:
             st.caption(
                 f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}. "
@@ -3623,6 +3682,8 @@ def overview_tab(df, wos):
         "That does **not** create a WO in Shelf. "
         f"Each table shows the top {OV_MAX_ROWS}. Use **Advanced filters** to narrow."
     )
+    if po_pos is not None and not getattr(po_pos, "empty", True):
+        render_po_destination_split(po_pos)
     if render_flag_guide is not None:
         render_flag_guide()
     elif _FLAG_GUIDE_ERROR:
@@ -3707,6 +3768,7 @@ def overview_tab(df, wos):
                     date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
                     numpct_cols=[c for c in ["Demand Fill %", "Vendor Fill %"] if c in d.columns],
                     pin_cols=["PO #"], color_rows=True, slack=False, multi_select=True,
+                    height=560,
                 )
                 picked = _picked_rows(sel, shown)
                 pos = [x for x in picked["PO #"].astype(str).tolist() if x] if "PO #" in picked.columns else []
@@ -3837,6 +3899,7 @@ def overview_tab(df, wos):
                     d, "ov_item_gap",
                     date_cols=[c for c in ["Order Placed", "Ship Date"] if c in d.columns],
                     pin_cols=["PO #"], color_rows=True, slack=False, multi_select=True,
+                    height=520,
                 )
                 picked = _picked_rows(sel, shown)
                 if sel is not None and not sel.empty:
@@ -4459,3 +4522,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
