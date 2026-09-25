@@ -233,6 +233,14 @@ bot_token = "xoxb-..."               # SECRET. Scopes: chat:write, im:write, fil
 - [ ] (Optional) Surface the Overview silent-exception error message.
 - [ ] (Optional) Extend the auto-post to include item-level gaps, or @-mention owners.
 
+### Shipped on `cursor/overview-no-wo-slack-path` (draft PR https://github.com/ashwinkaushik-web/wo-tracking-tool/pull/15)
+
+Raise-WO is one loop: tick no-WO POs/items → Catalogue Lookup (qty, PO #, ship-by come with them) → edit Shelf grid → Slack. Default view is genuine gap / partial coverage with outstanding qty. Overview no longer Slacks a WO file or adds a raise-WO pack from those panels (that skipped edit). Download / chase sit under **More**.
+
+PO Overview / Details also split **current ordered** units by destination: FBA, FBB, FBM, leftover **To stow** (blank fulfillment method), plus Other (ZFS/OCT). Cloud still serves `main` until merge + reboot (`c624549`).
+
+Earlier on this branch (`5a9c1b6`): no-WO first, orig/current/received, hide zeros, item-level panel, advanced filters, daily-PO vs 30-min WO stamps, Requests grid that doesn’t remount. Overview no longer shows blocked / overdue / issues / aging / over-receipts.
+
 ---
 
 ## 11. Information Station (context source)
