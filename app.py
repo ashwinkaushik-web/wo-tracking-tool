@@ -313,12 +313,13 @@ COLUMN_GLOSSARY = {
     "DNO Reason": "Do-Not-Order reason code.",
     "Seller": "Marketplace seller name.",
     "Fulfillment": "Listing fulfillment type (FBA, FBM, …) or the PO fulfillment method.",
-    "FBA": "Current ordered units on this PO destined for FBA (Amazon).",
-    "FBB": "Current ordered units on this PO destined for FBB (bol.com).",
-    "FBM": "Current ordered units on this PO destined for FBM (merchant fulfilled).",
-    "To Stow": "Current ordered units with no marketplace destination — expected to stow "
-               "(Pattern-owned). Blank PO fulfillment method.",
-    "Other dest.": "Current ordered units tagged ZFS, OCT, or another non-FBA/FBB/FBM method.",
+    "FBA": "Units raised on FBA work-order items (WO current qty). Not the PO report fulfillment method.",
+    "FBB": "Units raised on FBB work-order items (WO current qty).",
+    "FBM": "Units raised on FBM work-order items (WO current qty).",
+    "ZFS": "Units raised on ZFS work-order items (WO current qty).",
+    "OCT": "Units raised on OCT work-order items (WO current qty).",
+    "To Stow": "Current ordered minus FBA/FBB/FBM/ZFS/OCT and any other WO qty — leftover with no marketplace WO.",
+    "WO Type": "Work-order item type from Shelf (FBA, FBB, FBM, ZFS, OCT, …) — where those units are going.",
     "PO Qty": "Outstanding PO units (ordered − received) for that Master ID / SKU. "
               "Shown on every listing of the master in Catalogue Lookup.",
     "Request Amount": "Units to request on the Shelf WO upload / raise-WO pack. "
@@ -1441,19 +1442,20 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     )
     filtered = hide_unlisted(filtered, f"hl_pwo_items_{wo_id}")
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
-    display = filtered[
-        ["work_order_item_id", "po_ref_ship_by_date",
-         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
-         "master_id", "listing_id", "finished_good_name", "source_brand",
-         "status_simple", "po_block_flag",
-         "original_request", "current_request", "processed", "order_created", "shipped", "storage",
-         "woi_processing_pct", "po_days_past_ref_ship_by"]
-    ].rename(columns={
+    item_cols = [
+        "work_order_item_id", "po_ref_ship_by_date",
+        "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
+        "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
+        "status_simple", "po_block_flag",
+        "original_request", "current_request", "processed", "order_created", "shipped", "storage",
+        "woi_processing_pct", "po_days_past_ref_ship_by",
+    ]
+    display = filtered[[c for c in item_cols if c in filtered.columns]].rename(columns={
         "work_order_item_id": "WOI ID", "po_ref_ship_by_date": "Ref Ship-by",
         "po_requested_delivery_date": "Req Delivery Date",
         "po_placed_at": "Placed At", "po_arrived_at": "Arrived At",
         "master_id": "Master ID",
-        "listing_id": "Listing", "finished_good_name": "Item Name", "source_brand": "Brand",
+        "listing_id": "Listing", "woi_type": "WO Type", "finished_good_name": "Item Name", "source_brand": "Brand",
         "status_simple": "Status",
         "po_block_flag": "Flag", "original_request": "Orig",
         "current_request": "Current", "processed": "Processed", "order_created": "Ship Created",
@@ -1484,20 +1486,21 @@ def po_item_view(p_items, p_wos):
     filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     fwos = p_wos[p_wos["work_order_number"].isin(filtered["work_order_number"])]
     po_kpi_strip(filtered, fwos)
-    display = filtered[
-        ["work_order_item_id", "work_order_number", "po_number_raw",
-         "po_ref_ship_by_date", "po_requested_delivery_date",
-         "po_placed_at", "po_arrived_at",
-         "master_id", "listing_id", "finished_good_name", "source_brand",
-         "warehouse", "status_simple", "po_block_flag",
-         "original_request", "current_request", "processed", "order_created", "shipped", "storage",
-         "woi_processing_pct", "po_days_past_ref_ship_by"]
-    ].rename(columns={
+    pit_cols = [
+        "work_order_item_id", "work_order_number", "po_number_raw",
+        "po_ref_ship_by_date", "po_requested_delivery_date",
+        "po_placed_at", "po_arrived_at",
+        "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
+        "warehouse", "status_simple", "po_block_flag",
+        "original_request", "current_request", "processed", "order_created", "shipped", "storage",
+        "woi_processing_pct", "po_days_past_ref_ship_by",
+    ]
+    display = filtered[[c for c in pit_cols if c in filtered.columns]].rename(columns={
         "work_order_item_id": "WOI ID", "work_order_number": "WO", "po_number_raw": "PO #",
         "po_ref_ship_by_date": "Ref Ship-by",
         "po_requested_delivery_date": "Req Delivery Date", "po_placed_at": "Placed At",
         "po_arrived_at": "Arrived At",
-        "master_id": "Master ID", "listing_id": "Listing",
+        "master_id": "Master ID", "listing_id": "Listing", "woi_type": "WO Type",
         "finished_good_name": "Item Name", "source_brand": "Brand",
         "warehouse": "WH", "status_simple": "Status",
         "po_block_flag": "Flag", "original_request": "Orig",
@@ -1626,6 +1629,69 @@ def fetch_po_wo_agg():
     for c in agg.columns:
         agg[c] = pd.to_numeric(agg[c], errors="coerce")
     return agg
+
+
+_WO_AGG_COLS = [
+    "wo_count", "woi_count", "wo_current", "wo_processed",
+    "wo_ship_created", "wo_shipped", "wo_stowed",
+    "wo_fba", "wo_fbb", "wo_fbm", "wo_zfs", "wo_oct", "wo_other",
+]
+_DEST_MAP = (
+    ("wo_fba", "fba_units"),
+    ("wo_fbb", "fbb_units"),
+    ("wo_fbm", "fbm_units"),
+    ("wo_zfs", "zfs_units"),
+    ("wo_oct", "oct_units"),
+    ("wo_other", "other_units"),
+)
+_DEST_UNIT_COLS = [dst for _, dst in _DEST_MAP]
+_DEST_SHOW_KEYS = ("FBA", "FBB", "FBM", "ZFS", "OCT")
+_DEST_SHOW_COLS = {
+    "FBA": "fba_units", "FBB": "fbb_units", "FBM": "fbm_units",
+    "ZFS": "zfs_units", "OCT": "oct_units", "Stow": "stow_units",
+}
+
+
+def _enrich_po_pos_with_wo(po_pos):
+    """Attach WO counts and destination qty; stow = leftover current ordered."""
+    if po_pos is None or getattr(po_pos, "empty", True):
+        return po_pos
+    out = po_pos.copy()
+    try:
+        wo_agg = fetch_po_wo_agg()
+    except Exception:
+        wo_agg = None
+    if wo_agg is not None and not wo_agg.empty and "po_number" in wo_agg.columns:
+        keep = ["po_number"] + [c for c in _WO_AGG_COLS if c in wo_agg.columns]
+        drop_existing = [c for c in keep if c != "po_number" and c in out.columns]
+        if drop_existing:
+            out = out.drop(columns=drop_existing)
+        out = out.merge(wo_agg[keep], on="po_number", how="left")
+        _warn_missing_columns(
+            wo_agg,
+            ["po_number", "wo_count", "wo_fba", "wo_fbb", "wo_fbm", "wo_zfs", "wo_oct"],
+            "PO→WO rollup (queries/po_wo_agg.sql)",
+        )
+    for cc in _WO_AGG_COLS:
+        if cc in out.columns:
+            out[cc] = pd.to_numeric(out[cc], errors="coerce").fillna(0).astype(int)
+    return _finalize_po_destination(out)
+
+
+def _finalize_po_destination(po_pos):
+    """Named dest from WO item types; To stow = current ordered minus all WO qty."""
+    if po_pos is None or getattr(po_pos, "empty", True):
+        return po_pos
+    out = po_pos
+    for src, dst in _DEST_MAP:
+        if src in out.columns:
+            out[dst] = pd.to_numeric(out[src], errors="coerce").fillna(0).astype(int)
+        elif dst not in out.columns:
+            out[dst] = 0
+    ordered = pd.to_numeric(out["ordered"], errors="coerce").fillna(0) if "ordered" in out.columns else 0
+    raised = sum(pd.to_numeric(out[c], errors="coerce").fillna(0) for c in _DEST_UNIT_COLS)
+    out["stow_units"] = (ordered - raised).clip(lower=0).astype(int)
+    return out
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -2298,89 +2364,126 @@ def _po_item_status(df):
     return status
 
 
-def _fulfillment_bucket_series(s):
-    """Map PO fulfillment_method to FBA / FBB / FBM / Stow / Other."""
+def _wo_dest_bucket_series(s):
+    """Map Shelf WO item type to FBA / FBB / FBM / ZFS / OCT / Other."""
     raw = s.astype(str).str.strip().str.upper()
-    blank = s.isna() | raw.isin(("", "NAN", "NONE", "<NA>", "N/A", "NAT"))
     out = pd.Series("Other", index=s.index)
-    out = out.mask(blank, "Stow")
-    out = out.mask(raw.eq("FBA"), "FBA")
-    out = out.mask(raw.eq("FBB"), "FBB")
-    out = out.mask(raw.eq("FBM"), "FBM")
+    out = out.mask(raw.str.startswith("FBA", na=False), "FBA")
+    out = out.mask(raw.str.startswith("FBB", na=False), "FBB")
+    out = out.mask(raw.str.startswith("FBM", na=False), "FBM")
+    out = out.mask(raw.eq("ZFS"), "ZFS")
+    out = out.mask(raw.eq("OCT"), "OCT")
     return out
 
 
-def _po_fulfillment_split_frame(df, qty_col="ordered_units"):
-    """One row per PO: current ordered units by destination bucket."""
-    cols = ["fba_units", "fbb_units", "fbm_units", "stow_units", "other_units"]
-    empty = pd.DataFrame(columns=["po_number", *cols])
-    if df is None or getattr(df, "empty", True) or "po_number" not in df.columns:
-        return empty
-    if qty_col not in df.columns:
-        return empty
-    ful_col = next((c for c in ("fulfillment_method", "fulfillment") if c in df.columns), None)
-    if ful_col is None:
-        return empty
-    tmp = pd.DataFrame({
-        "po_number": df["po_number"],
-        "bucket": _fulfillment_bucket_series(df[ful_col]),
-        "qty": pd.to_numeric(df[qty_col], errors="coerce").fillna(0),
-    })
-    split = (
-        tmp.groupby(["po_number", "bucket"], as_index=False)["qty"].sum()
-        .pivot(index="po_number", columns="bucket", values="qty")
-        .reindex(columns=["FBA", "FBB", "FBM", "Stow", "Other"], fill_value=0)
-        .fillna(0)
-        .rename(columns={
-            "FBA": "fba_units", "FBB": "fbb_units", "FBM": "fbm_units",
-            "Stow": "stow_units", "Other": "other_units",
-        })
-        .reset_index()
-    )
-    return split
-
-
-def _po_destination_totals(df, qty_col="ordered_units"):
-    """Sum current ordered units by FBA / FBB / FBM / Stow / Other."""
-    keys = ("FBA", "FBB", "FBM", "Stow", "Other")
-    totals = {k: 0 for k in keys}
-    if df is None or getattr(df, "empty", True):
+def _destination_totals_from_pos(po_pos):
+    """Sum destination columns already on the PO rollup."""
+    totals = {k: 0 for k in (*_DEST_SHOW_KEYS, "Stow", "Other")}
+    if po_pos is None or getattr(po_pos, "empty", True):
         return totals, 0
-    qty_name = qty_col if qty_col in df.columns else next(
-        (c for c in ("ordered_units", "ordered", "current_units") if c in df.columns), None)
-    if not qty_name:
-        return totals, 0
-    qty = pd.to_numeric(df[qty_name], errors="coerce").fillna(0)
-    ordered = int(round(float(qty.sum())))
-    ful_col = next((c for c in ("fulfillment_method", "fulfillment") if c in df.columns), None)
-    if ful_col is None:
-        totals["Stow"] = ordered
-        return totals, ordered
-    summed = qty.groupby(_fulfillment_bucket_series(df[ful_col])).sum()
-    for k in keys:
-        totals[k] = int(round(float(summed.get(k, 0))))
+    colmap = dict(_DEST_SHOW_COLS)
+    colmap["Other"] = "other_units"
+    for k, c in colmap.items():
+        if c in po_pos.columns:
+            totals[k] = int(pd.to_numeric(po_pos[c], errors="coerce").fillna(0).sum())
+    ordered = 0
+    if "ordered" in po_pos.columns:
+        ordered = int(pd.to_numeric(po_pos["ordered"], errors="coerce").fillna(0).sum())
+    elif "ordered_units" in po_pos.columns:
+        ordered = int(pd.to_numeric(po_pos["ordered_units"], errors="coerce").fillna(0).sum())
     return totals, ordered
 
 
-def render_po_destination_split(df, *, qty_col="ordered_units"):
-    """KPI row: where current ordered units are headed."""
-    totals, ordered = _po_destination_totals(df, qty_col)
+def _destination_from_wo_items(wo_items, ordered):
+    """Named dest from WO current qty; stow = leftover of current ordered."""
+    totals = {k: 0 for k in (*_DEST_SHOW_KEYS, "Stow", "Other")}
+    ordered = int(ordered or 0)
+    if wo_items is not None and not getattr(wo_items, "empty", True) and "woi_type" in wo_items.columns:
+        qty_col = "current_request" if "current_request" in wo_items.columns else "original_request"
+        if qty_col in wo_items.columns:
+            qty = pd.to_numeric(wo_items[qty_col], errors="coerce").fillna(0)
+            summed = qty.groupby(_wo_dest_bucket_series(wo_items["woi_type"])).sum()
+            for k in (*_DEST_SHOW_KEYS, "Other"):
+                totals[k] = int(round(float(summed.get(k, 0))))
+    raised = sum(totals[k] for k in (*_DEST_SHOW_KEYS, "Other"))
+    totals["Stow"] = max(ordered - raised, 0)
+    return totals, ordered
+
+
+def _attach_item_wo_destination(items, wo_df):
+    """Per PO line: dest qty from WO items on the same PO × Master ID."""
+    if items is None or getattr(items, "empty", True):
+        return items
+    out = items.copy()
+    ordered = pd.to_numeric(out["ordered_units"], errors="coerce").fillna(0) if "ordered_units" in out.columns else 0
+    unit_cols = _DEST_UNIT_COLS
+    for c in unit_cols:
+        out[c] = 0
+    can_join = (
+        wo_df is not None and not getattr(wo_df, "empty", True)
+        and "woi_type" in wo_df.columns and "master_id" in out.columns
+        and "po_number_raw" in wo_df.columns and "po_number" in out.columns
+    )
+    if can_join:
+        w = wo_df.copy()
+        qty_col = "current_request" if "current_request" in w.columns else "original_request"
+        if qty_col in w.columns:
+            w["_po"] = _ov_po_str(w["po_number_raw"])
+            w["_mid"] = w["master_id"].astype(str).str.strip().str.upper()
+            w["_bucket"] = _wo_dest_bucket_series(w["woi_type"])
+            w["_qty"] = pd.to_numeric(w[qty_col], errors="coerce").fillna(0)
+            g = w.groupby(["_po", "_mid", "_bucket"], as_index=False)["_qty"].sum()
+            rename = {
+                "FBA": "fba_units", "FBB": "fbb_units", "FBM": "fbm_units",
+                "ZFS": "zfs_units", "OCT": "oct_units", "Other": "other_units",
+            }
+            pvt = (
+                g.pivot_table(index=["_po", "_mid"], columns="_bucket", values="_qty",
+                              aggfunc="sum", fill_value=0)
+                .reindex(columns=list(rename), fill_value=0)
+                .rename(columns=rename)
+                .reset_index()
+            )
+            out["_po"] = _ov_po_str(out["po_number"])
+            out["_mid"] = out["master_id"].astype(str).str.strip().str.upper()
+            out = out.merge(pvt, on=["_po", "_mid"], how="left", suffixes=("", "_wo"))
+            for c in unit_cols:
+                wo_c = f"{c}_wo"
+                if wo_c in out.columns:
+                    out[c] = pd.to_numeric(out[wo_c], errors="coerce").fillna(0)
+                    out = out.drop(columns=[wo_c])
+                else:
+                    out[c] = pd.to_numeric(out.get(c), errors="coerce").fillna(0)
+            out = out.drop(columns=["_po", "_mid"])
+    for c in unit_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+    raised = sum(out[c] for c in unit_cols)
+    out["stow_units"] = (ordered - raised).clip(lower=0).astype(int)
+    return out
+
+
+def render_po_destination_split(df=None, *, wo_items=None, ordered=None):
+    """KPI row: where current ordered units are headed (from WO types)."""
+    if df is not None and not getattr(df, "empty", True) and "fba_units" in df.columns:
+        totals, ordered_n = _destination_totals_from_pos(df)
+    else:
+        totals, ordered_n = _destination_from_wo_items(wo_items, ordered or 0)
 
     def _pct(n):
-        return f"{n * 100.0 / ordered:.0f}% of current ordered" if ordered else None
+        return f"{n * 100.0 / ordered_n:.0f}% of current ordered" if ordered_n else None
 
     st.markdown("##### Where current ordered units are going")
-    c = st.columns(5)
+    c = st.columns(6)
     c[0].metric("FBA", f"{totals['FBA']:,}", _pct(totals["FBA"]), delta_color="off")
     c[1].metric("FBB", f"{totals['FBB']:,}", _pct(totals["FBB"]), delta_color="off")
     c[2].metric("FBM", f"{totals['FBM']:,}", _pct(totals["FBM"]), delta_color="off")
-    c[3].metric("To stow", f"{totals['Stow']:,}", "no marketplace destination", delta_color="off")
-    c[4].metric("Other", f"{totals['Other']:,}", "ZFS / OCT / …", delta_color="off")
+    c[3].metric("ZFS", f"{totals['ZFS']:,}", _pct(totals["ZFS"]), delta_color="off")
+    c[4].metric("OCT", f"{totals['OCT']:,}", _pct(totals["OCT"]), delta_color="off")
+    c[5].metric("To stow", f"{totals['Stow']:,}", "leftover after WO types", delta_color="off")
     st.caption(
-        "Split of **current ordered** units by PO fulfillment method (daily report). "
-        "FBA / FBB / FBM go to those marketplaces. Blank method is **stow** "
-        "(Pattern-owned, typically no WO). Other is ZFS, OCT, etc. "
-        "This is the PO destination, not qty already raised on a work order."
+        "FBA / FBB / FBM / ZFS / OCT are **work-order item types** (WO current qty). "
+        "**To stow** is current ordered minus all WO qty — leftover with no marketplace WO. "
+        "The PO report fulfillment method is often blank, so it is not used here."
     )
 
 
@@ -2422,14 +2525,6 @@ def _build_po_aggregates(df):
     worst = (tmp.sort_values("_sev").drop_duplicates("po_number", keep="first")
              .set_index("po_number")["po_status"])
     g["status"] = g["po_number"].map(worst)
-    split = _po_fulfillment_split_frame(df)
-    if split is not None and not split.empty:
-        g = g.merge(split, on="po_number", how="left")
-    for c in ("fba_units", "fbb_units", "fbm_units", "stow_units", "other_units"):
-        if c not in g.columns:
-            g[c] = 0
-        else:
-            g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0).astype(int)
     return g
 
 
@@ -2521,7 +2616,10 @@ _PO_ITEM_COLS = [
     ("fulfillment_method", "Fulfillment"), ("note", "Note"),
     ("original_ordered_units", "Orig Ordered"), ("ordered_units", "Current Ordered"),
     ("current_on_order", "On Order"),
-    ("received_units", "Received"), ("remained_blanket_order_quantity", "Remained Blanket"),
+    ("received_units", "Received"),
+    ("fba_units", "FBA"), ("fbb_units", "FBB"), ("fbm_units", "FBM"),
+    ("zfs_units", "ZFS"), ("oct_units", "OCT"),
+    ("stow_units", "To Stow"), ("remained_blanket_order_quantity", "Remained Blanket"),
     ("wholesale_price", "Wholesale £"), ("retail_price", "Retail £"),
     ("wholesale_ordered", "WS Ordered £"), ("wholesale_received", "WS Received £"),
     ("demand_fill_rate_pct", "Demand Fill %"), ("vendor_fill_rate_pct", "Vendor Fill %"),
@@ -2529,7 +2627,8 @@ _PO_ITEM_COLS = [
 ]
 _PO_ITEM_DEFAULT = ["PO #", "Status", "Order Placed", "Ship Date", "PO Last Recv", "SKU", "ASIN",
                     "Master ID", "Title", "Vendor", "WH", "Fulfillment",
-                    "Orig Ordered", "Current Ordered", "Received", "On Order",
+                    "Orig Ordered", "Current Ordered", "Received",
+                    "FBA", "FBB", "FBM", "ZFS", "OCT", "To Stow", "On Order",
                     "Demand Fill %", "Vendor Fill %", "Issues", "PO WOs"]
 _PO_ITEM_DATE_COLS = ["Order Placed", "Ship Date", "Arrived", "PO Last Recv", "Item Last Recv",
                       "Finished Arrived", "Cancel Date"]
@@ -2546,7 +2645,7 @@ def _po_item_display(df, include_po=True):
     return disp, default
 
 
-def po_details_kpi(lines):
+def po_details_kpi(lines, po_pos=None):
     """PO summary cards computed from the (filtered) PO line-item frame."""
     orig = pd.to_numeric(lines.get("original_ordered_units"), errors="coerce").fillna(0).sum()
     ordered = pd.to_numeric(lines.get("ordered_units"), errors="coerce").fillna(0).sum()
@@ -2562,7 +2661,15 @@ def po_details_kpi(lines):
     c5.metric("Received", f"{int(received):,}")
     c6.metric("Vendor fill", f"{fill:.0f}%")
     c7.metric("Lines w/ issues", f"{issues:,}")
-    render_po_destination_split(lines, qty_col="ordered_units")
+    dest = None
+    if po_pos is not None and not getattr(po_pos, "empty", True) and "fba_units" in po_pos.columns:
+        dest = po_pos
+    elif "fba_units" in lines.columns:
+        dest = lines
+    if dest is not None and not dest.empty:
+        render_po_destination_split(dest)
+    else:
+        render_po_destination_split(ordered=int(ordered))
 
 
 def po_details_list(po_pos, po_df):
@@ -2578,7 +2685,7 @@ def po_details_list(po_pos, po_df):
     filtered = (filtered.assign(_sev=filtered["status"].map(sev).fillna(len(PO_STATUS_ORDER)))
                 .sort_values(["_sev", "po_number"]).drop(columns="_sev"))
     lines = po_df[po_df["po_number"].isin(filtered["po_number"])] if po_df is not None else po_df
-    po_details_kpi(lines)
+    po_details_kpi(lines, po_pos=filtered)
     if "wo_count" in filtered.columns:
         nwith = int((filtered["wo_count"] > 0).sum())
         n_no = int((filtered["wo_count"] == 0).sum())
@@ -2606,7 +2713,7 @@ def po_details_list(po_pos, po_df):
                  "po_type", "fulfillment",
                  "order_placed", "ship_date", "first_arrival", "last_received", "lines",
                  "original_ordered", "ordered", "received",
-                 "fba_units", "fbb_units", "fbm_units", "stow_units", "other_units",
+                 "fba_units", "fbb_units", "fbm_units", "zfs_units", "oct_units", "stow_units",
                  "left", "on_order", "demand_fill_pct", "vendor_fill_pct"]
     base_cols = [c for c in base_cols if c in filtered.columns]
     wo_cols = [c for c in ["wo_count", "wo_current", "wo_processed", "wo_ship_created", "wo_shipped", "wo_stowed"]
@@ -2619,13 +2726,14 @@ def po_details_list(po_pos, po_df):
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Current Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
         "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
-        "stow_units": "To Stow", "other_units": "Other dest.",
+        "zfs_units": "ZFS", "oct_units": "OCT",
+        "stow_units": "To Stow",
         "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
         "wo_count": "WOs", "wo_current": "WO Current", "wo_processed": "WO Processed",
         "wo_ship_created": "WO Ship Created", "wo_shipped": "WO Shipped", "wo_stowed": "WO Stowed",
     })
     display["PO #"] = pd.to_numeric(display["PO #"], errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
-    cols = column_picker(list(display.columns), key="cols_pod", required=["PO #"])
+    cols = column_picker(list(display.columns), key="cols_pod_dest", required=["PO #"])
     display = display[cols]
 
     table_toolbar(display, key="tb_pod", file_stem="po_details",
@@ -2657,7 +2765,7 @@ def po_details_list(po_pos, po_df):
                 _jump_to_catalog_lookup(ids, context=ctx, pack=True, qty_frame=lines)
 
 
-def po_details_items(po_df, po_pos=None):
+def po_details_items(po_df, po_pos=None, wo_df=None):
     items = po_df.copy()
     if po_pos is not None and "wo_count" in po_pos.columns and "po_number" in items.columns:
         if "wo_count" not in items.columns:
@@ -2672,6 +2780,7 @@ def po_details_items(po_df, po_pos=None):
         ship_col="ship_date",
     )
     filtered = _drop_zero_ordered(filtered)
+    filtered = _attach_item_wo_destination(filtered, wo_df)
     po_details_kpi(filtered)
     ia, ib, ic = st.columns(3)
     with ia:
@@ -2696,7 +2805,7 @@ def po_details_items(po_df, po_pos=None):
             add_raise_rows(raise_rows_from_gap(filtered))
             _jump_to_requests("Raise-WO pack")
     disp, default = _po_item_display(filtered, include_po=True)
-    cols = column_picker(list(disp.columns), key="cols_podi", default_labels=default, required=["PO #"])
+    cols = column_picker(list(disp.columns), key="cols_podi_dest", default_labels=default, required=["PO #"])
     disp = disp[cols]
     table_toolbar(disp, key="tb_podi", file_stem="po_items",
                   id_cols=["PO #", "SKU", "ASIN", "Master ID"], count_label=f"{len(disp):,} line items")
@@ -2735,9 +2844,18 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     c4.metric("Left", f"{_safe_int(row['left']):,}")
     c5.metric("Demand Fill", f"{row['demand_fill_pct']:.0f}%")
     c6.metric("Vendor Fill", f"{row['vendor_fill_pct']:.0f}%")
-    render_po_destination_split(items_for_ids, qty_col="ordered_units")
+    if "po_number_raw" in wo_df.columns:
+        awo = wo_df[wo_df["po_number_raw"].astype(str) == str(po)].copy()
+    else:
+        awo = wo_df.iloc[0:0].copy() if wo_df is not None else None
+    render_po_destination_split(
+        po_pos[po_pos["po_number"] == po],
+        wo_items=awo,
+        ordered=_safe_int(row.get("ordered")),
+    )
 
     items = _drop_zero_ordered(po_df[po_df["po_number"] == po].copy())
+    items = _attach_item_wo_destination(items, awo)
     st.markdown("---")
     st.markdown(f"#### 📄 Items in PO {po}")
     filtered = po_filter_panel(
@@ -2745,7 +2863,7 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
         search_cols=["sku", "asin", "master_id", "title"],
     )
     disp, default = _po_item_display(filtered, include_po=False)
-    cols = column_picker(list(disp.columns), key=f"cols_pod_items_{po}", default_labels=default, required=["SKU"])
+    cols = column_picker(list(disp.columns), key=f"cols_pod_items_dest_{po}", default_labels=default, required=["SKU"])
     disp = disp[cols]
     table_toolbar(disp, key=f"tb_pod_items_{po}", file_stem=f"po_{po}_items",
                   id_cols=["SKU", "ASIN", "Master ID"], count_label=f"{len(disp)} line items")
@@ -2757,15 +2875,12 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
 
     st.markdown("---")
     st.markdown("#### 🔗 Associated Work Orders")
-    if "po_number_raw" in wo_df.columns:
-        awo = wo_df[wo_df["po_number_raw"].astype(str) == str(po)].copy()
-    else:
-        awo = wo_df.iloc[0:0]
-    if awo.empty:
+    if awo is None or awo.empty:
         st.caption("No work orders linked to this PO in the current WO dataset (year-to-date).")
     else:
         awo_pairs = [
             ("work_order_item_id", "WOI ID"), ("work_order_number", "WO"),
+            ("woi_type", "WO Type"),
             ("master_id", "Master ID"), ("listing_id", "Listing"),
             ("finished_good_name", "Item Name"), ("source_brand", "Brand"), ("warehouse", "WH"),
             ("status_simple", "Status"), ("po_block_flag", "Flag"),
@@ -2778,11 +2893,11 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
         ]
         pairs = [(r, l) for r, l in awo_pairs if r in awo.columns]
         awo_disp = awo[[r for r, _ in pairs]].rename(columns=dict(pairs))
-        awo_default = [l for l in ["WOI ID", "WO", "Master ID", "Listing", "Item Name", "Brand",
+        awo_default = [l for l in ["WOI ID", "WO", "WO Type", "Master ID", "Listing", "Item Name", "Brand",
                                    "WH", "Status", "Flag", "Block Status", "Reason", "Orig",
                                    "Current", "Processed", "%", "Ref Ship-by", "Days Past",
                                    "Days Overdue"] if l in awo_disp.columns]
-        acols = column_picker(list(awo_disp.columns), key=f"cols_pod_awo_{po}",
+        acols = column_picker(list(awo_disp.columns), key=f"cols_pod_awo_dest_{po}",
                               default_labels=awo_default, required=["WOI ID"])
         awo_disp = awo_disp[acols]
         table_toolbar(awo_disp, key=f"tb_pod_awo_{po}", file_stem=f"po_{po}_workorders",
@@ -2808,16 +2923,8 @@ def po_details_tab(wo_df):
         po_df = po_df[po_df["warehouse_name"] == wh].copy()
         po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
 
-    # Enrich the PO rollup with WO-side quantities (best effort).
-    try:
-        wo_agg = fetch_po_wo_agg()
-        po_pos = po_pos.merge(wo_agg, on="po_number", how="left")
-        for cc in ["wo_count", "woi_count", "wo_current", "wo_processed",
-                   "wo_ship_created", "wo_shipped", "wo_stowed"]:
-            if cc in po_pos.columns:
-                po_pos[cc] = pd.to_numeric(po_pos[cc], errors="coerce").fillna(0).astype(int)
-    except Exception:
-        pass
+    # Enrich the PO rollup with WO-side quantities and FBA/FBB/FBM destination.
+    po_pos = _enrich_po_pos_with_wo(po_pos)
 
     sel = st.session_state.get("selected_po_detail")
     if sel is not None and sel in po_pos["po_number"].values:
@@ -2831,7 +2938,7 @@ def po_details_tab(wo_df):
     if view == "📋 PO Level":
         po_details_list(po_pos, po_df)
     else:
-        po_details_items(po_df, po_pos)
+        po_details_items(po_df, po_pos, wo_df)
 
 
 # ============================================================
@@ -3163,14 +3270,8 @@ def overview_tab(df, wos):
         if not _wh_is_all(wh):
             po_df = po_df[po_df["warehouse_name"] == wh].copy()
             po_pos = po_pos[po_pos["warehouse_name"] == wh].copy()
-        # Attach WO count per PO so we can flag POs with no work order (best effort).
-        try:
-            _wa = fetch_po_wo_agg()
-            po_pos = po_pos.merge(_wa[["po_number", "wo_count"]], on="po_number", how="left")
-            po_pos["wo_count"] = pd.to_numeric(po_pos["wo_count"], errors="coerce").fillna(0).astype(int)
-        except Exception:
-            if po_pos is not None and "wo_count" not in po_pos.columns:
-                po_pos["wo_count"] = 0
+        # Attach WO count + dest qty per PO (FBA/FBB/FBM/ZFS/OCT; leftover = To stow).
+        po_pos = _enrich_po_pos_with_wo(po_pos)
     except Exception as exc:
         po_df = po_pos = None
         po_fetch_error = f"{type(exc).__name__}: {exc}"
@@ -3245,7 +3346,7 @@ def overview_tab(df, wos):
         c[2].metric("Units received", f"{po_received:,}")
         c[3].metric("Vendor fill", f"{po_fill:.0f}%")
         c[4].metric("Lines w/ issues", f"{po_iss:,}")
-        render_po_destination_split(po_df, qty_col="ordered_units")
+        render_po_destination_split(po_pos)
         _po_lag_caption()
     else:
         st.caption("PO data unavailable — check queries/po_tracker.sql.")
@@ -3449,7 +3550,7 @@ def overview_tab(df, wos):
                 keep = [
                     "po_number", "vendor_name", "warehouse_name",
                     "original_ordered", "ordered", "received", "left",
-                    "fba_units", "fbb_units", "fbm_units", "stow_units",
+                    "fba_units", "fbb_units", "fbm_units", "zfs_units", "oct_units", "stow_units",
                     "demand_fill_pct", "vendor_fill_pct",
                     "_age", "order_placed", "ship_date", "first_arrival",
                     "country_name", "purchase_state", "po_type", "fulfillment",
@@ -3460,6 +3561,7 @@ def overview_tab(df, wos):
                     "original_ordered": "Orig Ordered", "ordered": "Current Ordered",
                     "received": "Received", "left": "Left",
                     "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
+                    "zfs_units": "ZFS", "oct_units": "OCT",
                     "stow_units": "To Stow",
                     "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
                     "_age": "Days Since Placed", "order_placed": "Order Placed",
@@ -3763,7 +3865,7 @@ def _sku_journey_render(mid, df, po_df):
             "ordered_units": "Ordered", "received_units": "Received", "demand_fill_rate_pct": "Demand Fill %",
             "vendor_fill_rate_pct": "Vendor Fill %", "total_issues": "Issues"})
         d["PO #"] = _ov_po_str(d["PO #"])
-        render_po_destination_split(po_rows, qty_col="ordered_units")
+        render_po_destination_split(wo_items=wo_rows, ordered=ordered)
         _ov_render(d, f"skuj_po_{mid}", date_cols=["Order Placed"],
                    numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"],
                    color_rows=True, height=300)
@@ -3772,12 +3874,14 @@ def _sku_journey_render(mid, df, po_df):
     if wo_rows.empty:
         st.caption("No work orders found for this Master ID (WO data is year-to-date).")
     else:
-        d = wo_rows.sort_values("ship_by")[
-            ["work_order_item_id", "work_order_number", "source_category", "source", "status_simple",
-             "po_block_flag", "processing_status", "original_request", "processed",
-             "woi_processing_pct", "ship_by", "warehouse"]
-        ].rename(columns={
-            "work_order_item_id": "WOI ID", "work_order_number": "WO", "source_category": "Type",
+        wo_keep = [c for c in [
+            "work_order_item_id", "work_order_number", "woi_type", "source_category", "source",
+            "status_simple", "po_block_flag", "processing_status", "original_request", "processed",
+            "woi_processing_pct", "ship_by", "warehouse",
+        ] if c in wo_rows.columns]
+        d = wo_rows.sort_values("ship_by")[wo_keep].rename(columns={
+            "work_order_item_id": "WOI ID", "work_order_number": "WO", "woi_type": "WO Type",
+            "source_category": "Type",
             "source": "Source", "status_simple": "Status", "po_block_flag": "Flag",
             "processing_status": "Block Status", "original_request": "Orig", "processed": "Processed",
             "woi_processing_pct": "%", "ship_by": "Ship By", "warehouse": "WH"})
