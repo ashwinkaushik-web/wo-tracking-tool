@@ -171,6 +171,7 @@ SUGGESTED_SHIP_LEAD_DAYS = 7  # if the PO has no future ship date, suggest today
 NO_WO_GRACE_DAYS = 0   # 0 = flag POs the moment they're placed (per Owen: get ahead early)
 OV_AGING_DAYS = 21
 OV_MAX_ROWS = 100
+GENUINE_GAP_REASON = "Genuine gap — needs WO raised"
 PO_REPORT_LAG = (
     "PO ordered / received figures are a **daily report**, not live Shelf. "
     "Shelf can already show receipts or a different current qty. "
@@ -312,6 +313,12 @@ COLUMN_GLOSSARY = {
     "DNO Reason": "Do-Not-Order reason code.",
     "Seller": "Marketplace seller name.",
     "Fulfillment": "Listing fulfillment type (FBA, FBM, …) or the PO fulfillment method.",
+    "FBA": "Current ordered units on this PO destined for FBA (Amazon).",
+    "FBB": "Current ordered units on this PO destined for FBB (bol.com).",
+    "FBM": "Current ordered units on this PO destined for FBM (merchant fulfilled).",
+    "To Stow": "Current ordered units with no marketplace destination — expected to stow "
+               "(Pattern-owned). Blank PO fulfillment method.",
+    "Other dest.": "Current ordered units tagged ZFS, OCT, or another non-FBA/FBB/FBM method.",
     "PO Qty": "Outstanding PO units (ordered − received) for that Master ID / SKU. "
               "Shown on every listing of the master in Catalogue Lookup.",
     "Request Amount": "Units to request on the Shelf WO upload / raise-WO pack. "
@@ -861,9 +868,10 @@ COLOR_ROW_LIMIT = 1500  # above this many rows, skip per-row colouring (Styler i
 def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=(), numpct_cols=(),
                  date_cols=(), datetime_cols=(), pin_cols=(), color_rows=False, height=480,
                  link_cols=None, slack=True, slack_label_cols=None, slack_whole=True,
-                 slack_filename="wo_tracker_table.csv"):
+                 slack_filename="wo_tracker_table.csv", multi_select=False):
     """Native st.dataframe. Drag-select cells/rows/cols + Ctrl+C copies cleanly.
     Selectable tables show a tick column; returns the ticked WO (or None).
+    multi_select=True returns the ticked rows as a DataFrame (empty if none).
 
     Every column also gets a hover "?" tooltip pulled from COLUMN_GLOSSARY, so
     going to a column header tells you what it actually means.
@@ -928,13 +936,18 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
                 display_text="Open",
             )
 
-    if selectable:
+    if selectable or multi_select:
+        mode = "multi-row" if multi_select else "single-row"
         event = st.dataframe(
             render_df, use_container_width=True, hide_index=True, height=height,
-            on_select="rerun", selection_mode="single-row", column_config=colcfg, key=key,
+            on_select="rerun", selection_mode=mode, column_config=colcfg, key=key,
         )
         _slack(display)
-        rows = event.selection.rows
+        rows = []
+        if event is not None and getattr(event, "selection", None) is not None:
+            rows = list(event.selection.rows or [])
+        if multi_select:
+            return display.iloc[rows].copy() if rows else display.iloc[0:0].copy()
         if rows and select_col in display.columns:
             return display.iloc[rows[0]][select_col]
         return None
@@ -2285,6 +2298,92 @@ def _po_item_status(df):
     return status
 
 
+def _fulfillment_bucket_series(s):
+    """Map PO fulfillment_method to FBA / FBB / FBM / Stow / Other."""
+    raw = s.astype(str).str.strip().str.upper()
+    blank = s.isna() | raw.isin(("", "NAN", "NONE", "<NA>", "N/A", "NAT"))
+    out = pd.Series("Other", index=s.index)
+    out = out.mask(blank, "Stow")
+    out = out.mask(raw.eq("FBA"), "FBA")
+    out = out.mask(raw.eq("FBB"), "FBB")
+    out = out.mask(raw.eq("FBM"), "FBM")
+    return out
+
+
+def _po_fulfillment_split_frame(df, qty_col="ordered_units"):
+    """One row per PO: current ordered units by destination bucket."""
+    cols = ["fba_units", "fbb_units", "fbm_units", "stow_units", "other_units"]
+    empty = pd.DataFrame(columns=["po_number", *cols])
+    if df is None or getattr(df, "empty", True) or "po_number" not in df.columns:
+        return empty
+    if qty_col not in df.columns:
+        return empty
+    ful_col = next((c for c in ("fulfillment_method", "fulfillment") if c in df.columns), None)
+    if ful_col is None:
+        return empty
+    tmp = pd.DataFrame({
+        "po_number": df["po_number"],
+        "bucket": _fulfillment_bucket_series(df[ful_col]),
+        "qty": pd.to_numeric(df[qty_col], errors="coerce").fillna(0),
+    })
+    split = (
+        tmp.groupby(["po_number", "bucket"], as_index=False)["qty"].sum()
+        .pivot(index="po_number", columns="bucket", values="qty")
+        .reindex(columns=["FBA", "FBB", "FBM", "Stow", "Other"], fill_value=0)
+        .fillna(0)
+        .rename(columns={
+            "FBA": "fba_units", "FBB": "fbb_units", "FBM": "fbm_units",
+            "Stow": "stow_units", "Other": "other_units",
+        })
+        .reset_index()
+    )
+    return split
+
+
+def _po_destination_totals(df, qty_col="ordered_units"):
+    """Sum current ordered units by FBA / FBB / FBM / Stow / Other."""
+    keys = ("FBA", "FBB", "FBM", "Stow", "Other")
+    totals = {k: 0 for k in keys}
+    if df is None or getattr(df, "empty", True):
+        return totals, 0
+    qty_name = qty_col if qty_col in df.columns else next(
+        (c for c in ("ordered_units", "ordered", "current_units") if c in df.columns), None)
+    if not qty_name:
+        return totals, 0
+    qty = pd.to_numeric(df[qty_name], errors="coerce").fillna(0)
+    ordered = int(round(float(qty.sum())))
+    ful_col = next((c for c in ("fulfillment_method", "fulfillment") if c in df.columns), None)
+    if ful_col is None:
+        totals["Stow"] = ordered
+        return totals, ordered
+    summed = qty.groupby(_fulfillment_bucket_series(df[ful_col])).sum()
+    for k in keys:
+        totals[k] = int(round(float(summed.get(k, 0))))
+    return totals, ordered
+
+
+def render_po_destination_split(df, *, qty_col="ordered_units"):
+    """KPI row: where current ordered units are headed."""
+    totals, ordered = _po_destination_totals(df, qty_col)
+
+    def _pct(n):
+        return f"{n * 100.0 / ordered:.0f}% of current ordered" if ordered else None
+
+    st.markdown("##### Where current ordered units are going")
+    c = st.columns(5)
+    c[0].metric("FBA", f"{totals['FBA']:,}", _pct(totals["FBA"]), delta_color="off")
+    c[1].metric("FBB", f"{totals['FBB']:,}", _pct(totals["FBB"]), delta_color="off")
+    c[2].metric("FBM", f"{totals['FBM']:,}", _pct(totals["FBM"]), delta_color="off")
+    c[3].metric("To stow", f"{totals['Stow']:,}", "no marketplace destination", delta_color="off")
+    c[4].metric("Other", f"{totals['Other']:,}", "ZFS / OCT / …", delta_color="off")
+    st.caption(
+        "Split of **current ordered** units by PO fulfillment method (daily report). "
+        "FBA / FBB / FBM go to those marketplaces. Blank method is **stow** "
+        "(Pattern-owned, typically no WO). Other is ZFS, OCT, etc. "
+        "This is the PO destination, not qty already raised on a work order."
+    )
+
+
 def _build_po_aggregates(df):
     """Roll line items up to one row per PO."""
     g = df.groupby("po_number", as_index=False).agg(
@@ -2323,6 +2422,14 @@ def _build_po_aggregates(df):
     worst = (tmp.sort_values("_sev").drop_duplicates("po_number", keep="first")
              .set_index("po_number")["po_status"])
     g["status"] = g["po_number"].map(worst)
+    split = _po_fulfillment_split_frame(df)
+    if split is not None and not split.empty:
+        g = g.merge(split, on="po_number", how="left")
+    for c in ("fba_units", "fbb_units", "fbm_units", "stow_units", "other_units"):
+        if c not in g.columns:
+            g[c] = 0
+        else:
+            g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0).astype(int)
     return g
 
 
@@ -2410,7 +2517,8 @@ _PO_ITEM_COLS = [
     ("sku", "SKU"), ("asin", "ASIN"), ("master_id", "Master ID"), ("item_id", "Item ID"),
     ("part_number", "Part #"), ("title", "Title"),
     ("vendor_name", "Vendor"), ("country_name", "Country"), ("warehouse_name", "WH"),
-    ("purchase_state", "State"), ("note", "Note"),
+    ("purchase_state", "State"), ("po_type", "PO Type"),
+    ("fulfillment_method", "Fulfillment"), ("note", "Note"),
     ("original_ordered_units", "Orig Ordered"), ("ordered_units", "Current Ordered"),
     ("current_on_order", "On Order"),
     ("received_units", "Received"), ("remained_blanket_order_quantity", "Remained Blanket"),
@@ -2420,7 +2528,7 @@ _PO_ITEM_COLS = [
     ("total_issues", "Issues"), ("wo_count", "PO WOs"),
 ]
 _PO_ITEM_DEFAULT = ["PO #", "Status", "Order Placed", "Ship Date", "PO Last Recv", "SKU", "ASIN",
-                    "Master ID", "Title", "Vendor", "WH",
+                    "Master ID", "Title", "Vendor", "WH", "Fulfillment",
                     "Orig Ordered", "Current Ordered", "Received", "On Order",
                     "Demand Fill %", "Vendor Fill %", "Issues", "PO WOs"]
 _PO_ITEM_DATE_COLS = ["Order Placed", "Ship Date", "Arrived", "PO Last Recv", "Item Last Recv",
@@ -2454,6 +2562,7 @@ def po_details_kpi(lines):
     c5.metric("Received", f"{int(received):,}")
     c6.metric("Vendor fill", f"{fill:.0f}%")
     c7.metric("Lines w/ issues", f"{issues:,}")
+    render_po_destination_split(lines, qty_col="ordered_units")
 
 
 def po_details_list(po_pos, po_df):
@@ -2497,6 +2606,7 @@ def po_details_list(po_pos, po_df):
                  "po_type", "fulfillment",
                  "order_placed", "ship_date", "first_arrival", "last_received", "lines",
                  "original_ordered", "ordered", "received",
+                 "fba_units", "fbb_units", "fbm_units", "stow_units", "other_units",
                  "left", "on_order", "demand_fill_pct", "vendor_fill_pct"]
     base_cols = [c for c in base_cols if c in filtered.columns]
     wo_cols = [c for c in ["wo_count", "wo_current", "wo_processed", "wo_ship_created", "wo_shipped", "wo_stowed"]
@@ -2508,6 +2618,8 @@ def po_details_list(po_pos, po_df):
         "ship_date": "Ship Date", "first_arrival": "First Arrival",
         "last_received": "Last Received", "lines": "Lines", "original_ordered": "Orig Ordered",
         "ordered": "Current Ordered", "received": "Received", "left": "Left", "on_order": "On Order",
+        "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
+        "stow_units": "To Stow", "other_units": "Other dest.",
         "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
         "wo_count": "WOs", "wo_current": "WO Current", "wo_processed": "WO Processed",
         "wo_ship_created": "WO Ship Created", "wo_shipped": "WO Shipped", "wo_stowed": "WO Stowed",
@@ -2623,6 +2735,7 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     c4.metric("Left", f"{_safe_int(row['left']):,}")
     c5.metric("Demand Fill", f"{row['demand_fill_pct']:.0f}%")
     c6.metric("Vendor Fill", f"{row['vendor_fill_pct']:.0f}%")
+    render_po_destination_split(items_for_ids, qty_col="ordered_units")
 
     items = _drop_zero_ordered(po_df[po_df["po_number"] == po].copy())
     st.markdown("---")
@@ -2847,11 +2960,11 @@ def _issue_types(val):
 
 def _ov_render(dfx, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False, height=260,
                link_cols=None, slack=True, slack_whole=True, slack_label_cols=None,
-               slack_filename="wo_tracker_table.csv"):
-    render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
-                 pin_cols=pin_cols, color_rows=color_rows, height=height, link_cols=link_cols,
-                 slack=slack, slack_whole=slack_whole, slack_label_cols=slack_label_cols,
-                 slack_filename=slack_filename)
+               slack_filename="wo_tracker_table.csv", multi_select=False):
+    return render_table(dfx, key=_grid_key(key), date_cols=date_cols, numpct_cols=numpct_cols,
+                        pin_cols=pin_cols, color_rows=color_rows, height=height, link_cols=link_cols,
+                        slack=slack, slack_whole=slack_whole, slack_label_cols=slack_label_cols,
+                        slack_filename=slack_filename, multi_select=multi_select)
 
 
 # Shelf (order-management) deep link for a PO, keyed on the plain PO number.
@@ -2925,6 +3038,89 @@ def _fetch_overview_item_gap(wh, pick, ov_q, po_pos):
         return item_gap, gap_ok
     except Exception:
         return None, False
+
+
+def _actionable_nowo_pos(df):
+    """POs that still have units left to receive — the raise-WO default."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    if "left" in df.columns:
+        return df[pd.to_numeric(df["left"], errors="coerce").fillna(0) > 0].copy()
+    return df
+
+
+def _actionable_item_gap(df):
+    """Genuine no-WO gaps and partial coverage, outstanding qty > 0."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df
+    if "outstanding_units" in out.columns:
+        qty = pd.to_numeric(out["outstanding_units"], errors="coerce").fillna(0)
+        out = out[qty > 0]
+    if out.empty:
+        return out
+    genuine = pd.Series(False, index=out.index)
+    if "reason" in out.columns:
+        genuine = out["reason"].astype(str) == GENUINE_GAP_REASON
+    partial = pd.Series(False, index=out.index)
+    if "coverage_state" in out.columns:
+        partial = out["coverage_state"].astype(str) == "Partial WO"
+    if genuine.any() or partial.any() or "reason" in out.columns:
+        out = out[genuine | partial]
+    return out
+
+
+def _picked_rows(sel, shown):
+    """Ticked rows, or every visible row when nothing is ticked."""
+    if sel is not None and not getattr(sel, "empty", True):
+        return sel
+    return shown
+
+
+def _lines_with_outstanding(lines):
+    """Keep PO lines that still have qty to raise."""
+    if lines is None or getattr(lines, "empty", True):
+        return lines
+    if "outstanding_units" in lines.columns:
+        q = pd.to_numeric(lines["outstanding_units"], errors="coerce").fillna(0)
+        return lines[q > 0].copy()
+    if "ordered_units" in lines.columns and "received_units" in lines.columns:
+        q = (
+            pd.to_numeric(lines["ordered_units"], errors="coerce").fillna(0)
+            - pd.to_numeric(lines["received_units"], errors="coerce").fillna(0)
+        )
+        return lines[q > 0].copy()
+    if "left" in lines.columns:
+        q = pd.to_numeric(lines["left"], errors="coerce").fillna(0)
+        return lines[q > 0].copy()
+    return lines
+
+
+def _overview_po_context(pos, *, item_n=None):
+    uniq = list(dict.fromkeys(p for p in pos if p))
+    shown = ", ".join(uniq[:12])
+    extra = f" (+{len(uniq) - 12} more)" if len(uniq) > 12 else ""
+    if item_n is not None:
+        head = f"{item_n:,} PO item(s) without full WO coverage"
+        return head + (f" (POs {shown}{extra})" if shown else "")
+    return f"POs with no work order: {shown}{extra}"
+
+
+def _overview_lookup_raise(key, qty_frame, context):
+    """Primary Overview action: Catalogue Lookup with qty / PO / ship-by attached."""
+    if st.button(
+        "🔎 Look up listings & raise WO",
+        key=key,
+        type="primary",
+        use_container_width=True,
+        help="Opens Catalogue Lookup with these SKUs, qty, PO # and ship-by. "
+             "Edit the Shelf grid there, then Slack. Does not create a WO in Shelf.",
+    ):
+        if qty_frame is None or getattr(qty_frame, "empty", True):
+            st.warning("No outstanding line items on the selected rows to look up.")
+            return
+        ids = _catalog_ids_for_lookup(qty_frame)
+        _jump_to_catalog_lookup(ids, context=context, pack=True, qty_frame=qty_frame)
 
 
 def _overview_send_wo_request(key, lines, *, filename):
@@ -3011,14 +3207,25 @@ def overview_tab(df, wos):
 
     def _panel(dshow, key, *, date_cols=(), numpct_cols=(), pin_cols=(), color_rows=False,
                link_cols=None, slack=True, slack_whole=True, slack_label_cols=None,
-               slack_filename="wo_tracker_table.csv"):
+               slack_filename="wo_tracker_table.csv", multi_select=False):
         # Cap rendered rows for speed; the full total is already in the panel header.
-        _ov_render(dshow.head(OV_MAX_ROWS), key, date_cols=date_cols,
-                   numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows,
-                   link_cols=link_cols, slack=slack, slack_whole=slack_whole,
-                   slack_label_cols=slack_label_cols, slack_filename=slack_filename)
+        shown = dshow.head(OV_MAX_ROWS)
+        sel = _ov_render(shown, key, date_cols=date_cols,
+                         numpct_cols=numpct_cols, pin_cols=pin_cols, color_rows=color_rows,
+                         link_cols=link_cols, slack=slack, slack_whole=slack_whole,
+                         slack_label_cols=slack_label_cols, slack_filename=slack_filename,
+                         multi_select=multi_select)
         if len(dshow) > OV_MAX_ROWS:
-            st.caption(f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}.")
+            st.caption(
+                f"Showing the top {OV_MAX_ROWS} of {len(dshow):,}. "
+                "Filter first — ticks apply to the rows on screen."
+            )
+        elif multi_select:
+            st.caption(
+                "Tick one or more rows, then look up listings. "
+                "If nothing is ticked, the visible rows are used."
+            )
+        return shown, sel
 
     # ================= Purchase orders (tiles) =================
     st.markdown("#### 📥 Purchase orders (placed since 2025-07-01)")
@@ -3038,6 +3245,7 @@ def overview_tab(df, wos):
         c[2].metric("Units received", f"{po_received:,}")
         c[3].metric("Vendor fill", f"{po_fill:.0f}%")
         c[4].metric("Lines w/ issues", f"{po_iss:,}")
+        render_po_destination_split(po_df, qty_col="ordered_units")
         _po_lag_caption()
     else:
         st.caption("PO data unavailable — check queries/po_tracker.sql.")
@@ -3176,10 +3384,11 @@ def overview_tab(df, wos):
     st.markdown("---")
     st.markdown("#### 🚨 Needs attention")
     st.caption(
-        "POs without a work order, then item-level gaps. "
-        "Use **Advanced filters** inside each panel (vendor, warehouse, state, coverage). "
-        "PO received/ordered figures are a daily report — Shelf can already be ahead. "
-        f"Each table shows the top {OV_MAX_ROWS}."
+        "**1.** See POs / items without a work order. **2.** Tick one or more rows. "
+        "**3.** Look up listings — qty, PO # and ship-by come with them. "
+        "**4.** Edit the Shelf grid if needed. **5.** Slack the request file. "
+        "That does **not** create a WO in Shelf. "
+        f"Each table shows the top {OV_MAX_ROWS}. Use **Advanced filters** to narrow."
     )
     if render_flag_guide is not None:
         render_flag_guide()
@@ -3192,20 +3401,35 @@ def overview_tab(df, wos):
                 "module is missing from the image or crashed on import."
             )
 
-    nowo = _active_nowo_pos(po_pos)
-    _n_nowo = 0 if nowo is None else len(nowo)
-    with st.expander(f"🧾 POs placed/arriving with no work order ({_n_nowo:,})", expanded=(_n_nowo > 0)):
+    nowo_all = _active_nowo_pos(po_pos)
+    nowo_act = _actionable_nowo_pos(nowo_all) if nowo_all is not None else nowo_all
+    _n_nowo_all = 0 if nowo_all is None else len(nowo_all)
+    _n_nowo_act = 0 if nowo_act is None else len(nowo_act)
+    with st.expander(
+        f"🧾 POs placed/arriving with no work order ({_n_nowo_act:,} with units left)",
+        expanded=(_n_nowo_act > 0),
+    ):
         st.caption(
-            "Active POs with no linked work order. Qty columns are original ordered, "
-            "current ordered, and received. Zero-ordered POs are hidden. "
-            "**Send WO request** attaches outstanding lines (qty > 0) as a Shelf file — "
-            "not the whole PO list. Does not create a WO in Shelf."
+            "Active POs with no linked work order. Tick one or more POs, then look up "
+            "listings — outstanding qty, PO # and ship-by travel with the items. "
+            "Edit and Slack from Catalogue Lookup. Does not create a WO in Shelf."
         )
-        if nowo is None:
+        if nowo_all is None:
             st.caption("PO→WO link unavailable (couldn't load the WO rollup).")
-        elif nowo.empty:
+        elif nowo_all.empty:
             st.caption("None — every active PO with ordered units has a work order.")
         else:
+            nowo_only = st.checkbox(
+                "Show only POs with units still outstanding",
+                value=True, key="ov_nowo_actionable",
+                help="Hides fully received POs that still have no WO.",
+            )
+            nowo = nowo_act if nowo_only else nowo_all
+            if nowo_only and _n_nowo_all > _n_nowo_act:
+                st.caption(
+                    f"{_n_nowo_all - _n_nowo_act:,} fully received PO(s) hidden. "
+                    "Uncheck to see them."
+                )
             nowo = _ov_adv_filters(
                 nowo, "nowo",
                 fields=[
@@ -3216,15 +3440,16 @@ def overview_tab(df, wos):
                     ("PO Type", "po_type"),
                     ("Fulfillment", "fulfillment"),
                 ],
-                qty_col="ordered",
-                qty_label="Min current ordered",
+                qty_col="left",
+                qty_label="Min outstanding",
             )
-            if nowo.empty:
+            if nowo is None or nowo.empty:
                 st.caption("No POs match these filters.")
             else:
                 keep = [
                     "po_number", "vendor_name", "warehouse_name",
                     "original_ordered", "ordered", "received", "left",
+                    "fba_units", "fbb_units", "fbm_units", "stow_units",
                     "demand_fill_pct", "vendor_fill_pct",
                     "_age", "order_placed", "ship_date", "first_arrival",
                     "country_name", "purchase_state", "po_type", "fulfillment",
@@ -3234,6 +3459,8 @@ def overview_tab(df, wos):
                     "po_number": "PO #", "vendor_name": "Vendor", "warehouse_name": "WH",
                     "original_ordered": "Orig Ordered", "ordered": "Current Ordered",
                     "received": "Received", "left": "Left",
+                    "fba_units": "FBA", "fbb_units": "FBB", "fbm_units": "FBM",
+                    "stow_units": "To Stow",
                     "demand_fill_pct": "Demand Fill %", "vendor_fill_pct": "Vendor Fill %",
                     "_age": "Days Since Placed", "order_placed": "Order Placed",
                     "ship_date": "Ship Date", "first_arrival": "First Arrival",
@@ -3241,84 +3468,61 @@ def overview_tab(df, wos):
                     "po_type": "PO Type", "fulfillment": "Fulfillment",
                 })
                 d["PO #"] = _ov_po_str(d["PO #"])
-                pos = [x for x in d["PO #"].astype(str).tolist() if x]
+                shown, sel = _panel(
+                    d, "ov_nowo",
+                    date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
+                    numpct_cols=[c for c in ["Demand Fill %", "Vendor Fill %"] if c in d.columns],
+                    pin_cols=["PO #"], color_rows=True, slack=False, multi_select=True,
+                )
+                picked = _picked_rows(sel, shown)
+                pos = [x for x in picked["PO #"].astype(str).tolist() if x] if "PO #" in picked.columns else []
                 try:
-                    lines = _po_lines_for_pos(po_df, pos)
+                    lines = _lines_with_outstanding(_po_lines_for_pos(po_df, pos))
                 except Exception as exc:
                     st.warning(f"Couldn't load PO lines for a WO request: {type(exc).__name__}: {exc}")
                     lines = None
-                a1, a2, a3 = st.columns(3)
-                with a1:
-                    _overview_send_wo_request(
-                        "slack_nowo_wo", lines,
-                        filename=f"wo_request_nowo_{datetime.now():%Y%m%d}.csv",
-                    )
-                with a2:
-                    if st.button("🔎 Look up listings", key="jump_nowo_cat",
-                                 use_container_width=True,
-                                 help="Catalogue Lookup for these POs. Edit qty there before Slack if you need to."):
-                        ids = _catalog_ids_for_lookup(lines)
-                        shown = ", ".join(pos[:12])
-                        extra = f" (+{len(pos) - 12} more)" if len(pos) > 12 else ""
-                        _jump_to_catalog_lookup(
-                            ids,
-                            context=f"POs with no work order: {shown}{extra}",
-                            pack=True, qty_frame=lines,
-                        )
-                with a3:
-                    if st.button("📦 Add to raise-WO pack", key="ov_nowo_raise",
-                                 use_container_width=True,
-                                 help="Copies outstanding lines into 📋 Requests. Does not create a WO in Shelf."):
-                        add_raise_rows(raise_rows_from_gap(lines))
-                        _jump_to_requests("Raise-WO pack")
-                b1, b2, b3 = st.columns(3)
-                with b1:
-                    st.download_button(
-                        "⬇ PO list CSV", d.to_csv(index=False).encode("utf-8"),
-                        file_name=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
-                        mime="text/csv", key="dl_nowo", use_container_width=True)
-                with b2:
-                    if slack_send_panel_button is not None:
-                        slack_send_panel_button(
-                            "slack_nowo_list", df=d,
-                            filename=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
-                            note=f"PO-level no-WO list — {len(d):,} POs (list only, not a Shelf WO file).",
-                            label="📤 Send PO list to Slack",
-                            use_container_width=True)
-                with b3:
-                    if st.button("📌 Add to chase list", key="ov_nowo_chase",
-                                 use_container_width=True,
-                                 help="Follow-up checklist only — does not complete a WO in Shelf."):
-                        chase_src = nowo
-                        if "po_number" in nowo.columns:
-                            chase_src = nowo[_ov_po_str(nowo["po_number"]).isin(pos)]
-                        add_chase_rows(chase_rows_from_pos(chase_src, kind="PO no-WO"))
-                        _jump_to_requests("Chase list")
-                st.caption("**PO #** copies the number. **Shelf → Open** opens the PO. "
-                           "WO request = outstanding lines; PO list = the table below.")
-                _panel(d, "ov_nowo",
-                       date_cols=[c for c in ["Order Placed", "Ship Date", "First Arrival"] if c in d.columns],
-                       numpct_cols=[c for c in ["Demand Fill %", "Vendor Fill %"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True, slack=False)
+                n_tick = 0 if sel is None else len(sel)
+                st.caption(
+                    f"{n_tick:,} PO(s) ticked · {len(pos):,} will be looked up"
+                    + ("" if n_tick else " (all visible rows).")
+                )
+                _overview_lookup_raise(
+                    "jump_nowo_cat", lines, _overview_po_context(pos),
+                )
+                with st.expander("More — download / chase"):
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        st.download_button(
+                            "⬇ PO list CSV", d.to_csv(index=False).encode("utf-8"),
+                            file_name=f"pos_without_wo_{datetime.now():%Y%m%d}.csv",
+                            mime="text/csv", key="dl_nowo", use_container_width=True)
+                    with m2:
+                        if st.button("📌 Add to chase list", key="ov_nowo_chase",
+                                     use_container_width=True,
+                                     help="Follow-up checklist only — does not complete a WO in Shelf."):
+                            chase_src = nowo
+                            if "po_number" in nowo.columns:
+                                chase_src = nowo[_ov_po_str(nowo["po_number"]).isin(pos)]
+                            add_chase_rows(chase_rows_from_pos(chase_src, kind="PO no-WO"))
+                            _jump_to_requests("Chase list")
 
     item_gap, gap_ok = _fetch_overview_item_gap(wh, pick, ov_q, po_pos)
+    item_gap_act = _actionable_item_gap(item_gap) if gap_ok and item_gap is not None else item_gap
     if not gap_ok or item_gap is None:
-        _n_gap = _n_nowo_items = _n_partial_items = 0
+        _n_gap_all = _n_gap_act = _n_nowo_items = 0
     else:
-        _n_gap = int(len(item_gap))
-        _cs = item_gap["coverage_state"].astype(str)
-        _n_nowo_items = int((_cs == "No WO").sum())
-        _n_partial_items = int((_cs == "Partial WO").sum())
+        _n_gap_all = int(len(item_gap))
+        _n_gap_act = int(len(item_gap_act)) if item_gap_act is not None else 0
+        _cs_all = item_gap["coverage_state"].astype(str) if "coverage_state" in item_gap.columns else None
+        _n_nowo_items = int((_cs_all == "No WO").sum()) if _cs_all is not None else 0
     with st.expander(
-        f"🧩 Item-level: no WO / incomplete coverage ({_n_gap:,})",
+        f"🧩 Item-level: no WO / incomplete coverage ({_n_gap_act:,} need a WO)",
         expanded=_n_nowo_items > 0,
     ):
         st.caption(
-            "One row per PO × SKU — a PO can have some items fully covered and others not. "
-            "**No WO** = nothing raised for this item yet. **Partial WO** = a WO exists but "
-            "for fewer units than are still outstanding. Zero-ordered lines are hidden. "
-            "**Send WO request** attaches outstanding qty (qty > 0) as a Shelf file. "
-            "Does not create a WO in Shelf."
+            "One row per PO × SKU. Default view is genuine gaps and partial coverage "
+            "with outstanding qty. Tick rows, look up listings (qty and PO details come "
+            "with them), edit, then Slack. Does not create a WO in Shelf."
         )
         if item_gap is None:
             st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
@@ -3333,8 +3537,19 @@ def overview_tab(df, wos):
         elif item_gap.empty:
             st.caption("None — every PO item has full work-order coverage.")
         else:
-            item_gap = _ov_adv_filters(
-                item_gap, "item_gap",
+            gap_only = st.checkbox(
+                "Show only rows that still need a WO (genuine gap or partial coverage, outstanding > 0)",
+                value=True, key="ov_gap_actionable",
+                help="Hides fully received, cancelled, and Storage-WO-covered lines.",
+            )
+            view = item_gap_act if gap_only else item_gap
+            if gap_only and _n_gap_all > _n_gap_act:
+                st.caption(
+                    f"{_n_gap_all - _n_gap_act:,} non-actionable line(s) hidden "
+                    "(fully received / cancelled / Storage WO). Uncheck to see them."
+                )
+            view = _ov_adv_filters(
+                view, "item_gap",
                 fields=[
                     ("Vendor", "vendor_name"),
                     ("Warehouse", "warehouse_name"),
@@ -3345,42 +3560,36 @@ def overview_tab(df, wos):
                 qty_col="outstanding_units",
                 qty_label="Min outstanding",
             )
-            if item_gap.empty:
+            if view is None or view.empty:
                 st.caption("No item lines match these filters.")
             else:
-                _cs = item_gap["coverage_state"].astype(str)
-                _n_gap = int(len(item_gap))
-                _n_nowo_items = int((_cs == "No WO").sum())
-                _n_partial_items = int((_cs == "Partial WO").sum())
+                _cs = view["coverage_state"].astype(str) if "coverage_state" in view.columns else None
+                _n_gap = int(len(view))
+                _n_nowo_view = int((_cs == "No WO").sum()) if _cs is not None else 0
+                _n_partial_view = int((_cs == "Partial WO").sum()) if _cs is not None else 0
                 mcol = st.columns(3)
-                mcol[0].metric("Item-lines flagged", f"{_n_gap:,}")
-                mcol[1].metric("No WO", f"{_n_nowo_items:,}")
-                mcol[2].metric("Partial WO", f"{_n_partial_items:,}")
-                if "reason" in item_gap.columns:
-                    genuine = int((item_gap["reason"] == "Genuine gap — needs WO raised").sum())
-                    if genuine:
-                        st.caption(
-                            f"Of the No-WO lines, **{genuine:,}** are a genuine gap needing a WO "
-                            "raised — the rest are already received, on a closed PO, or covered "
-                            "via a Storage WO."
-                        )
-                keep = ["po_number", "sku", "title", "vendor_name", "warehouse_name",
+                mcol[0].metric("Item-lines shown", f"{_n_gap:,}")
+                mcol[1].metric("No WO", f"{_n_nowo_view:,}")
+                mcol[2].metric("Partial WO", f"{_n_partial_view:,}")
+                keep = ["po_number", "sku", "master_id", "title", "vendor_name", "warehouse_name",
                         "original_ordered_units", "ordered_units", "received_units",
                         "outstanding_units", "wo_qty", "coverage_state", "reason",
-                        "order_placed_date", "purchase_state"]
-                keep = [c for c in keep if c in item_gap.columns]
-                sort_cols = [c for c in ["coverage_state", "outstanding_units"] if c in item_gap.columns]
+                        "order_placed_date", "ship_date", "purchase_state", "fulfillment_method"]
+                keep = [c for c in keep if c in view.columns]
+                sort_cols = [c for c in ["coverage_state", "outstanding_units"] if c in view.columns]
                 sorted_gap = (
-                    item_gap.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)])
-                    if sort_cols else item_gap
-                )
+                    view.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)])
+                    if sort_cols else view
+                ).reset_index(drop=True)
                 d = sorted_gap[keep].rename(columns={
-                    "po_number": "PO #", "sku": "SKU", "title": "Title", "vendor_name": "Vendor",
+                    "po_number": "PO #", "sku": "SKU", "master_id": "Master ID",
+                    "title": "Title", "vendor_name": "Vendor",
                     "warehouse_name": "WH",
                     "original_ordered_units": "Orig Ordered", "ordered_units": "Current Ordered",
                     "received_units": "Received", "outstanding_units": "Outstanding",
                     "wo_qty": "WO Qty", "coverage_state": "Coverage", "reason": "Reason",
-                    "order_placed_date": "Order Placed", "purchase_state": "State"})
+                    "order_placed_date": "Order Placed", "ship_date": "Ship Date",
+                    "purchase_state": "State", "fulfillment_method": "Fulfillment"})
                 if "PO #" in d.columns:
                     d["PO #"] = _ov_po_str(d["PO #"])
                 if flag_action is not None and "Coverage" in d.columns:
@@ -3390,56 +3599,45 @@ def overview_tab(df, wos):
                     )
                     _src = _src.where(_src.str.strip().ne("") & _src.str.lower().ne("nan"), d["Coverage"])
                     d["What to do"] = _src.map(flag_action)
-                gap_lines = item_gap
-                if "PO #" in d.columns and "po_number" in item_gap.columns:
-                    vis = set(d["PO #"].astype(str))
-                    gap_lines = item_gap[_ov_po_str(item_gap["po_number"]).isin(vis)]
-                _g0, _g1, _g2 = st.columns(3)
-                with _g0:
-                    _overview_send_wo_request(
-                        "slack_item_gap_wo", gap_lines,
-                        filename=f"wo_request_item_gap_{datetime.now():%Y%m%d}.csv",
-                    )
-                with _g1:
-                    if st.button("🔎 Look up listings", key="jump_item_gap_cat",
-                                 use_container_width=True,
-                                 help="Open Catalogue Lookup with these SKUs / Master IDs"):
-                        ids = _catalog_ids_for_lookup(gap_lines)
-                        po_nums = []
-                        if "po_number" in gap_lines.columns:
-                            po_nums = [x for x in _ov_po_str(gap_lines["po_number"]).tolist() if x]
-                        uniq_pos = list(dict.fromkeys(po_nums))
-                        shown = ", ".join(uniq_pos[:12])
-                        extra = f" (+{len(uniq_pos) - 12} more)" if len(uniq_pos) > 12 else ""
-                        _jump_to_catalog_lookup(
-                            ids,
-                            context=f"{len(gap_lines):,} PO item(s) without full WO coverage"
-                                    + (f" (POs {shown}{extra})" if shown else ""),
-                            pack=True, qty_frame=gap_lines,
-                        )
-                with _g2:
-                    if st.button("📦 Add gap lines to raise-WO pack", key="ov_gap_raise",
-                                 use_container_width=True,
-                                 help="Adds outstanding qty as Shelf rows. Does not create a WO in Shelf."):
-                        add_raise_rows(raise_rows_from_gap(gap_lines))
-                        _jump_to_requests("Raise-WO pack")
-                _h1, _h2 = st.columns(2)
-                with _h1:
-                    st.download_button(
-                        "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
-                        file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
-                        mime="text/csv", key="dl_item_gap", use_container_width=True)
-                with _h2:
-                    if st.button("📌 Add to chase list", key="ov_gap_chase",
-                                 use_container_width=True,
-                                 help="Follow-up checklist only — does not complete a WO in Shelf."):
-                        add_chase_rows(chase_rows_from_pos(gap_lines, kind="Item gap"))
-                        _jump_to_requests("Chase list")
-                st.caption("**Send WO request** attaches outstanding lines as a Shelf file. "
-                           "**PO #** copies the number. **Shelf → Open** opens the PO.")
-                _panel(d, "ov_item_gap",
-                       date_cols=[c for c in ["Order Placed"] if c in d.columns],
-                       pin_cols=["PO #"], color_rows=True, slack=False)
+                shown, sel = _panel(
+                    d, "ov_item_gap",
+                    date_cols=[c for c in ["Order Placed", "Ship Date"] if c in d.columns],
+                    pin_cols=["PO #"], color_rows=True, slack=False, multi_select=True,
+                )
+                picked = _picked_rows(sel, shown)
+                if sel is not None and not sel.empty:
+                    gap_lines = sorted_gap.reindex(picked.index).dropna(how="all")
+                else:
+                    gap_lines = sorted_gap.head(len(shown))
+                gap_lines = _lines_with_outstanding(gap_lines)
+                po_nums = []
+                if gap_lines is not None and "po_number" in gap_lines.columns:
+                    po_nums = [x for x in _ov_po_str(gap_lines["po_number"]).tolist() if x]
+                n_tick = 0 if sel is None else len(sel)
+                n_lines = 0 if gap_lines is None else len(gap_lines)
+                st.caption(
+                    f"{n_tick:,} item(s) ticked · {n_lines:,} will be looked up"
+                    + ("" if n_tick else " (all visible rows).")
+                )
+                _overview_lookup_raise(
+                    "jump_item_gap_cat",
+                    gap_lines,
+                    _overview_po_context(po_nums, item_n=n_lines),
+                )
+                with st.expander("More — download / chase"):
+                    g1, g2 = st.columns(2)
+                    with g1:
+                        st.download_button(
+                            "⬇ Download this list (CSV)", d.to_csv(index=False).encode("utf-8"),
+                            file_name=f"po_items_without_full_wo_{datetime.now():%Y%m%d}.csv",
+                            mime="text/csv", key="dl_item_gap", use_container_width=True)
+                    with g2:
+                        if st.button("📌 Add to chase list", key="ov_gap_chase",
+                                     use_container_width=True,
+                                     help="Follow-up checklist only — does not complete a WO in Shelf."):
+                            add_chase_rows(chase_rows_from_pos(
+                                gap_lines if gap_lines is not None else view, kind="Item gap"))
+                            _jump_to_requests("Chase list")
 
 
 
@@ -3552,15 +3750,20 @@ def _sku_journey_render(mid, df, po_df):
         st.caption("No POs found for this Master ID.")
     else:
         d = po_rows.sort_values("order_placed_date", ascending=False)[
-            ["po_number", "po_status", "vendor_name", "country_name", "warehouse_name", "purchase_state",
-             "order_placed_date", "ordered_units", "received_units", "demand_fill_rate_pct",
-             "vendor_fill_rate_pct", "total_issues"]
+            [c for c in [
+                "po_number", "po_status", "vendor_name", "country_name", "warehouse_name",
+                "purchase_state", "fulfillment_method", "order_placed_date",
+                "ordered_units", "received_units", "demand_fill_rate_pct",
+                "vendor_fill_rate_pct", "total_issues",
+            ] if c in po_rows.columns]
         ].rename(columns={
             "po_number": "PO #", "po_status": "Status", "vendor_name": "Vendor", "country_name": "Country",
-            "warehouse_name": "WH", "purchase_state": "State", "order_placed_date": "Order Placed",
+            "warehouse_name": "WH", "purchase_state": "State", "fulfillment_method": "Fulfillment",
+            "order_placed_date": "Order Placed",
             "ordered_units": "Ordered", "received_units": "Received", "demand_fill_rate_pct": "Demand Fill %",
             "vendor_fill_rate_pct": "Vendor Fill %", "total_issues": "Issues"})
         d["PO #"] = _ov_po_str(d["PO #"])
+        render_po_destination_split(po_rows, qty_col="ordered_units")
         _ov_render(d, f"skuj_po_{mid}", date_cols=["Order Placed"],
                    numpct_cols=["Demand Fill %", "Vendor Fill %"], pin_cols=["PO #"],
                    color_rows=True, height=300)
@@ -3626,10 +3829,8 @@ def catalog_lookup_tab():
     st.markdown("#### 🔎 Catalogue Lookup — search by ID")
     st.caption(
         "Paste SKUs, Listing IDs, ASINs, FNSKUs, Master IDs, MPNs, UPCs or EANs. "
-        "Looks up live catalog listings (not warehouse-scoped) so you can copy the "
-        "listing ids into a **raise-WO** Slack message without leaving the tool. "
-        "From Overview or PO Details, use **Look up listings** / **Raise-WO pack** to pre-fill this box. "
-        "Edit the Shelf grid below, then Slack it or add rows to **📋 Requests**. "
+        "From Overview, tick POs or items without WOs and **Look up listings & raise WO** — "
+        "qty, PO # and ship-by come with them. Edit the Shelf grid below, then Slack. "
         "That does **not** create a WO in Shelf until someone uploads the CSV."
     )
 
