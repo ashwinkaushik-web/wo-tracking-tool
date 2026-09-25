@@ -1351,10 +1351,16 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     )
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id}")
-    filtered = filter_panel(
-        items, f"fp_swo_items_{wo_id}", brand_col="source_brand", ship_col="ship_by",
-        reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
-        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
+    filtered = _ov_adv_filters(
+        items, f"swo_items_{wo_id}",
+        fields=[
+            ("WO Type", "woi_type"),
+            ("Brand", "source_brand"),
+            ("Status", "status_simple"),
+            ("Reason", "block_reason_pfs"),
+        ],
+        qty_col="current_request",
+        qty_label="Min current",
     )
     filtered = hide_unlisted(filtered, f"hl_swo_items_{wo_id}")
     render_root_cause_detail(filtered, f"rc_swo_{wo_id}")
@@ -1514,13 +1520,20 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
 
     st.markdown("---")
     st.markdown(f"#### 📄 Items in WO {wo_id} (PO# {wo_row['po_number_raw']})")
-    filtered = filter_panel(
-        items, f"fp_pwo_items_{wo_id}", brand_col="source_brand", ship_col="po_ref_ship_by_date",
-        ship_label="Ref ship-by", flag_col="po_block_flag", status_kind="item",
-        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name"],
+    filtered = _ov_adv_filters(
+        items, f"pwo_items_{wo_id}",
+        fields=[
+            ("WO Type", "woi_type"),
+            ("Brand", "source_brand"),
+            ("Status", "status_simple"),
+            ("Flag", "po_block_flag"),
+        ],
+        qty_col="current_request",
+        qty_label="Min current",
     )
     filtered = hide_unlisted(filtered, f"hl_pwo_items_{wo_id}")
-    filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
+    if not filtered.empty and "po_days_past_ref_ship_by" in filtered.columns:
+        filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     item_cols = [
         "work_order_item_id", "po_ref_ship_by_date",
         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
@@ -3057,9 +3070,15 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     items = _attach_item_wo_destination(items, awo)
     st.markdown("---")
     st.markdown(f"#### 📄 Items in PO {po}")
-    filtered = po_filter_panel(
-        items, f"fp_pod_items_{po}", date_col="order_placed_date", status_col="po_status",
-        search_cols=["sku", "asin", "master_id", "title"],
+    filtered = _ov_adv_filters(
+        items, f"pod_items_{po}",
+        fields=[("SKU", "sku"), ("Master ID", "master_id")],
+        qty_col="stow_units",
+        qty_label="Min to stow",
+        any_positive=[
+            ("FBA", "fba_units"), ("FBB", "fbb_units"), ("FBM", "fbm_units"),
+            ("ZFS", "zfs_units"), ("OCT", "oct_units"), ("To Stow", "stow_units"),
+        ],
     )
     disp, default = _po_item_display(filtered, include_po=False)
     cols = column_picker(list(disp.columns), key=f"cols_pod_items_dest_{po}", default_labels=default, required=["SKU"])
@@ -3077,6 +3096,17 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
     if awo is None or awo.empty:
         st.caption("No work orders linked to this PO in the current WO dataset (year-to-date).")
     else:
+        awo = _ov_adv_filters(
+            awo, f"pod_awo_{po}",
+            fields=[
+                ("WO Type", "woi_type"),
+                ("Brand", "source_brand"),
+                ("Status", "status_simple"),
+                ("Flag", "po_block_flag"),
+            ],
+            qty_col="current_request",
+            qty_label="Min current",
+        )
         awo_pairs = [
             ("work_order_item_id", "WOI ID"), ("work_order_number", "WO"),
             ("woi_type", "WO Type"),
@@ -3194,8 +3224,9 @@ def _overview_quick_filters(df, wos, po_df, po_pos):
     return pick, q
 
 
-def _ov_adv_filters(df, key, *, fields, qty_col=None, qty_label="Min qty"):
-    """Collapsed vendor / WH / state / coverage filters plus search for one panel."""
+def _ov_adv_filters(df, key, *, fields, qty_col=None, qty_label="Min qty",
+                    any_positive=None):
+    """Collapsed filters + search, scoped to one table."""
     if df is None or getattr(df, "empty", True):
         return df
     out = df
@@ -3217,10 +3248,24 @@ def _ov_adv_filters(df, key, *, fields, qty_col=None, qty_label="Min qty"):
             )
             if pick:
                 out = out[out[col].astype(str).isin(pick)]
+        if any_positive:
+            dest_opts = [lab for lab, col in any_positive if col in out.columns]
+            if dest_opts:
+                dpick = st.multiselect(
+                    "Has units in", dest_opts, key=f"ovadv_{key}_hasunits",
+                    placeholder="Any destination",
+                    help="Keep rows with qty in at least one of the dest columns you tick.",
+                )
+                if dpick:
+                    mask = pd.Series(False, index=out.index)
+                    for lab, col in any_positive:
+                        if lab in dpick and col in out.columns:
+                            mask = mask | (pd.to_numeric(out[col], errors="coerce").fillna(0) > 0)
+                    out = out[mask]
         q1, q2 = st.columns([2, 1])
         q = q1.text_input(
-            "Find in this panel", "", key=f"ovq_{key}",
-            placeholder="PO # · SKU · vendor · title",
+            "Find in this table", "", key=f"ovq_{key}",
+            placeholder="SKU · Master ID · WO Type · name — paste several",
         )
         min_qty = 0
         if qty_col and qty_col in df.columns:
