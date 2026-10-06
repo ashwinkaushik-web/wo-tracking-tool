@@ -332,6 +332,7 @@ COLUMN_GLOSSARY = {
     "DNO Note": "Do-Not-Order note from the catalog DNO setting.",
     "DNO Reason": "Do-Not-Order reason code.",
     "Seller": "Marketplace seller name.",
+    "Region": "Marketplace country/region (from the listing marketplace, e.g. UK, DE, ES, US).",
     "Fulfillment": "Listing fulfillment type (FBA, FBM, …) or the PO fulfillment method.",
     "FBA": "Units raised on FBA work-order items (WO current qty). Not the PO report fulfillment method.",
     "FBB": "Units raised on FBB work-order items (WO current qty).",
@@ -1054,6 +1055,26 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
 # ============================================================
 # SIDEBAR
 # ============================================================
+def _clear_data_caches():
+    """Drop Streamlit data caches. Only cached functions have .clear() — wrappers
+    like fetch_po_wo_agg must not be called with .clear() (AttributeError)."""
+    for fn in (
+        fetch_data,
+        fetch_po_data,
+        fetch_po_extract_asof,
+        fetch_po_item_wo_gap,
+        _cached_po_wo_agg,
+        _cached_po_dest_agg,
+        _cached_woi_types,
+        fetch_wo_unpickable_detail,
+        fetch_catalog_lookup,
+        fetch_warehouse_dim,
+    ):
+        clearer = getattr(fn, "clear", None)
+        if callable(clearer):
+            clearer()
+
+
 def sidebar(last_refresh):
     st.sidebar.title("📊 WO Tracker")
     st.sidebar.caption("Snowflake snapshot · two clocks")
@@ -1067,14 +1088,7 @@ def sidebar(last_refresh):
     else:
         st.sidebar.caption("PO ordered/received is a daily report. Shelf can already be ahead.")
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, type="primary"):
-        fetch_data.clear()
-        fetch_po_data.clear()
-        fetch_po_extract_asof.clear()
-        fetch_po_item_wo_gap.clear()
-        fetch_po_wo_agg.clear()
-        fetch_wo_unpickable_detail.clear()
-        fetch_catalog_lookup.clear()
-        fetch_warehouse_dim.clear()
+        _clear_data_caches()
         _reset_selection()
         st.rerun()
     wo_s = st.session_state.get("_wo_fetch_s")
@@ -1779,19 +1793,27 @@ WHERE woi.deleted_at IS NULL
 """
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_po_dest_agg():
     """Per-PO dest qty from WO item types. Independent of po_wo_agg.sql shape."""
-    dest = _sf_query(_PO_DEST_SQL)
+    return _cached_po_dest_agg(_PO_DEST_SQL)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_po_dest_agg(sql):
+    dest = _sf_query(sql)
     for c in dest.columns:
         dest[c] = pd.to_numeric(dest[c], errors="coerce")
     return dest
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_woi_types(wh_scope=()):
     """WO item type names when wo_tracker.sql does not SELECT woi_type."""
     sql = _scope_sql(_WOI_TYPE_SQL, _override_from_scope(wh_scope))
+    return _cached_woi_types(sql)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_woi_types(sql):
     types = _sf_query(sql)
     types["work_order_item_id"] = pd.to_numeric(types["work_order_item_id"], errors="coerce")
     return types[["work_order_item_id", "woi_type"]]
@@ -2179,6 +2201,59 @@ def _catalog_is_raisable(df):
     return mask
 
 
+_PATTERN_UK_EU_SELLERS = frozenset({"pattern uk", "pattern eu"})
+
+_MARKETPLACE_REGION = {
+    "amazon.com": "US",
+    "amazon.co.uk": "UK",
+    "amazon.de": "DE",
+    "amazon.fr": "FR",
+    "amazon.es": "ES",
+    "amazon.it": "IT",
+    "amazon.nl": "NL",
+    "amazon.pl": "PL",
+    "amazon.se": "SE",
+    "amazon.ie": "IE",
+    "amazon.com.be": "BE",
+    "amazon.com.tr": "TR",
+    "amazon.ae": "AE",
+    "amazon.sa": "SA",
+    "amazon.ca": "CA",
+    "amazon.com.au": "AU",
+    "amazon.com.mx": "MX",
+    "amazon.co.jp": "JP",
+    "amazon.in": "IN",
+    "amazon.sg": "SG",
+    "amazon.com.br": "BR",
+}
+
+
+def _marketplace_region(value):
+    raw = "" if value is None else str(value).strip()
+    if not raw or raw.lower() in ("nan", "none", "<na>"):
+        return ""
+    return _MARKETPLACE_REGION.get(raw.lower(), raw)
+
+
+def _attach_catalog_region(display):
+    """Add a compact Region (UK/DE/ES/…) next to Marketplace for pick-line + table."""
+    if display is None or "Marketplace" not in getattr(display, "columns", []):
+        return display
+    if "Region" in display.columns:
+        return display
+    out = display.copy()
+    out["Region"] = out["Marketplace"].map(_marketplace_region)
+    cols = list(out.columns)
+    mkt_i = cols.index("Marketplace")
+    cols.remove("Region")
+    cols.insert(mkt_i + 1, "Region")
+    return out[cols]
+
+
+def _is_pattern_uk_eu_seller(value):
+    return str(value or "").strip().lower() in _PATTERN_UK_EU_SELLERS
+
+
 def catalog_filter_panel(df, key):
     """Filters for Catalogue Lookup: drop DNO / inactive / marketplace / seller / etc."""
     out = df.copy()
@@ -2193,6 +2268,29 @@ def catalog_filter_panel(df, key):
         )
         if hide_bad:
             out = out[_catalog_is_raisable(out)]
+
+        if "Seller" in out.columns:
+            pattern_key = f"{key}_pattern_sellers"
+            if pattern_key not in st.session_state:
+                st.session_state[pattern_key] = True
+            only_pattern = st.checkbox(
+                "Only Pattern UK and Pattern EU sellers",
+                key=pattern_key,
+                help="Hides listings on other seller accounts (Pattern US, 3P, etc.).",
+            )
+            if only_pattern:
+                n_before = len(out)
+                out = out[out["Seller"].map(_is_pattern_uk_eu_seller)]
+                dropped = n_before - len(out)
+                if n_before and out.empty:
+                    st.warning(
+                        "No Pattern UK or Pattern EU sellers in this result. "
+                        "Uncheck the seller filter to see the other accounts."
+                    )
+                elif dropped:
+                    st.caption(
+                        f"Hidden {dropped:,} listing(s) on sellers other than Pattern UK / Pattern EU."
+                    )
 
         r1a, r1b = st.columns(2)
         if "Marketplace" in out.columns:
@@ -2219,7 +2317,7 @@ def catalog_filter_panel(df, key):
 
         r2a, r2b = st.columns(2)
         if "Seller" in out.columns:
-            sellers = _uniq_filter_vals(df["Seller"])
+            sellers = _uniq_filter_vals(out["Seller"])
             pick = r2a.multiselect("Seller", sellers, key=f"{key}_seller", placeholder="All sellers")
             if pick:
                 out = out[out["Seller"].astype(str).isin(pick)]
@@ -4253,7 +4351,7 @@ CATALOG_COL_LABELS = {
 
 CATALOG_DEFAULT_COLS = [
     "Status", "SKU", "Listing ID", "Master ID", "PO Qty", "Product Name", "Marketplace",
-    "Vendor", "Fulfillment", "ASIN", "FNSKU", "Commingled", "Shippable",
+    "Region", "Vendor", "Fulfillment", "ASIN", "FNSKU", "Commingled", "Shippable",
     "DNO", "Active", "Seller",
 ]
 
@@ -4367,6 +4465,7 @@ def catalog_lookup_tab():
             ordered.append(lab)
             seen.add(lab)
     display = display[ordered]
+    display = _attach_catalog_region(display)
     display = _attach_po_qty(display)
     if "PO Qty" in display.columns and "Master ID" in display.columns:
         cols = [c for c in display.columns if c != "PO Qty"]
@@ -4490,16 +4589,17 @@ def catalog_lookup_tab():
         )
 
     default_cols = [c for c in CATALOG_DEFAULT_COLS if c in filtered.columns]
+    required = [c for c in ("Listing ID", "Region") if c in filtered.columns]
     cols = column_picker(list(filtered.columns), key="cols_cat",
-                         default_labels=default_cols, required=["Listing ID"] if "Listing ID" in filtered.columns else ())
-    filtered = filtered[cols]
+                         default_labels=default_cols, required=required)
+    filtered = filtered[[c for c in cols if c in filtered.columns]]
     table_toolbar(filtered, key="tb_cat", file_stem="catalogue_listings",
-                  id_cols=["Listing ID", "SKU", "Master ID", "ASIN", "FNSKU"],
+                  id_cols=["Listing ID", "SKU", "Region", "Marketplace", "Master ID", "ASIN", "FNSKU"],
                   count_label=f"{len(filtered):,} listing row(s)")
     render_table(
         filtered, key=_grid_key("cat_lookup"), pin_cols=["Listing ID", "SKU"],
         color_rows=True, height=480,
-        slack_label_cols=["Listing ID", "SKU", "Master ID", "PO Qty", "Product Name"],
+        slack_label_cols=["Listing ID", "SKU", "Region", "Marketplace", "Master ID", "PO Qty", "Product Name"],
         slack_filename="catalogue_listings.csv",
     )
 
