@@ -267,10 +267,15 @@ COLUMN_GLOSSARY = {
     # --- counts (WO level) ---
     "Items": "Number of WO items in this Work Order.",
     "Open": "Items still open (quantity remaining > 0).",
+    "Closed": "Items with nothing left to process.",
+    "Created": "When the WO was first created (oldest item created date).",
+    "Latest Ship By": "Latest item ship-by on the WO.",
     "Untouched": "Items with 0 processed so far.",
     "Blocked (PFS)": "Count of items the warehouse system (PFS) marks Unpickable — "
                      "ground-truth Storage block.",
-    "Top Reason": "Most common PFS block reason across the blocked items in this WO.",
+    "Top Reason": "Most common PFS block bucket across the blocked items in this WO (e.g. Listing Failed).",
+    "Listing block": "Why listings are unpickable — active unpickable reason, PFS component reason, or raw PFS status.",
+    "PFS Status": "Raw warehouse processing status (e.g. Unpickable: Listing Failed …).",
     # --- status / flags ---
     "Status": "Open or Closed.",
     "Block Status": "Raw PFS processing status (Storage), e.g. 'Unpickable: ...'.",
@@ -303,7 +308,12 @@ COLUMN_GLOSSARY = {
     "Req Delivery Date": "PO requested delivery date.",
     "Placed At": "When the Purchase Order was placed.",
     "Arrived At": "When the PO stock arrived.",
+    "Created": "When the work order header was created (WORK_ORDERS.created_at).",
     "Created At": "When the WO item was created.",
+    "WO Created": "When the work order header was created (WORK_ORDERS.created_at).",
+    "Sent to FBA": "First Amazon FBA inbound shipment created for this WO/item "
+                   "(SHIPMENTS.created_at via WOIR shippable_type = Shipment). Blank if "
+                   "nothing has been sent to FBA yet.",
     "Last Edit At": "When the WO item was last edited.",
     # --- aging ---
     "Age (d)": "Age in days since created (WO level: the oldest item).",
@@ -453,8 +463,82 @@ def _sf_query(sql):
         cur.close()
 
 
+def _top_value_per_wo(df, value_col):
+    """Most common non-blank value of ``value_col`` on each work order."""
+    if value_col not in df.columns or "work_order_number" not in df.columns:
+        return {}
+    sub = df[["work_order_number", value_col]].copy()
+    sub["_v"] = sub[value_col].astype(str).str.strip()
+    sub = sub[sub["_v"].ne("") & ~sub["_v"].str.lower().isin(("nan", "none", "<na>"))]
+    if sub.empty:
+        return {}
+    top = (
+        sub.groupby(["work_order_number", "_v"])
+        .size().reset_index(name="_cnt")
+        .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
+        .drop_duplicates("work_order_number", keep="first")
+    )
+    return dict(zip(top["work_order_number"], top["_v"]))
+
+
+def _clean_block_text(value):
+    t = "" if value is None else str(value).strip()
+    if not t or t.lower() in ("nan", "none", "<na>"):
+        return ""
+    if t.lower().startswith("unpickable:"):
+        t = t.split(":", 1)[1].strip()
+    return t
+
+
+def _join_unique_per_wo(df, value_col, cap=4):
+    """Distinct block-reason strings per WO, joined with · ."""
+    if df is None or value_col not in getattr(df, "columns", []) or "work_order_number" not in df.columns:
+        return {}
+    rows = []
+    for wo, s in df.groupby("work_order_number")[value_col]:
+        seen = []
+        for raw in s.tolist():
+            t = _clean_block_text(raw)
+            if t and t not in seen:
+                seen.append(t)
+        if not seen:
+            continue
+        extra = len(seen) - cap
+        text = " · ".join(seen[:cap])
+        if extra > 0:
+            text = f"{text} · +{extra} more"
+        rows.append((wo, text))
+    return dict(rows)
+
+
+def _attach_listing_block_reasons(items):
+    """Prefer active unpickable reasons, then PFS component reasons, then raw status."""
+    if items is None or getattr(items, "empty", True):
+        return items
+    out = items.copy()
+    listing = pd.Series("", index=out.index, dtype="object")
+    if "component_block_reasons" in out.columns:
+        listing = out["component_block_reasons"].map(_clean_block_text)
+    if "processing_status" in out.columns:
+        ps = out["processing_status"].map(_clean_block_text)
+        listing = listing.where(listing.astype(str).str.strip().ne(""), ps)
+    try:
+        det = fetch_wo_unpickable_detail()
+    except Exception:
+        det = None
+    if (det is not None and not det.empty and "woi_id" in det.columns
+            and "active_reasons" in det.columns and "work_order_item_id" in out.columns):
+        left = pd.to_numeric(out["work_order_item_id"], errors="coerce")
+        right = det[["woi_id", "active_reasons"]].copy()
+        right["woi_id"] = pd.to_numeric(right["woi_id"], errors="coerce")
+        mapped = left.map(dict(zip(right["woi_id"], right["active_reasons"].map(_clean_block_text))))
+        listing = mapped.where(mapped.astype(str).str.strip().ne(""), listing)
+    out["listing_block"] = listing.fillna("").astype(str)
+    return out
+
+
 def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.groupby("work_order_number", as_index=False).agg(
+    agg = dict(
         source_category=("source_category", "first"),
         source=("source", "first"),
         po_number_raw=("po_number_raw", "first"),
@@ -464,16 +548,27 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
         closed_items=("status_simple", lambda s: (s == "Closed").sum()),
         untouched=("processed", lambda s: (s == 0).sum()),
         orig=("original_request", "sum"),
+        current=("current_request", "sum"),
         processed=("processed", "sum"),
         ordered=("order_created", "sum"),
         shipped=("shipped", "sum"),
         stowed=("storage", "sum"),
         max_age=("age_days_from_created", "max"),
         earliest_ship=("ship_by", "min"),
+        latest_ship=("ship_by", "max"),
         earliest_ref_ship=("po_ref_ship_by_date", "min"),
         unique_listings=("listing_id", "nunique"),
         pfs_blocks=("is_blocked_pfs", lambda s: s.fillna(False).sum()),
     )
+    if "created_at" in df.columns:
+        agg["created_at"] = ("created_at", "min")
+    if "wo_created_at" in df.columns:
+        agg["wo_created_at"] = ("wo_created_at", "min")
+    if "fba_sent_at" in df.columns:
+        agg["fba_sent_at"] = ("fba_sent_at", "min")
+    if "last_edit_at" in df.columns:
+        agg["last_edit_at"] = ("last_edit_at", "max")
+    g = df.groupby("work_order_number", as_index=False).agg(**agg)
     g["pct"] = np.where(
         g["orig"].fillna(0) > 0,
         (g["processed"].fillna(0) * 100.0 / g["orig"].replace(0, np.nan)).round(1),
@@ -492,15 +587,10 @@ def _build_wo_aggregates(df: pd.DataFrame) -> pd.DataFrame:
         worst_map = {}
     g["worst_po_flag"] = g["work_order_number"].map(worst_map)
 
-    brand_counts = (
-        df.dropna(subset=["source_brand"])
-        .groupby(["work_order_number", "source_brand"])
-        .size().reset_index(name="_cnt")
-        .sort_values(["work_order_number", "_cnt"], ascending=[True, False])
-        .drop_duplicates("work_order_number", keep="first")
-    )
-    brand_map = dict(zip(brand_counts["work_order_number"], brand_counts["source_brand"]))
-    g["top_brand"] = g["work_order_number"].map(brand_map).fillna("")
+    g["top_brand"] = g["work_order_number"].map(_top_value_per_wo(df, "source_brand")).fillna("")
+    g["top_wo_type"] = g["work_order_number"].map(_top_value_per_wo(df, "woi_type")).fillna("")
+    g["created_by"] = g["work_order_number"].map(_top_value_per_wo(df, "created_by")).fillna("")
+    g["last_edit_by"] = g["work_order_number"].map(_top_value_per_wo(df, "last_edit_by")).fillna("")
 
     blocked = df[df["is_blocked_pfs"].fillna(False)]
     if not blocked.empty:
@@ -591,7 +681,7 @@ def fetch_data(wh_scope=()):
     date_cols = [
         "po_ref_ship_by_date", "po_requested_ship_date",
         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
-        "ship_by", "last_edit_at", "created_at",
+        "ship_by", "last_edit_at", "created_at", "wo_created_at", "fba_sent_at",
     ]
     for col in date_cols:
         if col in df.columns:
@@ -817,9 +907,26 @@ def table_toolbar(display, *, key, file_stem, id_cols, count_label):
 # ============================================================
 # SHARED FILTER PANEL
 # ============================================================
+def _filter_multi(out, col, label, widget, key):
+    if col not in out.columns:
+        return out
+    opts = sorted(
+        str(v).strip() for v in out[col].dropna().unique()
+        if str(v).strip() and str(v).lower() not in ("nan", "none", "<na>")
+    )
+    if not opts:
+        return out
+    pick = widget.multiselect(label, opts, key=key, placeholder=f"All {label.lower()}")
+    if pick:
+        out = out[out[col].astype(str).isin(pick)]
+    return out
+
+
 def filter_panel(df, key, *, brand_col=None, ship_col=None, ship_fallback_col=None,
                  ship_label="Ship by", reason_col=None,
-                 blocked_kind=None, flag_col=None, status_kind=None, search_cols=None):
+                 blocked_kind=None, flag_col=None, status_kind=None, search_cols=None,
+                 warehouse_col=None, created_col=None, type_col=None,
+                 type_label="WO Type", pipeline=False, extra_multis=None):
     """Standard filters in an expander. Returns the filtered DataFrame.
     blocked_kind: 'wo' (pfs_blocks count) or 'item' (is_blocked_pfs bool) or None.
     flag_col: a column to filter via the 5-way Flag dropdown (PO) or None.
@@ -876,13 +983,38 @@ def filter_panel(df, key, *, brand_col=None, ship_col=None, ship_fallback_col=No
             elif sp == "Closed":
                 out = out[out["open_items"] == 0]
 
-        # Ship-by range + Search
-        d1, d2, d3 = st.columns([1, 1, 2])
+        r2a, r2b, r2c, r2d = st.columns(4)
+        out = _filter_multi(out, warehouse_col, "Warehouse", r2a, f"{key}_wh")
+        out = _filter_multi(out, type_col, type_label, r2b, f"{key}_wotype")
+        if pipeline:
+            pipe = r2c.selectbox(
+                "Pipeline",
+                ["All", "Untouched", "Has ship created", "Has shipped", "Not shipped", "Has stowed"],
+                key=f"{key}_pipe",
+            )
+            if pipe == "Untouched" and "processed" in out.columns:
+                out = out[pd.to_numeric(out["processed"], errors="coerce").fillna(0) <= 0]
+            elif pipe == "Has ship created" and "ordered" in out.columns:
+                out = out[pd.to_numeric(out["ordered"], errors="coerce").fillna(0) > 0]
+            elif pipe == "Has ship created" and "order_created" in out.columns:
+                out = out[pd.to_numeric(out["order_created"], errors="coerce").fillna(0) > 0]
+            elif pipe == "Has shipped" and "shipped" in out.columns:
+                out = out[pd.to_numeric(out["shipped"], errors="coerce").fillna(0) > 0]
+            elif pipe == "Not shipped" and "shipped" in out.columns:
+                out = out[pd.to_numeric(out["shipped"], errors="coerce").fillna(0) <= 0]
+            elif pipe == "Has stowed" and "stowed" in out.columns:
+                out = out[pd.to_numeric(out["stowed"], errors="coerce").fillna(0) > 0]
+            elif pipe == "Has stowed" and "storage" in out.columns:
+                out = out[pd.to_numeric(out["storage"], errors="coerce").fillna(0) > 0]
+        extras = list(extra_multis or [])
+        if extras:
+            out = _filter_multi(out, extras[0][1], extras[0][0], r2d, f"{key}_x0")
+
+        d1, d2, d3, d4 = st.columns(4)
         if ship_col and ship_col in out.columns:
             sfrom = d1.date_input(f"{ship_label} — from", value=None, key=f"{key}_sfrom", format="YYYY-MM-DD")
             sto = d2.date_input(f"{ship_label} — to", value=None, key=f"{key}_sto", format="YYYY-MM-DD")
             ship_dt = pd.to_datetime(out[ship_col], errors="coerce")
-            # Many POs have no ship_by — fall back to the reference ship-by date.
             if ship_fallback_col and ship_fallback_col in out.columns:
                 ship_dt = ship_dt.fillna(pd.to_datetime(out[ship_fallback_col], errors="coerce"))
             if sfrom:
@@ -890,8 +1022,23 @@ def filter_panel(df, key, *, brand_col=None, ship_col=None, ship_fallback_col=No
                 ship_dt = ship_dt.loc[out.index]
             if sto:
                 out = out[ship_dt <= (pd.Timestamp(sto) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+        if created_col and created_col in out.columns:
+            cfrom = d3.date_input("Created — from", value=None, key=f"{key}_cfrom", format="YYYY-MM-DD")
+            cto = d4.date_input("Created — to", value=None, key=f"{key}_cto", format="YYYY-MM-DD")
+            cdt = pd.to_datetime(out[created_col], errors="coerce")
+            if cfrom:
+                out = out[cdt >= pd.Timestamp(cfrom)]
+                cdt = cdt.loc[out.index]
+            if cto:
+                out = out[cdt <= (pd.Timestamp(cto) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+
+        if extra_multis and len(extra_multis) > 1:
+            xcols = st.columns(min(4, len(extra_multis) - 1))
+            for i, (lab, col) in enumerate(extra_multis[1:]):
+                out = _filter_multi(out, col, lab, xcols[i % len(xcols)], f"{key}_x{i + 1}")
+
         if search_cols:
-            q = d3.text_input("Search", "", key=f"{key}_search",
+            q = st.text_input("Search", "", key=f"{key}_search",
                               placeholder="paste several — comma / new line = match any")
             if q:
                 out = out[_str_contains_any(out, search_cols, q)]
@@ -1188,14 +1335,29 @@ def storage_kpi_strip(s_items, s_wos):
     blocked_items = s_items[s_items["is_blocked_pfs"].fillna(False)]
     total_blocked = len(blocked_items)
     pickable = open_items - total_blocked
+    ship_created = int(pd.to_numeric(s_items.get("order_created"), errors="coerce").fillna(0).sum()) if "order_created" in s_items.columns else 0
+    shipped = int(pd.to_numeric(s_items.get("shipped"), errors="coerce").fillna(0).sum()) if "shipped" in s_items.columns else 0
+    stowed = int(pd.to_numeric(s_items.get("storage"), errors="coerce").fillna(0).sum()) if "storage" in s_items.columns else 0
+    try:
+        created_rng = (
+            f"{s_items['created_at'].min().strftime('%Y-%m-%d')} → "
+            f"{s_items['created_at'].max().strftime('%Y-%m-%d')}"
+        )
+    except Exception:
+        created_rng = "—"
 
     st.markdown("#### 📦 Storage Volume")
+    st.caption(f"Created **{created_rng}** · pipeline qty is WO current units that have a shipment / departed / stowed.")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Storage WOs", f"{len(s_wos):,}")
     c2.metric("Storage Items", f"{len(s_items):,}", f"{open_items:,} Open · {closed_items:,} Closed")
     c3.metric("Original Qty", f"{total_orig:,}")
     c4.metric("Current Qty", f"{total_current:,}")
     c5.metric("Processed Qty", f"{total_processed:,}", f"{pct_processed:.1f}%")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Ship created", f"{ship_created:,}")
+    p2.metric("Shipped", f"{shipped:,}")
+    p3.metric("Stowed", f"{stowed:,}")
 
     st.markdown(f"#### 🚫 Storage Block Reasons (PFS) — {total_blocked:,} blocked · {pickable:,} pickable")
     reason_counts = blocked_items["block_reason_pfs"].dropna().value_counts()
@@ -1248,7 +1410,13 @@ def po_kpi_strip(p_items, p_wos):
 # ============================================================
 def storage_tab(df, wos):
     s_wos = wos[wos["source_category"] == "Storage"].copy()
-    s_items = df[df["source_category"] == "Storage"].copy()
+    s_items = _attach_listing_block_reasons(df[df["source_category"] == "Storage"].copy())
+    blocked = s_items
+    if "is_blocked_pfs" in s_items.columns:
+        blocked = s_items[s_items["is_blocked_pfs"].fillna(False)]
+    s_wos["listing_block"] = s_wos["work_order_number"].map(
+        _join_unique_per_wo(blocked, "listing_block")
+    ).fillna("")
 
     sel = st.session_state.get("selected_storage_wo")
     if sel and sel in s_wos["work_order_number"].values:
@@ -1257,7 +1425,11 @@ def storage_tab(df, wos):
 
     view = st.radio("View", ["📋 WO Level", "📄 Item Level"], horizontal=True,
                     key="storage_view", label_visibility="collapsed")
-    st.caption("Blocked detection: **PFS table** · 💡 Tick a row then press **Open WO** · drag-select cells + Ctrl+C to copy · cards react to the filters")
+    st.caption(
+        "Manual / Storage WOs (not tied to a PO). "
+        "WO list includes **created**, **sent to FBA**, **ship created / shipped / stowed**. "
+        "Blocked detection: **PFS table** · tick a row then **Open WO** · filters apply to the cards."
+    )
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
     else:
@@ -1267,33 +1439,51 @@ def storage_tab(df, wos):
 def storage_wo_view(s_wos, s_items):
     filtered = filter_panel(
         s_wos, "fp_swo", brand_col="top_brand", ship_col="earliest_ship",
-        reason_col="top_block_reason", blocked_kind="wo", status_kind="wo",
-        search_cols=["work_order_number", "top_brand", "top_block_reason"],
+        reason_col="listing_block", blocked_kind="wo", status_kind="wo",
+        search_cols=["work_order_number", "top_brand", "listing_block",
+                     "created_by", "last_edit_by", "top_wo_type", "warehouse"],
+        warehouse_col="warehouse",
+        created_col="wo_created_at" if "wo_created_at" in s_wos.columns else "created_at",
+        type_col="top_wo_type", pipeline=True,
     )
     filtered = filtered.sort_values("pfs_blocks", ascending=False)
     fitems = s_items[s_items["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(fitems, filtered)
-    if render_flag_guide_inline is not None and "top_block_reason" in filtered.columns:
-        render_flag_guide_inline(set(filtered["top_block_reason"].dropna()))
-    display = filtered[
-        ["work_order_number", "earliest_ship", "warehouse", "top_brand", "items", "open_items",
-         "pfs_blocks", "top_block_reason", "orig", "processed", "pct", "max_age"]
-    ].rename(columns={
-        "work_order_number": "WO", "warehouse": "WH", "top_brand": "Brand",
-        "items": "Items", "open_items": "Open", "pfs_blocks": "Blocked (PFS)",
-        "top_block_reason": "Top Reason", "orig": "Orig", "processed": "Processed",
-        "pct": "% Processed", "max_age": "Age (d)", "earliest_ship": "Ship By",
+    swo_keep = [
+        "work_order_number", "wo_created_at", "fba_sent_at", "earliest_ship", "last_edit_at",
+        "warehouse", "top_brand", "top_wo_type", "created_by", "last_edit_by",
+        "items", "open_items",
+        "pfs_blocks", "listing_block",
+        "orig", "current", "processed", "pct", "ordered", "shipped", "stowed", "max_age",
+    ]
+    display = filtered[[c for c in swo_keep if c in filtered.columns]].rename(columns={
+        "work_order_number": "WO", "wo_created_at": "Created", "fba_sent_at": "Sent to FBA",
+        "earliest_ship": "Ship By",
+        "last_edit_at": "Last Edit At",
+        "warehouse": "WH", "top_brand": "Brand", "top_wo_type": "WO Type",
+        "created_by": "Created By", "last_edit_by": "Last Edit By",
+        "items": "Items", "open_items": "Open",
+        "pfs_blocks": "Blocked (PFS)", "listing_block": "Listing block",
+        "orig": "Orig", "current": "Current", "processed": "Processed", "pct": "% Processed",
+        "ordered": "Ship Created", "shipped": "Shipped", "stowed": "Stowed", "max_age": "Age (d)",
     })
-    if flag_action is not None and "Top Reason" in display.columns:
-        display["What to do"] = display["Top Reason"].map(flag_action)
-    cols = column_picker(list(display.columns), key="cols_swo", required=["WO"])
+    default_swo = [c for c in [
+        "WO", "Created", "Sent to FBA", "Ship By", "WH", "Brand", "WO Type", "Items", "Open",
+        "Blocked (PFS)", "Listing block", "Orig", "Current", "Processed",
+        "% Processed", "Shipped", "Stowed", "Age (d)",
+    ] if c in display.columns]
+    cols = column_picker(list(display.columns), key="cols_swo_v3",
+                         default_labels=default_swo, required=["WO"])
     display = display[cols]
 
     table_toolbar(display, key="tb_swo", file_stem="storage_wos",
                   id_cols=["WO"], count_label=f"{len(display)} of {len(s_wos)} WOs")
     sel_wo = render_table(
-        display, key=_grid_key("grid_swo"), selectable=True,
-        pct_cols=["% Processed"], date_cols=["Ship By"], pin_cols=["WO"], height=500,
+        display, key=_grid_key("grid_swo_v3"), selectable=True,
+        pct_cols=["% Processed"],
+        date_cols=["Created", "Ship By"],
+        datetime_cols=["Sent to FBA", "Last Edit At"],
+        pin_cols=["WO"], height=560,
     )
     if sel_wo is not None:
         if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_swo", use_container_width=True):
@@ -1311,9 +1501,9 @@ def render_root_cause_detail(items, key):
     if blk.empty:
         return
     with st.expander(f"🔎 Root-cause detail ({len(blk)} blocked item(s))"):
-        base_cols = [c for c in ["work_order_item_id", "source_brand", "block_reason_pfs",
+        base_cols = [c for c in ["work_order_item_id", "source_brand", "listing_block",
                                  "marketplace", "marketplace_country", "pick_type",
-                                 "processing_status", "listing_id", "master_id"] if c in blk.columns]
+                                 "listing_id", "master_id"] if c in blk.columns]
         d = blk[base_cols].copy()
 
         det = fetch_wo_unpickable_detail()
@@ -1325,9 +1515,6 @@ def render_root_cause_detail(items, key):
             st.caption("Deeper unpickable detail (resolvable qty / exact reasons) is unavailable — "
                        "showing the block attributes from the main feed only.")
 
-        if flag_action is not None and "block_reason_pfs" in d.columns:
-            d["What to do"] = d["block_reason_pfs"].map(flag_action)
-
         if {"marketplace", "marketplace_country"}.issubset(d.columns):
             d["Marketplace"] = d.apply(
                 lambda r: f"{'' if pd.isna(r['marketplace']) else r['marketplace']}"
@@ -1338,14 +1525,19 @@ def render_root_cause_detail(items, key):
         elif "marketplace" in d.columns:
             d = d.rename(columns={"marketplace": "Marketplace"})
 
+        if "listing_block" in d.columns and "active_reasons" in d.columns:
+            lb = d["listing_block"].map(_clean_block_text)
+            ar = d["active_reasons"].map(_clean_block_text)
+            d["listing_block"] = ar.where(ar.astype(str).str.strip().ne(""), lb)
+            d = d.drop(columns=["active_reasons"])
         d = d.rename(columns={
-            "work_order_item_id": "WOI ID", "source_brand": "Brand", "block_reason_pfs": "Reason",
-            "pick_type": "Pick Type", "processing_status": "Raw Block Status",
-            "active_reasons": "Active Reasons", "resolvable_qty": "Resolvable Qty",
+            "work_order_item_id": "WOI ID", "source_brand": "Brand",
+            "listing_block": "Listing block", "pick_type": "Pick Type",
+            "resolvable_qty": "Resolvable Qty",
             "listing_id": "Listing", "master_id": "Master ID"})
-        order = [c for c in ["WOI ID", "Brand", "Reason", "Marketplace", "Active Reasons",
-                             "Resolvable Qty", "Raw Block Status", "Pick Type", "Listing",
-                             "Master ID", "What to do"] if c in d.columns]
+        order = [c for c in ["WOI ID", "Brand", "Listing block", "Marketplace",
+                             "Resolvable Qty", "Pick Type", "Listing",
+                             "Master ID"] if c in d.columns]
         st.dataframe(d[order], use_container_width=True, hide_index=True)
         st.caption("Active unpickable rows only (deleted_at IS NULL). Resolvable Qty is blank for "
                    "No-Inventory / Expired — nothing in the warehouse resolves those.")
@@ -1358,16 +1550,37 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
         _reset_selection()
         st.rerun()
     top2.markdown(f"### WO {wo_id} — Storage · {wo_row['warehouse']}")
-    st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
+    bits = [
+        f"Top brand: **{wo_row['top_brand']}**",
+        f"{wo_row['unique_listings']} unique listings",
+    ]
+    if wo_row.get("top_wo_type"):
+        bits.append(f"WO type **{wo_row['top_wo_type']}**")
+    if wo_row.get("created_by"):
+        bits.append(f"created by **{wo_row['created_by']}**")
+    created_s = _safe_date_str(wo_row.get("wo_created_at", wo_row.get("created_at")))
+    if created_s != "—":
+        bits.append(f"created **{created_s}**")
+    fba_s = _safe_date_str(wo_row.get("fba_sent_at"))
+    if fba_s != "—":
+        bits.append(f"sent to FBA **{fba_s}**")
+    ship_s = _safe_date_str(wo_row.get("earliest_ship"))
+    if ship_s != "—":
+        bits.append(f"ship by **{ship_s}**")
+    edited_s = _safe_date_str(wo_row.get("last_edit_at"))
+    if edited_s != "—":
+        bits.append(f"last edit **{edited_s}**")
+    st.caption(" · ".join(bits))
 
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Items", _safe_int(wo_row["items"]))
     c2.metric("Open", _safe_int(wo_row["open_items"]))
     c3.metric("Blocked (PFS)", _safe_int(wo_row["pfs_blocks"]))
     c4.metric("Orig Qty", f"{_safe_int(wo_row['orig']):,}")
     c5.metric("Processed", f"{_safe_int(wo_row['processed']):,}", f"{wo_row['pct']:.1f}%")
-    c6.metric("Stowed", f"{_safe_int(wo_row['stowed']):,}")
-    c7.metric("Max Age", f"{_safe_int(wo_row['max_age'])}d")
+    c6.metric("Shipped", f"{_safe_int(wo_row.get('shipped')):,}")
+    c7.metric("Stowed", f"{_safe_int(wo_row['stowed']):,}")
+    c8.metric("Max Age", f"{_safe_int(wo_row['max_age'])}d")
 
     items = s_items[s_items["work_order_number"] == wo_id].copy()
     render_po_destination_split(
@@ -1382,7 +1595,10 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
             ("WO Type", "woi_type"),
             ("Brand", "source_brand"),
             ("Status", "status_simple"),
-            ("Reason", "block_reason_pfs"),
+            ("Listing block", "listing_block"),
+            ("Marketplace", "marketplace"),
+            ("Pick Type", "pick_type"),
+            ("Created by", "created_by"),
         ],
         qty_col="current_request",
         qty_label="Min current",
@@ -1390,23 +1606,29 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     filtered = hide_unlisted(filtered, f"hl_swo_items_{wo_id}")
     render_root_cause_detail(filtered, f"rc_swo_{wo_id}")
     swo_cols = [
-        "work_order_item_id", "ship_by", "created_at", "last_edit_at", "master_id",
-        "listing_id", "woi_type", "finished_good_name", "source_brand",
-        "status_simple", "pick_type", "processing_status", "block_reason_pfs", "original_request",
+        "work_order_item_id", "ship_by", "wo_created_at", "created_at", "fba_sent_at",
+        "last_edit_at", "created_by", "last_edit_by",
+        "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
+        "marketplace", "status_simple", "pick_type",
+        "listing_block", "original_request",
         "current_request", "processed", "order_created", "shipped", "storage", "woi_processing_pct",
         "age_days_from_created", "days_overdue",
     ]
     display = filtered[[c for c in swo_cols if c in filtered.columns]].rename(columns={
-        "work_order_item_id": "WOI ID", "ship_by": "Ship By", "created_at": "Created At",
-        "last_edit_at": "Last Edit At", "master_id": "Master ID",
+        "work_order_item_id": "WOI ID", "ship_by": "Ship By",
+        "wo_created_at": "WO Created", "created_at": "Created At", "fba_sent_at": "Sent to FBA",
+        "last_edit_at": "Last Edit At", "created_by": "Created By", "last_edit_by": "Last Edit By",
+        "master_id": "Master ID",
         "listing_id": "Listing", "woi_type": "WO Type", "finished_good_name": "Item Name", "source_brand": "Brand",
-        "status_simple": "Status", "pick_type": "Pick Type", "processing_status": "Block Status",
-        "block_reason_pfs": "Reason", "original_request": "Orig", "current_request": "Current",
+        "marketplace": "Marketplace",
+        "status_simple": "Status", "pick_type": "Pick Type",
+        "listing_block": "Listing block",
+        "original_request": "Orig", "current_request": "Current",
         "processed": "Processed", "order_created": "Ship Created", "shipped": "Shipped",
         "storage": "Stowed", "woi_processing_pct": "%", "age_days_from_created": "Age (d)",
         "days_overdue": "Days Overdue",
     })
-    cols = column_picker(list(display.columns), key=f"cols_swo_items_{wo_id}", required=["WOI ID"])
+    cols = column_picker(list(display.columns), key=f"cols_swo_items_v2_{wo_id}", required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key=f"tb_swo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
@@ -1414,7 +1636,7 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
     render_table(
         display, key=_grid_key(f"grid_swo_items_{wo_id}"),
         pct_cols=["%"], date_cols=["Ship By"],
-        datetime_cols=["Created At", "Last Edit At"],
+        datetime_cols=["WO Created", "Created At", "Sent to FBA", "Last Edit At"],
         pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
@@ -1422,42 +1644,56 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
 def storage_item_view(s_items, s_wos):
     filtered = filter_panel(
         s_items, "fp_sit", brand_col="source_brand", ship_col="ship_by",
-        reason_col="block_reason_pfs", blocked_kind="item", status_kind="item",
-        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name", "work_order_number"],
+        reason_col="listing_block", blocked_kind="item", status_kind="item",
+        search_cols=["work_order_item_id", "listing_id", "source_brand", "finished_good_name",
+                     "work_order_number", "created_by", "master_id", "woi_type"],
+        warehouse_col="warehouse", created_col="created_at",
+        type_col="woi_type", pipeline=True,
+        extra_multis=[("Marketplace", "marketplace"), ("Pick Type", "pick_type"),
+                      ("Created by", "created_by")],
     )
     filtered = hide_unlisted(filtered, "hl_sit")
     fwos = s_wos[s_wos["work_order_number"].isin(filtered["work_order_number"])]
     storage_kpi_strip(filtered, fwos)
-    if render_flag_guide_inline is not None and "block_reason_pfs" in filtered.columns:
-        render_flag_guide_inline(set(filtered["block_reason_pfs"].dropna()))
-    display = filtered[
-        ["work_order_item_id", "ship_by", "created_at", "last_edit_at", "work_order_number",
-         "master_id", "listing_id", "finished_good_name", "source_brand",
-         "warehouse", "status_simple", "pick_type",
-         "processing_status", "block_reason_pfs", "original_request", "current_request",
-         "processed", "order_created", "shipped", "storage", "woi_processing_pct",
-         "age_days_from_created", "days_overdue"]
-    ].rename(columns={
-        "work_order_item_id": "WOI ID", "ship_by": "Ship By", "created_at": "Created At",
-        "last_edit_at": "Last Edit At", "work_order_number": "WO",
-        "master_id": "Master ID", "listing_id": "Listing", "finished_good_name": "Item Name",
-        "source_brand": "Brand", "warehouse": "WH", "status_simple": "Status", "pick_type": "Pick Type",
-        "processing_status": "Block Status", "block_reason_pfs": "Reason",
+    sit_keep = [
+        "work_order_item_id", "ship_by", "wo_created_at", "created_at", "fba_sent_at",
+        "last_edit_at", "created_by", "last_edit_by",
+        "work_order_number", "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
+        "marketplace", "warehouse", "status_simple", "pick_type",
+        "listing_block", "original_request", "current_request",
+        "processed", "order_created", "shipped", "storage", "woi_processing_pct",
+        "age_days_from_created", "days_overdue",
+    ]
+    display = filtered[[c for c in sit_keep if c in filtered.columns]].rename(columns={
+        "work_order_item_id": "WOI ID", "ship_by": "Ship By",
+        "wo_created_at": "WO Created", "created_at": "Created At", "fba_sent_at": "Sent to FBA",
+        "last_edit_at": "Last Edit At", "created_by": "Created By", "last_edit_by": "Last Edit By",
+        "work_order_number": "WO",
+        "master_id": "Master ID", "listing_id": "Listing", "woi_type": "WO Type",
+        "finished_good_name": "Item Name",
+        "source_brand": "Brand", "marketplace": "Marketplace",
+        "warehouse": "WH", "status_simple": "Status", "pick_type": "Pick Type",
+        "listing_block": "Listing block",
         "original_request": "Orig", "current_request": "Current", "processed": "Processed",
         "order_created": "Ship Created", "shipped": "Shipped", "storage": "Stowed",
         "woi_processing_pct": "%", "age_days_from_created": "Age (d)", "days_overdue": "Days Overdue",
     })
-    if flag_action is not None and "Reason" in display.columns:
-        display["What to do"] = display["Reason"].map(flag_action)
-    cols = column_picker(list(display.columns), key="cols_sit", required=["WOI ID"])
+    default_sit = [c for c in [
+        "WOI ID", "WO Created", "Created At", "Sent to FBA", "Ship By", "WO", "WO Type",
+        "Master ID", "Listing", "Item Name",
+        "Brand", "Marketplace", "WH", "Status", "Listing block",
+        "Orig", "Current", "Processed", "Ship Created", "Shipped", "Stowed", "%", "Age (d)",
+    ] if c in display.columns]
+    cols = column_picker(list(display.columns), key="cols_sit_v3",
+                         default_labels=default_sit, required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key="tb_sit", file_stem="storage_items",
                   id_cols=["WOI ID", "Listing", "WO", "Master ID"], count_label=f"{len(display):,} items")
     render_table(
-        display, key=_grid_key("grid_sit"),
+        display, key=_grid_key("grid_sit_v3"),
         pct_cols=["%"], date_cols=["Ship By"],
-        datetime_cols=["Created At", "Last Edit At"],
+        datetime_cols=["WO Created", "Created At", "Sent to FBA", "Last Edit At"],
         pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
@@ -1491,23 +1727,35 @@ def po_wo_view(p_wos, p_items):
     )
     fitems = p_items[p_items["work_order_number"].isin(filtered["work_order_number"])]
     po_kpi_strip(fitems, filtered)
-    display = filtered[
-        ["work_order_number", "po_number_raw", "earliest_ref_ship", "warehouse", "top_brand", "items", "open_items",
-         "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age"]
-    ].rename(columns={
-        "work_order_number": "WO", "po_number_raw": "PO #", "warehouse": "WH", "top_brand": "Brand",
+    pwo_keep = [
+        "work_order_number", "po_number_raw", "wo_created_at", "fba_sent_at",
+        "earliest_ref_ship", "warehouse", "top_brand", "items", "open_items",
+        "untouched", "orig", "processed", "pct", "worst_po_flag", "max_age",
+    ]
+    display = filtered[[c for c in pwo_keep if c in filtered.columns]].rename(columns={
+        "work_order_number": "WO", "po_number_raw": "PO #",
+        "wo_created_at": "Created", "fba_sent_at": "Sent to FBA",
+        "warehouse": "WH", "top_brand": "Brand",
         "items": "Items", "open_items": "Open", "untouched": "Untouched",
         "orig": "Orig", "processed": "Processed", "pct": "% Processed",
         "worst_po_flag": "Worst Flag", "max_age": "Age (d)", "earliest_ref_ship": "Ref Ship-by",
     })
-    cols = column_picker(list(display.columns), key="cols_pwo", required=["WO"])
+    default_pwo = [c for c in [
+        "WO", "PO #", "Created", "Sent to FBA", "Ref Ship-by", "WH", "Brand",
+        "Items", "Open", "Orig", "Processed", "% Processed", "Worst Flag", "Age (d)",
+    ] if c in display.columns]
+    cols = column_picker(list(display.columns), key="cols_pwo_v2",
+                         default_labels=default_pwo, required=["WO"])
     display = display[cols]
 
     table_toolbar(display, key="tb_pwo", file_stem="po_wos",
                   id_cols=["WO", "PO #"], count_label=f"{len(display)} of {len(p_wos)} WOs")
     sel_wo = render_table(
-        display, key=_grid_key("grid_pwo"), selectable=True,
-        pct_cols=["% Processed"], date_cols=["Ref Ship-by"], pin_cols=["WO"], height=500,
+        display, key=_grid_key("grid_pwo_v2"), selectable=True,
+        pct_cols=["% Processed"],
+        date_cols=["Created", "Ref Ship-by"],
+        datetime_cols=["Sent to FBA"],
+        pin_cols=["WO"], height=500,
     )
     if sel_wo is not None:
         if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_pwo", use_container_width=True):
@@ -1522,7 +1770,17 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         _reset_selection()
         st.rerun()
     top2.markdown(f"### WO {wo_id} — PO# {wo_row['po_number_raw']} · {wo_row['warehouse']} · {wo_row['worst_po_flag'] or ''}")
-    st.caption(f"Top brand: **{wo_row['top_brand']}** · {wo_row['unique_listings']} unique listings")
+    pwo_bits = [
+        f"Top brand: **{wo_row['top_brand']}**",
+        f"{wo_row['unique_listings']} unique listings",
+    ]
+    created_s = _safe_date_str(wo_row.get("wo_created_at", wo_row.get("created_at")))
+    if created_s != "—":
+        pwo_bits.append(f"created **{created_s}**")
+    fba_s = _safe_date_str(wo_row.get("fba_sent_at"))
+    if fba_s != "—":
+        pwo_bits.append(f"sent to FBA **{fba_s}**")
+    st.caption(" · ".join(pwo_bits))
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Items", _safe_int(wo_row["items"]))
@@ -1560,7 +1818,8 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
     if not filtered.empty and "po_days_past_ref_ship_by" in filtered.columns:
         filtered = filtered.sort_values("po_days_past_ref_ship_by", ascending=False)
     item_cols = [
-        "work_order_item_id", "po_ref_ship_by_date",
+        "work_order_item_id", "wo_created_at", "created_at", "fba_sent_at",
+        "po_ref_ship_by_date",
         "po_requested_delivery_date", "po_placed_at", "po_arrived_at",
         "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
         "status_simple", "po_block_flag",
@@ -1568,7 +1827,9 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         "woi_processing_pct", "po_days_past_ref_ship_by",
     ]
     display = filtered[[c for c in item_cols if c in filtered.columns]].rename(columns={
-        "work_order_item_id": "WOI ID", "po_ref_ship_by_date": "Ref Ship-by",
+        "work_order_item_id": "WOI ID",
+        "wo_created_at": "WO Created", "created_at": "Created At", "fba_sent_at": "Sent to FBA",
+        "po_ref_ship_by_date": "Ref Ship-by",
         "po_requested_delivery_date": "Req Delivery Date",
         "po_placed_at": "Placed At", "po_arrived_at": "Arrived At",
         "master_id": "Master ID",
@@ -1588,7 +1849,7 @@ def po_wo_drilldown(wo_id, p_items, p_wos):
         display, key=_grid_key(f"grid_pwo_items_{wo_id}"),
         pct_cols=["%"],
         date_cols=["Ref Ship-by", "Req Delivery Date"],
-        datetime_cols=["Placed At", "Arrived At"],
+        datetime_cols=["WO Created", "Created At", "Sent to FBA", "Placed At", "Arrived At"],
         pin_cols=["WOI ID"], color_rows=True, height=480,
     )
 
@@ -1605,6 +1866,7 @@ def po_item_view(p_items, p_wos):
     po_kpi_strip(filtered, fwos)
     pit_cols = [
         "work_order_item_id", "work_order_number", "po_number_raw",
+        "wo_created_at", "created_at", "fba_sent_at",
         "po_ref_ship_by_date", "po_requested_delivery_date",
         "po_placed_at", "po_arrived_at",
         "master_id", "listing_id", "woi_type", "finished_good_name", "source_brand",
@@ -1614,6 +1876,7 @@ def po_item_view(p_items, p_wos):
     ]
     display = filtered[[c for c in pit_cols if c in filtered.columns]].rename(columns={
         "work_order_item_id": "WOI ID", "work_order_number": "WO", "po_number_raw": "PO #",
+        "wo_created_at": "WO Created", "created_at": "Created At", "fba_sent_at": "Sent to FBA",
         "po_ref_ship_by_date": "Ref Ship-by",
         "po_requested_delivery_date": "Req Delivery Date", "po_placed_at": "Placed At",
         "po_arrived_at": "Arrived At",
@@ -1625,16 +1888,22 @@ def po_item_view(p_items, p_wos):
         "shipped": "Shipped", "storage": "Stowed", "woi_processing_pct": "%",
         "po_days_past_ref_ship_by": "Days Past",
     })
-    cols = column_picker(list(display.columns), key="cols_pit", required=["WOI ID"])
+    default_pit = [c for c in [
+        "WOI ID", "WO", "PO #", "WO Created", "Created At", "Sent to FBA",
+        "Ref Ship-by", "Item Name", "Brand", "WH", "Status", "Flag",
+        "Orig", "Current", "Processed", "%", "Days Past",
+    ] if c in display.columns]
+    cols = column_picker(list(display.columns), key="cols_pit_v2",
+                         default_labels=default_pit, required=["WOI ID"])
     display = display[cols]
 
     table_toolbar(display, key="tb_pit", file_stem="po_items",
                   id_cols=["WOI ID", "Listing", "WO", "PO #", "Master ID"], count_label=f"{len(display):,} items")
     render_table(
-        display, key=_grid_key("grid_pit"),
+        display, key=_grid_key("grid_pit_v2"),
         pct_cols=["%"],
         date_cols=["Ref Ship-by", "Req Delivery Date"],
-        datetime_cols=["Placed At", "Arrived At"],
+        datetime_cols=["WO Created", "Created At", "Sent to FBA", "Placed At", "Arrived At"],
         pin_cols=["WOI ID"], color_rows=True, height=600,
     )
 
@@ -3291,22 +3560,25 @@ def po_details_drilldown(po, po_df, po_pos, wo_df):
             ("order_created", "Ship Created"), ("shipped", "Shipped"), ("storage", "Stowed"),
             ("woi_processing_pct", "%"), ("po_ref_ship_by_date", "Ref Ship-by"),
             ("po_days_past_ref_ship_by", "Days Past"), ("days_overdue", "Days Overdue"),
-            ("created_at", "Created At"),
+            ("wo_created_at", "WO Created"), ("created_at", "Created At"),
+            ("fba_sent_at", "Sent to FBA"),
         ]
         pairs = [(r, l) for r, l in awo_pairs if r in awo.columns]
         awo_disp = awo[[r for r, _ in pairs]].rename(columns=dict(pairs))
-        awo_default = [l for l in ["WOI ID", "WO", "WO Type", "Master ID", "Listing", "Item Name", "Brand",
+        awo_default = [l for l in ["WOI ID", "WO", "WO Type", "WO Created", "Created At", "Sent to FBA",
+                                   "Master ID", "Listing", "Item Name", "Brand",
                                    "WH", "Status", "Flag", "Block Status", "Reason", "Orig",
                                    "Current", "Processed", "%", "Ref Ship-by", "Days Past",
                                    "Days Overdue"] if l in awo_disp.columns]
-        acols = column_picker(list(awo_disp.columns), key=f"cols_pod_awo_dest_{po}",
+        acols = column_picker(list(awo_disp.columns), key=f"cols_pod_awo_dates_{po}",
                               default_labels=awo_default, required=["WOI ID"])
         awo_disp = awo_disp[acols]
         table_toolbar(awo_disp, key=f"tb_pod_awo_{po}", file_stem=f"po_{po}_workorders",
                       id_cols=["WO", "WOI ID", "Listing", "Master ID"], count_label=f"{len(awo_disp)} WO item(s)")
         render_table(
             awo_disp, key=_grid_key(f"grid_pod_awo_{po}"),
-            pct_cols=["%"], date_cols=["Ref Ship-by"], datetime_cols=["Created At"],
+            pct_cols=["%"], date_cols=["Ref Ship-by"],
+            datetime_cols=["WO Created", "Created At", "Sent to FBA"],
             pin_cols=["WOI ID"], color_rows=True, height=340,
         )
 
