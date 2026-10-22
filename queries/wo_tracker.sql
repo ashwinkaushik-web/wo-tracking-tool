@@ -22,6 +22,12 @@ WITH woi_results AS (
     SELECT
         r.work_order_item_id,
         MIN(r.created_at) AS first_processed_at,
+        -- First Amazon FBA inbound shipment created for this WOI
+        -- (WOIR.shippable_type = 'Shipment' → STG_AMACZAR__SHIPMENTS).
+        MIN(CASE
+            WHEN r.shippable_type = 'Shipment'
+            THEN COALESCE(s.created_at, r.created_at)
+        END) AS fba_sent_at,
         SUM(CASE WHEN r.shippable_id IS NOT NULL OR tb.shippable_id IS NOT NULL
                  THEN r.quantity ELSE 0 END) AS shipment_created_quantity,
         SUM(CASE WHEN r.departed = TRUE THEN r.quantity ELSE 0 END) AS departed_quantity,
@@ -30,6 +36,8 @@ WITH woi_results AS (
     FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEM_RESULTS r
     LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__INVENTORY_LOCATIONS il ON il.id = r.inventory_location_id
     LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__TRANSIENT_BOXES tb ON tb.transient_carton_id = r.inventory_location_id
+    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__SHIPMENTS s
+      ON r.shippable_type = 'Shipment' AND s.id = r.shippable_id
     GROUP BY r.work_order_item_id
 ),
 pfs_agg AS (
@@ -97,12 +105,14 @@ SELECT
         ELSE NULL
     END                                           AS block_reason_pfs,
     pfs.pick_type                                 AS pick_type,
+    pfs.component_block_reasons                   AS component_block_reasons,
     woi.original_quantity                         AS original_request,
     woi.quantity                                  AS current_request,
     woi.processed_quantity                        AS processed,
     COALESCE(res.shipment_created_quantity, 0)    AS order_created,
     COALESCE(res.departed_quantity, 0)            AS shipped,
     COALESCE(res.stowed_quantity, 0)              AS storage,
+    res.fba_sent_at                               AS fba_sent_at,
     ROUND(woi.processed_quantity * 100.0 / NULLIF(woi.original_quantity, 0), 1) AS woi_processing_pct,
     wagg.wo_total_wois,
     wagg.wo_wois_open,
@@ -161,6 +171,7 @@ SELECT
     woi.updated_at                                AS last_edit_at,
     eu.username                                   AS last_edit_by,
     woi.created_at                                AS created_at,
+    wo.created_at                                 AS wo_created_at,
     CASE WHEN cu.username = 'amaczar_app' THEN 'Shelf' ELSE cu.username END AS created_by
 FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
 JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS            wo ON wo.id = woi.work_order_id
