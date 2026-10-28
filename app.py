@@ -4083,21 +4083,47 @@ def _overview_po_context(pos, *, item_n=None):
     return f"POs with no work order: {shown}{extra}"
 
 
-def _overview_lookup_raise(key, qty_frame, context):
-    """Primary Overview action: Catalogue Lookup with qty / PO / ship-by attached."""
-    if st.button(
-        "🔎 Look up listings & raise WO",
-        key=key,
-        type="primary",
-        use_container_width=True,
-        help="Opens Catalogue Lookup with these SKUs, qty, PO # and ship-by. "
-             "Edit the Shelf grid there, then Slack. Does not create a WO in Shelf.",
-    ):
-        if qty_frame is None or getattr(qty_frame, "empty", True):
-            st.warning("No outstanding line items on the selected rows to look up.")
-            return
-        ids = _catalog_ids_for_lookup(qty_frame)
-        _jump_to_catalog_lookup(ids, context=context, pack=True, qty_frame=qty_frame)
+def _overview_lookup_or_slack(key, qty_frame, context, *, slack_df=None,
+                              slack_filename="overview_selected.csv"):
+    """Two Overview actions on ticked rows: Catalogue Lookup, or Slack a message.
+
+    Lookup carries qty / PO / ship-by into Catalogue Lookup. Slack opens the
+    compose dialog with the ticked lines attached as CSV. Neither creates a WO.
+    """
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "🔎 Look up listings",
+            key=f"{key}_cat",
+            type="primary",
+            use_container_width=True,
+            help="Opens Catalogue Lookup with these SKUs, qty, PO # and ship-by. "
+                 "Edit the Shelf grid there if needed. Does not create a WO in Shelf.",
+        ):
+            if qty_frame is None or getattr(qty_frame, "empty", True):
+                st.warning("No outstanding line items on the selected rows to look up.")
+            else:
+                ids = _catalog_ids_for_lookup(qty_frame)
+                _jump_to_catalog_lookup(ids, context=context, pack=True, qty_frame=qty_frame)
+    with c2:
+        send = slack_df if slack_df is not None and not getattr(slack_df, "empty", True) else qty_frame
+        if slack_send_panel_button is None:
+            st.caption("Slack is not configured.")
+        elif send is None or getattr(send, "empty", True):
+            st.caption("Nothing to Slack — tick a row first.")
+        else:
+            n = len(send)
+            slack_send_panel_button(
+                f"{key}_slk",
+                df=send,
+                filename=slack_filename,
+                note=(
+                    f"{context}\n{n:,} line(s) attached from the WO Tracking Tool.\n"
+                    "Message only — does not create a WO in Shelf."
+                ),
+                label="💬 Slack message",
+                use_container_width=True,
+            )
 
 
 def _overview_send_wo_request(key, lines, *, filename):
@@ -4361,9 +4387,9 @@ def overview_tab(df, wos):
     st.markdown("#### 🚨 Needs attention")
     st.caption(
         "**1.** See POs / items without a work order. **2.** Tick one or more rows. "
-        "**3.** Look up listings — qty, PO # and ship-by come with them. "
-        "**4.** Edit the Shelf grid if needed. **5.** Slack the request file. "
-        "That does **not** create a WO in Shelf. "
+        "**3.** Look up listings, or Slack a message about those rows. "
+        "Lookup carries qty, PO # and ship-by — edit the Shelf grid if needed, then Slack the request file from Catalogue Lookup. "
+        "Neither creates a WO in Shelf. "
         f"Each table shows the top {OV_MAX_ROWS}. Use **Advanced filters** to narrow."
     )
     if render_flag_guide is not None:
@@ -4460,8 +4486,9 @@ def overview_tab(df, wos):
                     f"{n_tick:,} PO(s) ticked · {len(pos):,} will be looked up"
                     + ("" if n_tick else " (all visible rows).")
                 )
-                _overview_lookup_raise(
-                    "jump_nowo_cat", lines, _overview_po_context(pos),
+                _overview_lookup_or_slack(
+                    "jump_nowo", lines, _overview_po_context(pos),
+                    slack_df=picked, slack_filename="pos_without_wo_selected.csv",
                 )
                 with st.expander("More — download / chase"):
                     m1, m2 = st.columns(2)
@@ -4495,8 +4522,8 @@ def overview_tab(df, wos):
     ):
         st.caption(
             "One row per PO × SKU. Default view is genuine gaps and partial coverage "
-            "with outstanding qty. Tick rows, look up listings (qty and PO details come "
-            "with them), edit, then Slack. Does not create a WO in Shelf."
+            "with outstanding qty. Tick rows, then look up listings or Slack a message. "
+            "Does not create a WO in Shelf."
         )
         if item_gap is None:
             st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
@@ -4594,10 +4621,11 @@ def overview_tab(df, wos):
                     f"{n_tick:,} item(s) ticked · {n_lines:,} will be looked up"
                     + ("" if n_tick else " (all visible rows).")
                 )
-                _overview_lookup_raise(
-                    "jump_item_gap_cat",
+                _overview_lookup_or_slack(
+                    "jump_item_gap",
                     gap_lines,
                     _overview_po_context(po_nums, item_n=n_lines),
+                    slack_df=picked, slack_filename="po_items_without_full_wo_selected.csv",
                 )
                 with st.expander("More — download / chase"):
                     g1, g2 = st.columns(2)
@@ -4806,8 +4834,9 @@ def catalog_lookup_tab():
     st.markdown("#### 🔎 Catalogue Lookup — search by ID")
     st.caption(
         "Paste SKUs, Listing IDs, ASINs, FNSKUs, Master IDs, MPNs, UPCs or EANs. "
-        "From Overview, tick POs or items without WOs and **Look up listings & raise WO** — "
-        "qty, PO # and ship-by come with them. Edit the Shelf grid below, then Slack. "
+        "From Overview, tick POs or items without WOs and **Look up listings** — "
+        "qty, PO # and ship-by come with them — or **Slack message** those rows. "
+        "Edit the Shelf grid below, then Slack. "
         "That does **not** create a WO in Shelf until someone uploads the CSV."
     )
 
