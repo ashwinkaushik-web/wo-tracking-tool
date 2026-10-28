@@ -830,24 +830,25 @@ def _row_style(row):
 
 _COPY_TABLE_TEMPLATE = """
 <div style="font-family:sans-serif;">
-  <button id="__BID__" style="width:100%;background:#5B4DF0;color:#fff;border:none;border-radius:6px;padding:8px 10px;font-size:13px;font-weight:600;cursor:pointer;">📋 Copy table</button>
+  <button id="__BID__" style="width:100%;background:#5B4DF0;color:#fff;border:none;border-radius:6px;padding:8px 10px;font-size:13px;font-weight:600;cursor:pointer;">__LABEL__</button>
   <textarea id="__BID___data" style="position:absolute;left:-9999px;top:-9999px;">__DATA__</textarea>
   <script>
   (function(){
     var b = document.getElementById("__BID__");
     var t = document.getElementById("__BID___data");
     if(!b) return;
+    var label = "__LABEL__";
     b.onclick = function(){
       t.select(); t.setSelectionRange(0, 999999999);
       try {
         navigator.clipboard.writeText(t.value).then(function(){
           b.textContent = "✅ Copied __NOTE__";
-          setTimeout(function(){ b.textContent = "📋 Copy table"; }, 2500);
+          setTimeout(function(){ b.textContent = label; }, 2500);
         });
       } catch(e) {
         document.execCommand("copy");
         b.textContent = "✅ Copied";
-        setTimeout(function(){ b.textContent = "📋 Copy table"; }, 2500);
+        setTimeout(function(){ b.textContent = label; }, 2500);
       }
     };
   })();
@@ -856,7 +857,7 @@ _COPY_TABLE_TEMPLATE = """
 """
 
 
-def copy_table_button(display, key):
+def copy_table_button(display, key, label="📋 Copy table"):
     """One-click copy of the whole (visible) table as TSV with headers. Capped 5,000 rows."""
     cap = 5000
     d = display.head(cap)
@@ -868,6 +869,7 @@ def copy_table_button(display, key):
         .replace("__BID__", bid)
         .replace("__DATA__", _html.escape(tsv))
         .replace("__NOTE__", note)
+        .replace("__LABEL__", _html.escape(label))
     )
     components.html(html_out, height=46)
 
@@ -1254,6 +1256,70 @@ def render_table(display, *, key, selectable=False, select_col="WO", pct_cols=()
     return None
 
 
+def _ticked_line_actions(sel, *, key, lookup_frame=None, wo_session_key=None,
+                         slack_filename="wo_tracker_selected.csv"):
+    """Buttons under a multi-select table: Open WO, Catalogue Lookup, Slack, copy.
+
+    Tick any rows, then act on just those lines. Empty selection does nothing.
+    Does not create a WO in Shelf.
+    """
+    n = 0 if sel is None else len(sel)
+    if n == 0:
+        st.caption(
+            "Tick one or more rows, then Slack / look up listings / copy. "
+            "Or drag-select cells and press Ctrl+C."
+        )
+        return
+    wos = []
+    if sel is not None and "WO" in sel.columns:
+        wos = sorted({_to_wo(v) for v in sel["WO"].tolist() if pd.notna(v)})
+    n_btn = 4 if slack_send_panel_button is not None else 3
+    cols = st.columns(n_btn)
+    with cols[0]:
+        if wo_session_key and len(wos) == 1:
+            if st.button(f"➡ Open WO {wos[0]}", type="primary", key=f"{key}_open",
+                         use_container_width=True):
+                st.session_state[wo_session_key] = wos[0]
+                st.rerun()
+        elif wo_session_key and len(wos) > 1:
+            st.caption(f"{n} row(s) · {len(wos)} WOs — tick one WO to open it")
+        else:
+            st.caption(f"{n} row(s) ticked")
+    with cols[1]:
+        if st.button("🔎 Look up listings", key=f"{key}_cat", use_container_width=True,
+                     help="Open Catalogue Lookup with listings / master IDs on the ticked rows."):
+            frame = lookup_frame if lookup_frame is not None and not getattr(lookup_frame, "empty", True) else sel
+            ids = _catalog_ids_for_lookup(frame)
+            if not ids:
+                ids = _ids_from_frame(frame, ["listing_id", "Listing", "master_id", "Master ID", "asin", "ASIN"])
+            ctx = f"{n} ticked Manual WO line(s)"
+            if wos:
+                shown = ", ".join(str(w) for w in wos[:6])
+                extra = f" +{len(wos) - 6}" if len(wos) > 6 else ""
+                ctx = f"{n} ticked line(s) from WO {shown}{extra}"
+            _jump_to_catalog_lookup(ids, context=ctx, qty_frame=frame)
+    col_i = 2
+    if slack_send_panel_button is not None:
+        with cols[col_i]:
+            slack_send_panel_button(
+                f"{key}_slk",
+                df=sel,
+                filename=slack_filename,
+                note=(
+                    f"{n} ticked line(s) from the WO Tracking Tool"
+                    + (f" (WO {', '.join(str(w) for w in wos[:8])}"
+                       + (f" +{len(wos) - 8}" if len(wos) > 8 else "")
+                       + ")" if wos else "")
+                    + ".\nRequest / share only — does not create a WO in Shelf."
+                ),
+                label="📤 Slack ticked",
+                use_container_width=True,
+            )
+        col_i += 1
+    with cols[col_i]:
+        copy_table_button(sel, key=f"{key}_copy", label="📋 Copy ticked")
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -1488,7 +1554,8 @@ def storage_tab(df, wos):
     st.caption(
         "Manual / Storage WOs (not tied to a PO). "
         "WO list includes **created**, **sent to FBA**, **ship created / shipped / stowed**. "
-        "Blocked detection: **PFS table** · tick a row then **Open WO** · filters apply to the cards."
+        "Blocked detection: **PFS table** · tick any rows to Slack / look up / copy, "
+        "or tick one WO and **Open WO** · filters apply to the cards."
     )
     if view == "📋 WO Level":
         storage_wo_view(s_wos, s_items)
@@ -1539,17 +1606,24 @@ def storage_wo_view(s_wos, s_items):
 
     table_toolbar(display, key="tb_swo", file_stem="storage_wos",
                   id_cols=["WO"], count_label=f"{len(display)} of {len(s_wos)} WOs")
-    sel_wo = render_table(
-        display, key=_grid_key("grid_swo_v4"), selectable=True,
+    sel = render_table(
+        display, key=_grid_key("grid_swo_v5"), multi_select=True,
+        slack_label_cols=["WO", "Brand", "WO Type"],
+        slack_filename="storage_wos.csv",
         numpct_cols=["% Processed"],
         date_cols=["Created", "Sent to FBA", "Ship By"],
         datetime_cols=["Last Edit At"],
         pin_cols=["WO"], height=560,
     )
-    if sel_wo is not None:
-        if st.button(f"➡ Open WO {_to_wo(sel_wo)}", type="primary", key="open_swo", use_container_width=True):
-            st.session_state.selected_storage_wo = _to_wo(sel_wo)
-            st.rerun()
+    picked_wos = []
+    if sel is not None and not sel.empty and "WO" in sel.columns:
+        picked_wos = [_to_wo(v) for v in sel["WO"].tolist() if pd.notna(v)]
+    lookup_items = fitems[fitems["work_order_number"].isin(picked_wos)] if picked_wos else None
+    _ticked_line_actions(
+        sel, key="swo_tick", lookup_frame=lookup_items,
+        wo_session_key="selected_storage_wo",
+        slack_filename="storage_wos_selected.csv",
+    )
 
 
 def render_root_cause_detail(items, key):
@@ -1697,11 +1771,24 @@ def storage_wo_drilldown(wo_id, s_items, s_wos):
 
     table_toolbar(display, key=f"tb_swo_items_{wo_id}", file_stem=f"wo_{wo_id}_items",
                   id_cols=["WOI ID", "Listing", "Master ID"], count_label=f"{len(display)} items")
-    render_table(
-        display, key=_grid_key(f"grid_swo_items_{wo_id}"),
+    sel = render_table(
+        display, key=_grid_key(f"grid_swo_items_v2_{wo_id}"),
+        multi_select=True,
+        slack_label_cols=["WOI ID", "Listing", "Item Name"],
+        slack_filename=f"wo_{wo_id}_items.csv",
         numpct_cols=["%"], date_cols=["Ship By", "WO Created", "Created At", "Sent to FBA"],
         datetime_cols=["Last Edit At"],
         pin_cols=["WOI ID"], color_rows=True, height=480,
+    )
+    picked_ids = []
+    if sel is not None and not sel.empty and "WOI ID" in sel.columns:
+        picked_ids = sel["WOI ID"].tolist()
+    lookup_items = None
+    if picked_ids and "work_order_item_id" in filtered.columns:
+        lookup_items = filtered[filtered["work_order_item_id"].isin(picked_ids)]
+    _ticked_line_actions(
+        sel, key=f"swo_items_tick_{wo_id}", lookup_frame=lookup_items,
+        slack_filename=f"wo_{wo_id}_items_selected.csv",
     )
 
 
@@ -1756,11 +1843,24 @@ def storage_item_view(s_items, s_wos):
 
     table_toolbar(display, key="tb_sit", file_stem="storage_items",
                   id_cols=["WOI ID", "Listing", "WO", "Master ID"], count_label=f"{len(display):,} items")
-    render_table(
-        display, key=_grid_key("grid_sit_v4"),
+    sel = render_table(
+        display, key=_grid_key("grid_sit_v5"), multi_select=True,
+        slack_label_cols=["WOI ID", "WO", "Listing"],
+        slack_filename="storage_items.csv",
         numpct_cols=["%"], date_cols=["Ship By", "WO Created", "Created At", "Sent to FBA"],
         datetime_cols=["Last Edit At"],
         pin_cols=["WOI ID"], color_rows=True, height=600,
+    )
+    picked_ids = []
+    if sel is not None and not sel.empty and "WOI ID" in sel.columns:
+        picked_ids = sel["WOI ID"].tolist()
+    lookup_items = None
+    if picked_ids and "work_order_item_id" in filtered.columns:
+        lookup_items = filtered[filtered["work_order_item_id"].isin(picked_ids)]
+    _ticked_line_actions(
+        sel, key="sit_tick", lookup_frame=lookup_items,
+        wo_session_key="selected_storage_wo",
+        slack_filename="storage_items_selected.csv",
     )
 
 
@@ -3983,21 +4083,47 @@ def _overview_po_context(pos, *, item_n=None):
     return f"POs with no work order: {shown}{extra}"
 
 
-def _overview_lookup_raise(key, qty_frame, context):
-    """Primary Overview action: Catalogue Lookup with qty / PO / ship-by attached."""
-    if st.button(
-        "🔎 Look up listings & raise WO",
-        key=key,
-        type="primary",
-        use_container_width=True,
-        help="Opens Catalogue Lookup with these SKUs, qty, PO # and ship-by. "
-             "Edit the Shelf grid there, then Slack. Does not create a WO in Shelf.",
-    ):
-        if qty_frame is None or getattr(qty_frame, "empty", True):
-            st.warning("No outstanding line items on the selected rows to look up.")
-            return
-        ids = _catalog_ids_for_lookup(qty_frame)
-        _jump_to_catalog_lookup(ids, context=context, pack=True, qty_frame=qty_frame)
+def _overview_lookup_or_slack(key, qty_frame, context, *, slack_df=None,
+                              slack_filename="overview_selected.csv"):
+    """Two Overview actions on ticked rows: Catalogue Lookup, or Slack a message.
+
+    Lookup carries qty / PO / ship-by into Catalogue Lookup. Slack opens the
+    compose dialog with the ticked lines attached as CSV. Neither creates a WO.
+    """
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "🔎 Look up listings",
+            key=f"{key}_cat",
+            type="primary",
+            use_container_width=True,
+            help="Opens Catalogue Lookup with these SKUs, qty, PO # and ship-by. "
+                 "Edit the Shelf grid there if needed. Does not create a WO in Shelf.",
+        ):
+            if qty_frame is None or getattr(qty_frame, "empty", True):
+                st.warning("No outstanding line items on the selected rows to look up.")
+            else:
+                ids = _catalog_ids_for_lookup(qty_frame)
+                _jump_to_catalog_lookup(ids, context=context, pack=True, qty_frame=qty_frame)
+    with c2:
+        send = slack_df if slack_df is not None and not getattr(slack_df, "empty", True) else qty_frame
+        if slack_send_panel_button is None:
+            st.caption("Slack is not configured.")
+        elif send is None or getattr(send, "empty", True):
+            st.caption("Nothing to Slack — tick a row first.")
+        else:
+            n = len(send)
+            slack_send_panel_button(
+                f"{key}_slk",
+                df=send,
+                filename=slack_filename,
+                note=(
+                    f"{context}\n{n:,} line(s) attached from the WO Tracking Tool.\n"
+                    "Message only — does not create a WO in Shelf."
+                ),
+                label="💬 Slack message",
+                use_container_width=True,
+            )
 
 
 def _overview_send_wo_request(key, lines, *, filename):
@@ -4261,9 +4387,9 @@ def overview_tab(df, wos):
     st.markdown("#### 🚨 Needs attention")
     st.caption(
         "**1.** See POs / items without a work order. **2.** Tick one or more rows. "
-        "**3.** Look up listings — qty, PO # and ship-by come with them. "
-        "**4.** Edit the Shelf grid if needed. **5.** Slack the request file. "
-        "That does **not** create a WO in Shelf. "
+        "**3.** Look up listings, or Slack a message about those rows. "
+        "Lookup carries qty, PO # and ship-by — edit the Shelf grid if needed, then Slack the request file from Catalogue Lookup. "
+        "Neither creates a WO in Shelf. "
         f"Each table shows the top {OV_MAX_ROWS}. Use **Advanced filters** to narrow."
     )
     if render_flag_guide is not None:
@@ -4360,8 +4486,9 @@ def overview_tab(df, wos):
                     f"{n_tick:,} PO(s) ticked · {len(pos):,} will be looked up"
                     + ("" if n_tick else " (all visible rows).")
                 )
-                _overview_lookup_raise(
-                    "jump_nowo_cat", lines, _overview_po_context(pos),
+                _overview_lookup_or_slack(
+                    "jump_nowo", lines, _overview_po_context(pos),
+                    slack_df=picked, slack_filename="pos_without_wo_selected.csv",
                 )
                 with st.expander("More — download / chase"):
                     m1, m2 = st.columns(2)
@@ -4395,8 +4522,8 @@ def overview_tab(df, wos):
     ):
         st.caption(
             "One row per PO × SKU. Default view is genuine gaps and partial coverage "
-            "with outstanding qty. Tick rows, look up listings (qty and PO details come "
-            "with them), edit, then Slack. Does not create a WO in Shelf."
+            "with outstanding qty. Tick rows, then look up listings or Slack a message. "
+            "Does not create a WO in Shelf."
         )
         if item_gap is None:
             st.caption("Item-level WO gap data unavailable (couldn't load queries/po_item_wo_gap.sql).")
@@ -4494,10 +4621,11 @@ def overview_tab(df, wos):
                     f"{n_tick:,} item(s) ticked · {n_lines:,} will be looked up"
                     + ("" if n_tick else " (all visible rows).")
                 )
-                _overview_lookup_raise(
-                    "jump_item_gap_cat",
+                _overview_lookup_or_slack(
+                    "jump_item_gap",
                     gap_lines,
                     _overview_po_context(po_nums, item_n=n_lines),
+                    slack_df=picked, slack_filename="po_items_without_full_wo_selected.csv",
                 )
                 with st.expander("More — download / chase"):
                     g1, g2 = st.columns(2)
@@ -4706,8 +4834,9 @@ def catalog_lookup_tab():
     st.markdown("#### 🔎 Catalogue Lookup — search by ID")
     st.caption(
         "Paste SKUs, Listing IDs, ASINs, FNSKUs, Master IDs, MPNs, UPCs or EANs. "
-        "From Overview, tick POs or items without WOs and **Look up listings & raise WO** — "
-        "qty, PO # and ship-by come with them. Edit the Shelf grid below, then Slack. "
+        "From Overview, tick POs or items without WOs and **Look up listings** — "
+        "qty, PO # and ship-by come with them — or **Slack message** those rows. "
+        "Edit the Shelf grid below, then Slack. "
         "That does **not** create a WO in Shelf until someone uploads the CSV."
     )
 
