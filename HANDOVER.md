@@ -55,7 +55,7 @@ pandas/numpy/pyarrow ranges) — see §9 for why. Don't loosen these casually.
 ## 4. File map
 
 ```
-app.py                       Main Streamlit app (~2.2k lines). Nav, Snowflake fetch,
+app.py                       Main Streamlit app (~4.7k lines). Nav, Snowflake fetch,
                              all tabs/panels, table renderer, drill-downs.
 flag_guide.py                Curated flag → meaning/root-cause/action reference
                              (Information Station-grounded). render_flag_guide,
@@ -67,7 +67,7 @@ slack_messaging/             In-app Slack messenger feature package
 queries/
   wo_tracker.sql             MAIN WO-items feed (base of the app).
   po_tracker.sql             PO Details source (report table).
-  po_wo_agg.sql              Per-PO rollup of linked WOs (no-WO detection).
+  po_wo_agg.sql              Per-PO rollup of linked WOs (no-WO detection + dest qty).
   po_item_wo_gap.sql         Item-level (PO × Master ID) WO coverage gaps.
   wo_unpickable_detail.sql   Per-WOI active block reasons + resolvable qty (root-cause).
 scripts/
@@ -91,7 +91,7 @@ user `SVC_PC_LOOKUP_TOOL__PROD__USER` (**key-pair auth**; private key is a secre
 
 ### WO feed — `queries/wo_tracker.sql`
 Base: `ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS` (woi), joined to:
-- `STG_AMACZAR__WORK_ORDERS` (wo), `__WORK_ORDER_ITEM_TYPES`, `__WORK_ORDER_ITEM_RESULTS`
+- `STG_AMACZAR__WORK_ORDERS` (wo), `__WORK_ORDER_ITEM_TYPES`, `__WORK_ORDER_ITEM_RESULTS`, `__SHIPMENTS`
 - **Block status (PFS):** `PATTERN_DB.OPERATIONS.PICK_FROM_STOW_WORK_ORDER_ITEMS`
   (drives `processing_status` / block reasons; different schema — note `PATTERN_DB`).
 - Dims: `__LISTINGS`, `__ITEMS`, `__PARTNERS`, `__CATALOG_MARKETPLACES`, `__WAREHOUSES`,
@@ -237,7 +237,15 @@ bot_token = "xoxb-..."               # SECRET. Scopes: chat:write, im:write, fil
 
 Raise-WO is one loop: tick no-WO POs/items → Catalogue Lookup (qty, PO #, ship-by come with them) → edit Shelf grid → Slack. Default view is genuine gap / partial coverage with outstanding qty. Overview no longer Slacks a WO file or adds a raise-WO pack from those panels (that skipped edit). Download / chase sit under **More**.
 
-PO Overview / Details also split **current ordered** units by destination: FBA, FBB, FBM, leftover **To stow** (blank fulfillment method), plus Other (ZFS/OCT). Cloud still serves `main` until merge + reboot (`c624549`).
+PO Details / Associated WOs / WO drilldowns split **current ordered** by **WO item type** (not PO fulfillment, which is usually blank): named columns FBA, FBB, FBM, ZFS, OCT; **To stow** = current ordered minus *all* WO current qty (WFS/Coubang/FBT/etc. still subtract so they do not inflate Stow). Tables show a **Split** (`20% FBA · 20% FBM · 60% stow`) and amber-highlight **100% stow**. Overview tiles do **not** show dest. Associated WOs show **WO Type**.
+
+Catalogue Lookup defaults to **Pattern UK** and **Pattern EU** sellers only (uncheck to see `Pattern.` / US and others). The Slack “pick a line” string includes **Region** (UK/DE/ES/…) plus Marketplace.
+
+Manual/Storage (and PO WO) tables show **Created** = `WORK_ORDERS.created_at` and **Sent to FBA** = first FBA **departure** (`SHIPMENTS.departed_at`, date only). Blank until units actually leave, and blank on non-FBA types. **Shipped + Stowed + In-process = Processed** (capped per WOI). Stowed is emptied-to-stow / failed inbound, not carton teardown. **% Processed** = Processed ÷ Current, not capped at 100.
+
+**Refresh now** must `.clear()` the `@st.cache_data` wrappers (`_cached_po_wo_agg`, `_cached_po_dest_agg`, `_cached_woi_types`) — `fetch_po_wo_agg` itself is not cached (AttributeError if you `.clear()` it).
+
+Deploy **`app.py` + `queries/po_wo_agg.sql` + `queries/wo_tracker.sql` together**, then reboot. `catalog_lookup.sql` does not need a change for the seller/region work. Cloud still serves `main` until merge + reboot.
 
 Earlier on this branch (`5a9c1b6`): no-WO first, orig/current/received, hide zeros, item-level panel, advanced filters, daily-PO vs 30-min WO stamps, Requests grid that doesn’t remount. Overview no longer shows blocked / overdue / issues / aging / over-receipts.
 

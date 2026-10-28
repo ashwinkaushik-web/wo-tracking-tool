@@ -18,18 +18,51 @@
 --   WOs fall back to the catalog join as before.
 -- =====================================================================
 
-WITH woi_results AS (
+WITH scoped_woi AS (
+    -- Restrict WOIR/SHIPMENTS joins to YTD Northampton/Wroclaw WOIs.
+    -- Joining the full 20M-row results table hangs Streamlit Cloud.
+    SELECT woi.id
+    FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
+    JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS wo ON wo.id = woi.work_order_id
+    JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WAREHOUSES wh ON wh.id = wo.warehouse_id
+    WHERE woi.deleted_at IS NULL
+      AND wo.deleted_at IS NULL
+      AND woi.for_accepted_overage = FALSE
+      AND woi.created_at >= DATE_TRUNC('year', CURRENT_DATE)
+      AND wh.id IN (138, 146)
+),
+woi_results AS (
+    -- WOIR is a sequential log (pallet → carton → shipment), not a partition of
+    -- units. Do not treat deleted transient locations as stow (that's carton
+    -- teardown). Departure = shippable.departed_at, not WOIR.departed.
+    -- Sent to FBA = first FBA SHIPMENTS.departed_at (units actually left).
     SELECT
         r.work_order_item_id,
         MIN(r.created_at) AS first_processed_at,
+        MIN(s.departed_at)::DATE AS fba_sent_at,
         SUM(CASE WHEN r.shippable_id IS NOT NULL OR tb.shippable_id IS NOT NULL
                  THEN r.quantity ELSE 0 END) AS shipment_created_quantity,
-        SUM(CASE WHEN r.departed = TRUE THEN r.quantity ELSE 0 END) AS departed_quantity,
-        SUM(CASE WHEN il.deleted_at IS NOT NULL AND r.departed = FALSE
-                 THEN r.quantity ELSE 0 END) AS stowed_quantity
+        SUM(CASE
+            WHEN COALESCE(s.departed_at, fss.departed_at, ipd.departed_at) IS NOT NULL
+            THEN r.quantity ELSE 0
+        END) AS departed_quantity,
+        SUM(CASE
+            WHEN tb.emptied_by_stow_at IS NOT NULL
+              OR (r.failure_reason IS NOT NULL
+                  AND r.shippable_id IS NULL
+                  AND COALESCE(r.departed, FALSE) = FALSE)
+            THEN r.quantity ELSE 0
+        END) AS stowed_quantity
     FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEM_RESULTS r
-    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__INVENTORY_LOCATIONS il ON il.id = r.inventory_location_id
-    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__TRANSIENT_BOXES tb ON tb.transient_carton_id = r.inventory_location_id
+    JOIN scoped_woi sw ON sw.id = r.work_order_item_id
+    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__TRANSIENT_BOXES tb
+      ON tb.transient_carton_id = r.inventory_location_id
+    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__SHIPMENTS s
+      ON r.shippable_type = 'Shipment' AND s.id = r.shippable_id
+    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__FULFILLMENT_SERVICE_SHIPMENTS fss
+      ON r.shippable_type = 'FulfillmentServiceShipment' AND fss.id = r.shippable_id
+    LEFT JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__INVENTORY_PLACEMENT_DESTINATIONS ipd
+      ON r.shippable_type = 'InventoryPlacementDestination' AND ipd.id = r.shippable_id
     GROUP BY r.work_order_item_id
 ),
 pfs_agg AS (
@@ -47,7 +80,8 @@ pfs_agg AS (
         MAX(COMPONENT_BRAND) AS pfs_component_brand,
         LISTAGG(DISTINCT COMPONENT_UNPICKABLE_REASON, ' | ')
             WITHIN GROUP (ORDER BY COMPONENT_UNPICKABLE_REASON) AS component_block_reasons
-    FROM PATTERN_DB.OPERATIONS.PICK_FROM_STOW_WORK_ORDER_ITEMS
+    FROM PATTERN_DB.OPERATIONS.PICK_FROM_STOW_WORK_ORDER_ITEMS pfs
+    JOIN scoped_woi sw ON sw.id = pfs.WOI_ID
     GROUP BY WOI_ID
 ),
 wo_agg AS (
@@ -58,8 +92,9 @@ wo_agg AS (
         SUM(CASE WHEN (woi.quantity - COALESCE(woi.processed_quantity,0)) > 0 THEN 1 ELSE 0 END) AS wo_wois_open,
         SUM(woi.original_quantity) AS wo_total_orig_qty,
         SUM(woi.processed_quantity) AS wo_total_processed_qty,
-        ROUND(SUM(woi.processed_quantity) * 100.0 / NULLIF(SUM(woi.original_quantity), 0), 1) AS wo_processing_pct
+        ROUND(SUM(woi.processed_quantity) * 100.0 / NULLIF(SUM(woi.quantity), 0), 1) AS wo_processing_pct
     FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
+    JOIN scoped_woi sw ON sw.id = woi.id
     WHERE woi.deleted_at IS NULL AND woi.for_accepted_overage = FALSE
     GROUP BY woi.work_order_id
 )
@@ -97,13 +132,40 @@ SELECT
         ELSE NULL
     END                                           AS block_reason_pfs,
     pfs.pick_type                                 AS pick_type,
+    pfs.component_block_reasons                   AS component_block_reasons,
     woi.original_quantity                         AS original_request,
     woi.quantity                                  AS current_request,
     woi.processed_quantity                        AS processed,
     COALESCE(res.shipment_created_quantity, 0)    AS order_created,
-    COALESCE(res.departed_quantity, 0)            AS shipped,
-    COALESCE(res.stowed_quantity, 0)              AS storage,
-    ROUND(woi.processed_quantity * 100.0 / NULLIF(woi.original_quantity, 0), 1) AS woi_processing_pct,
+    -- Cap per WOI so Shipped + Stowed + In-process = Processed.
+    -- Raw WOIR sums over-count sequential pallet/carton/shipment rows.
+    LEAST(
+        COALESCE(woi.processed_quantity, 0),
+        COALESCE(res.departed_quantity, 0)
+    )                                             AS shipped,
+    LEAST(
+        GREATEST(
+            COALESCE(woi.processed_quantity, 0)
+            - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0)),
+            0
+        ),
+        COALESCE(res.stowed_quantity, 0)
+    )                                             AS storage,
+    GREATEST(
+        COALESCE(woi.processed_quantity, 0)
+        - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0))
+        - LEAST(
+            GREATEST(
+                COALESCE(woi.processed_quantity, 0)
+                - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0)),
+                0
+            ),
+            COALESCE(res.stowed_quantity, 0)
+        ),
+        0
+    )                                             AS in_process,
+    res.fba_sent_at                               AS fba_sent_at,
+    ROUND(woi.processed_quantity * 100.0 / NULLIF(woi.quantity, 0), 1) AS woi_processing_pct,
     wagg.wo_total_wois,
     wagg.wo_wois_open,
     wagg.wo_wois_untouched,
@@ -154,12 +216,14 @@ SELECT
     pfs.days_overdue                              AS days_overdue,
     -- Listing: catalog listing first, else PFS listing (fills the blanks)
     COALESCE(l.listing_id, pfs.pfs_listing_id)    AS listing_id,
+    wt.name                                       AS woi_type,
     cm.name                                       AS marketplace,
     cm.country_code                               AS marketplace_country,
     wh.warehouse_name                             AS warehouse,
     woi.updated_at                                AS last_edit_at,
     eu.username                                   AS last_edit_by,
     woi.created_at                                AS created_at,
+    wo.created_at                                 AS wo_created_at,
     CASE WHEN cu.username = 'amaczar_app' THEN 'Shelf' ELSE cu.username END AS created_by
 FROM ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDER_ITEMS woi
 JOIN ANALYTICS_DB.STG_AMACZAR.STG_AMACZAR__WORK_ORDERS            wo ON wo.id = woi.work_order_id
