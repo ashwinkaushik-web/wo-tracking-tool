@@ -137,8 +137,33 @@ SELECT
     woi.quantity                                  AS current_request,
     woi.processed_quantity                        AS processed,
     COALESCE(res.shipment_created_quantity, 0)    AS order_created,
-    COALESCE(res.departed_quantity, 0)            AS shipped,
-    COALESCE(res.stowed_quantity, 0)              AS storage,
+    -- Cap per WOI so Shipped + Stowed + In-process = Processed.
+    -- Raw WOIR sums over-count sequential pallet/carton/shipment rows.
+    LEAST(
+        COALESCE(woi.processed_quantity, 0),
+        COALESCE(res.departed_quantity, 0)
+    )                                             AS shipped,
+    LEAST(
+        GREATEST(
+            COALESCE(woi.processed_quantity, 0)
+            - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0)),
+            0
+        ),
+        COALESCE(res.stowed_quantity, 0)
+    )                                             AS storage,
+    GREATEST(
+        COALESCE(woi.processed_quantity, 0)
+        - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0))
+        - LEAST(
+            GREATEST(
+                COALESCE(woi.processed_quantity, 0)
+                - LEAST(COALESCE(woi.processed_quantity, 0), COALESCE(res.departed_quantity, 0)),
+                0
+            ),
+            COALESCE(res.stowed_quantity, 0)
+        ),
+        0
+    )                                             AS in_process,
     res.fba_sent_at                               AS fba_sent_at,
     ROUND(woi.processed_quantity * 100.0 / NULLIF(woi.quantity, 0), 1) AS woi_processing_pct,
     wagg.wo_total_wois,
